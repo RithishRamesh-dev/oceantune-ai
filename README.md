@@ -284,12 +284,45 @@ tests/test_search_space.py::TestFlagsFromDict::test_missing_keys_use_defaults PA
 
 ---
 
-### Step 3 — vLLM server manager
-**Status: pending**
+### Step 3 — vLLM server runner
+**Status: complete**
 
-Wraps the vLLM process lifecycle: spawn with a given set of flags, poll the health endpoint until ready, stream stdout/stderr into the logger, and terminate cleanly. Exposes a context-manager API so the rest of the system never has to think about process management.
+Fully async process manager for the vLLM server lifecycle. Launches vLLM with flags from `VLLMFlags.to_vllm_args()`, streams stdout/stderr into a 500-line rotating log buffer, polls `/health` with exponential backoff, and tears down cleanly via SIGTERM → SIGKILL. A 5-class failure hierarchy (`OOMError`, `StartupTimeout`, `PortConflict`, `CUDAError`, `ProcessCrash`) turns cryptic CUDA stderr into actionable exceptions. `scripts/run_vllm.sh` wraps the process with ulimits, NCCL tuning, PID files, and signal forwarding.
 
-Key files: `core/vllm_manager.py`
+Key files: [core/vllm_server.py](core/vllm_server.py), [scripts/run_vllm.sh](scripts/run_vllm.sh), [tests/test_vllm_server.py](tests/test_vllm_server.py)
+
+#### Validation
+
+**Test suite — 49/49 new tests, 98/98 total (zero regressions)**
+
+Ran on the DigitalOcean droplet (165.245.171.90) inside `python:3.12-slim` Docker container — no GPU, no vLLM installation required (all subprocess and HTTP calls are mocked):
+
+```
+$ docker run --rm -v /opt/oceantune-ai:/workspace -w /workspace python:3.12-slim \
+    bash -c 'pip install pytest pytest-asyncio pyyaml httpx click --quiet && pytest tests/ -v'
+
+platform linux -- Python 3.12.13, pytest-9.0.2
+collected 98 items
+
+tests/test_search_space.py::TestChoiceParam::test_sample_is_in_values PASSED
+...
+tests/test_vllm_server.py::TestClassifyLogFailure::test_oom_detected PASSED
+tests/test_vllm_server.py::TestClassifyLogFailure::test_oom_takes_priority_over_cuda PASSED
+tests/test_vllm_server.py::TestVLLMServerProperties::test_endpoint PASSED
+tests/test_vllm_server.py::TestBuildCommand::test_tensor_parallel_in_args PASSED
+tests/test_vllm_server.py::TestBuildEnv::test_amd_env_for_mi300x PASSED
+tests/test_vllm_server.py::TestIsHealthy::test_healthy_on_200 PASSED
+tests/test_vllm_server.py::TestIsHealthy::test_unhealthy_on_connection_error PASSED
+tests/test_vllm_server.py::TestLogCapture::test_buffer_respects_maxlen PASSED
+tests/test_vllm_server.py::TestStartStop::test_start_reaches_healthy_state PASSED
+tests/test_vllm_server.py::TestStartStop::test_oom_in_logs_raises_oom_error PASSED
+tests/test_vllm_server.py::TestStartStop::test_port_conflict_in_logs_raises_port_conflict PASSED
+tests/test_vllm_server.py::TestStartStop::test_context_manager_stops_on_exception PASSED
+tests/test_vllm_server.py::TestMakeServer::test_factory_port_override PASSED
+tests/test_vllm_server.py::TestExceptionHierarchy::test_formatted_tail_truncates PASSED
+
+98 passed in 0.21s
+```
 
 ---
 
