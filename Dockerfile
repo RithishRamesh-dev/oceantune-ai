@@ -53,5 +53,8 @@ RUN mkdir -p storage/logs storage/results
 # Runs without GPU — pure Python only.
 RUN python3 oceantune.py validate-config
 
+# ── Clear base image entrypoint (vllm/vllm-openai sets ENTRYPOINT ["vllm"]) ──
+ENTRYPOINT []
+
 # ── Default command: run the full test suite ───────────────────────────────
 CMD ["python3", "-m", "pytest", "tests/", "-v", "--tb=short", "--asyncio-mode=auto"]
