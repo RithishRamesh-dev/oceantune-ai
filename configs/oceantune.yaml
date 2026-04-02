@@ -1,56 +1,76 @@
 # OceanTune AI — Main Configuration
-# Edit this file to change what model / GPU / search strategy to use.
-# Secrets (API keys, tokens) MUST be set as environment variables, not here.
+# ─────────────────────────────────────────────────────────────────────────────
+# Edit this file to change model / GPU / search strategy.
+# Secrets (HF_TOKEN, DO_SPACES_KEY, DO_SPACES_SECRET) MUST be in .env
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Model ─────────────────────────────────────────────────────────────────
-# Hugging Face model ID — any model supported by vLLM works here.
-# Supported: mistralai/Mistral-7B-Instruct-v0.2, deepseek-ai/DeepSeek-V3,
-#            Qwen/Qwen3-235B-Instruct, moonshotai/Kimi-K2, etc.
-model_id: "mistralai/Mistral-7B-Instruct-v0.2"
+# ── Model ─────────────────────────────────────────────────────────────────────
+# Full Hugging Face model ID or alias from configs/models.yaml.
+#
+# Available aliases:
+#   NVIDIA + AMD:
+#     deepseek_v3_2            deepseek-ai/DeepSeek-V3.2            (671B MoE)
+#     minimax_m2_5             MiniMaxAI/MiniMax-M2.5               (229B MoE)
+#     kimi_k2_5                moonshotai/Kimi-K2.5                 (1T MoE)
+#     qwen3_5_397b             Qwen/Qwen3.5-397B-A17B               (397B MoE)
+#
+#   NVIDIA only (NVFP4 — Hopper/Blackwell):
+#     deepseek_v3_2_nvfp4      nvidia/DeepSeek-V3.2-NVFP4
+#     kimi_k2_5_nvfp4          nvidia/Kimi-K2.5-NVFP4
+#     qwen3_5_397b_nvfp4       nvidia/Qwen3.5-397B-A17B-NVFP4
+#
+model_id: "deepseek-ai/DeepSeek-V3.2"
 
-# GPU profile used for vendor-specific flag selection
-# Options: A100 | H100 | A10G | RTX4090 | MI300X (AMD)
-gpu_type: "A100"
+# ── GPU ───────────────────────────────────────────────────────────────────────
+# Must match a key in configs/gpu_profiles.yaml exactly.
+#
+# NVIDIA:  H100  |  H200  |  B300
+# AMD:     MI300X  |  MI325X  |  MI350X
+#
+gpu_type: "H100"
 
-# ── DigitalOcean Spaces ───────────────────────────────────────────────────
+# ── DigitalOcean Spaces ───────────────────────────────────────────────────────
 spaces:
   bucket: "oceantune-results"
   region: "nyc3"
   endpoint_url: "https://nyc3.digitaloceanspaces.com"
-  # Credentials → env vars: DO_SPACES_KEY  DO_SPACES_SECRET
+  # Credentials → .env: DO_SPACES_KEY  DO_SPACES_SECRET
 
-# ── vLLM Server ───────────────────────────────────────────────────────────
+# ── vLLM Server ───────────────────────────────────────────────────────────────
 vllm:
   host: "0.0.0.0"
   port: 8000
-  startup_timeout_sec: 300
+  # Large MoE models can take 10–20 min to load weights
+  startup_timeout_sec: 1200
 
-# ── Benchmark Engine ──────────────────────────────────────────────────────
+# ── Benchmark Engine ──────────────────────────────────────────────────────────
 benchmark:
-  # Concurrency ramp — how many concurrent requests per benchmark run
+  # Concurrency ramp — number of concurrent requests per run
   concurrency_levels: [1, 2, 4, 8, 16, 32, 64]
-  # Number of prompts to send per concurrency level
+  # Total prompts sent per concurrency level
   num_prompts: 200
-  # Default token lengths (overridden per context_config)
+  # Default token lengths (overridden per context_config entry)
   input_len: 1024
   output_len: 1024
+  # Seconds to run each concurrency level before moving on
+  duration_sec: 60
 
-# ── Optimisation Engine ───────────────────────────────────────────────────
+# ── Optimisation Engine ───────────────────────────────────────────────────────
 optimiser:
   strategy: "evolutionary"      # evolutionary | grid | random | bayesian
   population_size: 10
   generations: 5
   mutation_rate: 0.2
   elite_fraction: 0.2
-  primary_metric: "throughput"  # throughput | p95_latency | ttft
+  # Primary metric drives fitness scoring; secondary metrics are recorded
+  primary_metric: "throughput"  # throughput | p95_latency | ttft | tpot
 
-# ── Context-Length Evaluation Matrix ─────────────────────────────────────
-# Each pair is [input_tokens, output_tokens].
-# Each combination generates a separate optimisation recipe.
+# ── Context-Length Evaluation Matrix ─────────────────────────────────────────
+# Each [input_tokens, output_tokens] pair → separate optimisation recipe.
 context_configs:
-  - [1024,  1024]
-  - [1024,  4096]
-  - [1024,  8192]
-  - [2048,  8192]
-  - [4096, 16384]
-  - [8192, 32768]
+  - [1024,   1024]
+  - [1024,   4096]
+  - [1024,   8192]
+  - [2048,   8192]
+  - [4096,  16384]
+  - [8192,  32768]

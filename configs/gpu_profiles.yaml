@@ -1,55 +1,247 @@
 # OceanTune AI — GPU Profiles
-# These are starting-point hints for vLLM flags per GPU type.
-# The optimisation engine will mutate these during search.
+# ─────────────────────────────────────────────────────────────────────────────
+# One entry per GPU SKU. Used by ConfigValidator, SearchSpace, VLLMServer,
+# and the Docker/compose layer.
+#
+# Docker image sources:
+#   NVIDIA: https://hub.docker.com/r/vllm/vllm-openai
+#           docker pull vllm/vllm-openai:latest-cu130
+#           docker pull vllm/vllm-openai:v0.18.1-cu130
+#   AMD:    https://hub.docker.com/r/vllm/vllm-openai-rocm
+#           docker pull vllm/vllm-openai-rocm:v0.18.1
+# ─────────────────────────────────────────────────────────────────────────────
 
 gpu_profiles:
-  A100:
-    vendor: "nvidia"
-    vram_gb: 80
-    fp16: true
-    bf16: true
-    flash_attention: true
-    default_gpu_memory_utilization: 0.90
-    max_tensor_parallel: 8
-    notes: "Primary target GPU — high-bandwidth HBM2e."
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # NVIDIA — Hopper
+  # ══════════════════════════════════════════════════════════════════════════
 
   H100:
-    vendor: "nvidia"
+    vendor: nvidia
+    arch: hopper
     vram_gb: 80
+    vram_type: HBM3
     fp16: true
     bf16: true
+    fp8: true
+    nvfp4: false
     flash_attention: true
     default_gpu_memory_utilization: 0.92
     max_tensor_parallel: 8
-    notes: "Higher throughput than A100; FP8 native support."
+    docker_image: "vllm/vllm-openai:latest-cu130"
+    docker_image_pinned: "vllm/vllm-openai:v0.18.1-cu130"
+    ipc_host: true
+    env_vars:
+      NCCL_DEBUG: "WARN"
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+      CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+      TOKENIZERS_PARALLELISM: "false"
+    recommended_kv_cache_dtype: "fp8"
+    recommended_block_size: 16
+    notes: >
+      80 GB HBM3. FP8 native via Transformer Engine.
+      Use tp=8 for 70B+ dense models. For MoE use enable-expert-parallel.
 
-  A10G:
-    vendor: "nvidia"
-    vram_gb: 24
-    fp16: true
-    bf16: false
-    flash_attention: true
-    default_gpu_memory_utilization: 0.88
-    max_tensor_parallel: 2
-    notes: "Cost-effective; limited VRAM means more aggressive quant."
-
-  RTX4090:
-    vendor: "nvidia"
-    vram_gb: 24
+  H200:
+    vendor: nvidia
+    arch: hopper
+    vram_gb: 141
+    vram_type: HBM3e
     fp16: true
     bf16: true
+    fp8: true
+    nvfp4: false
     flash_attention: true
-    default_gpu_memory_utilization: 0.85
-    max_tensor_parallel: 1
-    notes: "Consumer GPU; GDDR6X vs HBM — lower bandwidth."
+    default_gpu_memory_utilization: 0.92
+    max_tensor_parallel: 8
+    docker_image: "vllm/vllm-openai:latest-cu130"
+    docker_image_pinned: "vllm/vllm-openai:v0.18.1-cu130"
+    ipc_host: true
+    env_vars:
+      NCCL_DEBUG: "WARN"
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+      CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+      TOKENIZERS_PARALLELISM: "false"
+    recommended_kv_cache_dtype: "fp8"
+    recommended_block_size: 16
+    notes: >
+      141 GB HBM3e. Fits large MoE models on fewer GPUs.
+      Preferred for DeepSeek-V3.2 and Kimi-K2.5 at BF16.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # NVIDIA — Blackwell
+  # ══════════════════════════════════════════════════════════════════════════
+
+  B300:
+    vendor: nvidia
+    arch: blackwell
+    vram_gb: 192
+    vram_type: HBM3e
+    fp16: true
+    bf16: true
+    fp8: true
+    nvfp4: true                     # NVFP4 native — use nvidia/* NVFP4 model variants
+    flash_attention: true
+    default_gpu_memory_utilization: 0.93
+    max_tensor_parallel: 8
+    docker_image: "vllm/vllm-openai:latest-cu130"
+    docker_image_pinned: "vllm/vllm-openai:v0.18.1-cu130"
+    ipc_host: true
+    env_vars:
+      NCCL_DEBUG: "WARN"
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+      CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+      TOKENIZERS_PARALLELISM: "false"
+    recommended_kv_cache_dtype: "fp8"
+    recommended_block_size: 16
+    notes: >
+      Blackwell — 192 GB VRAM. Native NVFP4 support.
+      Use nvidia/* NVFP4 model variants for peak throughput.
+      Requires CUDA 13.0+ (cu130 image).
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AMD — CDNA3
+  # ══════════════════════════════════════════════════════════════════════════
 
   MI300X:
-    vendor: "amd"
+    vendor: amd
+    arch: cdna3
+    rocm_arch: gfx942
     vram_gb: 192
+    vram_type: HBM3
     fp16: true
     bf16: true
-    flash_attention: false       # use ROCm-native FlashAttention
+    fp8: true
+    nvfp4: false
+    flash_attention: false          # use AITER kernels instead
     default_gpu_memory_utilization: 0.90
     max_tensor_parallel: 8
-    notes: "AMD GPU; pass --device rocm to vLLM."
-    vllm_extra_flags: ["--device", "rocm"]
+    docker_image: "vllm/vllm-openai-rocm:v0.18.1"
+    docker_image_pinned: "vllm/vllm-openai-rocm:v0.18.1"
+    ipc_host: true
+    # Extra vLLM serve args appended after user flags
+    vllm_extra_args:
+      - "--distributed-executor-backend"
+      - "mp"
+    # Full set of ROCm perf env vars validated against real deployments
+    env_vars:
+      HSA_NO_SCRATCH_RECLAIM: "1"
+      NCCL_MIN_NCHANNELS: "112"
+      SAFETENSORS_FAST_GPU: "1"
+      VLLM_ROCM_USE_AITER: "1"
+      VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "0"
+      VLLM_ROCM_USE_AITER_MLA: "1"
+      VLLM_ROCM_USE_AITER_MOE: "1"
+      VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: "INT6"
+      VLLM_USE_TRITON_FLASH_ATTN: "0"
+      PYTORCH_ROCM_ARCH: "gfx942"
+      GPU_ARCHS: "gfx942"
+      TOKENIZERS_PARALLELISM: "false"
+    recommended_kv_cache_dtype: "fp8"
+    # block_size=1 required for MLA (DeepSeek models)
+    recommended_block_size: 1
+    # Extra docker run flags for ROCm device access
+    docker_extra_flags:
+      - "--device /dev/kfd"
+      - "--device /dev/dri"
+      - "--group-add 44"
+      - "--cap-add SYS_PTRACE"
+      - "--security-opt seccomp=unconfined"
+    notes: >
+      192 GB HBM3. AITER kernels for MoE and MLA.
+      block_size=1 for DeepSeek MLA attention.
+      VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0 for stability.
+
+  MI325X:
+    vendor: amd
+    arch: cdna3
+    rocm_arch: gfx942              # same arch as MI300X — drop-in upgrade
+    vram_gb: 256
+    vram_type: HBM3e
+    fp16: true
+    bf16: true
+    fp8: true
+    nvfp4: false
+    flash_attention: false
+    default_gpu_memory_utilization: 0.90
+    max_tensor_parallel: 8
+    docker_image: "vllm/vllm-openai-rocm:v0.18.1"
+    docker_image_pinned: "vllm/vllm-openai-rocm:v0.18.1"
+    ipc_host: true
+    vllm_extra_args:
+      - "--distributed-executor-backend"
+      - "mp"
+    env_vars:
+      HSA_NO_SCRATCH_RECLAIM: "1"
+      NCCL_MIN_NCHANNELS: "112"
+      SAFETENSORS_FAST_GPU: "1"
+      VLLM_ROCM_USE_AITER: "1"
+      VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "0"
+      VLLM_ROCM_USE_AITER_MLA: "1"
+      VLLM_ROCM_USE_AITER_MOE: "1"
+      VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: "INT6"
+      VLLM_USE_TRITON_FLASH_ATTN: "0"
+      PYTORCH_ROCM_ARCH: "gfx942"
+      GPU_ARCHS: "gfx942"
+      TOKENIZERS_PARALLELISM: "false"
+    recommended_kv_cache_dtype: "fp8"
+    recommended_block_size: 1
+    docker_extra_flags:
+      - "--device /dev/kfd"
+      - "--device /dev/dri"
+      - "--group-add 44"
+      - "--cap-add SYS_PTRACE"
+      - "--security-opt seccomp=unconfined"
+    notes: >
+      256 GB HBM3e. Same gfx942 as MI300X — same env vars apply.
+      Preferred for DeepSeek-V3.2 and Qwen3.5-397B at FP8.
+      Use enable-expert-parallel for MoE models.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AMD — CDNA4
+  # ══════════════════════════════════════════════════════════════════════════
+
+  MI350X:
+    vendor: amd
+    arch: cdna4
+    rocm_arch: gfx950
+    vram_gb: 288
+    vram_type: HBM3e
+    fp16: true
+    bf16: true
+    fp8: true
+    nvfp4: false
+    flash_attention: false
+    default_gpu_memory_utilization: 0.90
+    max_tensor_parallel: 8
+    docker_image: "vllm/vllm-openai-rocm:v0.18.1"
+    docker_image_pinned: "vllm/vllm-openai-rocm:v0.18.1"
+    ipc_host: true
+    vllm_extra_args:
+      - "--distributed-executor-backend"
+      - "mp"
+    env_vars:
+      HSA_NO_SCRATCH_RECLAIM: "1"
+      NCCL_MIN_NCHANNELS: "112"
+      SAFETENSORS_FAST_GPU: "1"
+      VLLM_ROCM_USE_AITER: "1"
+      VLLM_ROCM_USE_AITER_MLA: "1"
+      VLLM_ROCM_USE_AITER_MOE: "1"
+      VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: "INT6"
+      VLLM_USE_TRITON_FLASH_ATTN: "0"
+      PYTORCH_ROCM_ARCH: "gfx950"
+      GPU_ARCHS: "gfx950"
+      TOKENIZERS_PARALLELISM: "false"
+    recommended_kv_cache_dtype: "fp8"
+    recommended_block_size: 1
+    docker_extra_flags:
+      - "--device /dev/kfd"
+      - "--device /dev/dri"
+      - "--group-add 44"
+      - "--cap-add SYS_PTRACE"
+      - "--security-opt seccomp=unconfined"
+    notes: >
+      CDNA4 (gfx950). 288 GB HBM3e. Improved FP8 throughput vs CDNA3.
+      Verify ROCm image compatibility — may need newer image than v0.18.1.
+      FUSION_SHARED_EXPERTS flag may differ from CDNA3 — validate on first run.

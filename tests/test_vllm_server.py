@@ -53,7 +53,7 @@ def make_server_instance(**kwargs) -> VLLMServer:
         flags=make_flags(),
         port=9999,
         startup_timeout=5,
-        gpu_type="A100",
+        gpu_type="H100",
         hf_token="test-token",
     )
     defaults.update(kwargs)
@@ -221,7 +221,9 @@ class TestBuildEnv:
     def test_amd_env_for_mi300x(self):
         s = make_server_instance(gpu_type="MI300X")
         env = s._build_env()
-        assert "HIP_VISIBLE_DEVICES" in env
+        # Profile-driven ROCm vars should be present
+        assert env.get("VLLM_ROCM_USE_AITER") == "1"
+        assert env.get("TOKENIZERS_PARALLELISM") == "false"
 
 
 # ===========================================================================
@@ -514,7 +516,7 @@ class TestMakeServer:
     def test_factory_port_override(self):
         cfg = MagicMock()
         cfg.model_id = "m"
-        cfg.gpu_type = "A100"
+        cfg.gpu_type = "H100"
         cfg.hf_token = ""
         cfg.vllm.host = "0.0.0.0"
         cfg.vllm.port = 8000

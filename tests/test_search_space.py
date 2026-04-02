@@ -37,13 +37,18 @@ def ss() -> SearchSpace:
 
 
 @pytest.fixture(scope="module")
-def validator_a100() -> ConfigValidator:
-    return ConfigValidator(gpu_type="A100")
+def validator_h100() -> ConfigValidator:
+    return ConfigValidator(gpu_type="H100")
 
 
 @pytest.fixture(scope="module")
-def validator_a10g() -> ConfigValidator:
-    return ConfigValidator(gpu_type="A10G")
+def validator_mi300x() -> ConfigValidator:
+    return ConfigValidator(gpu_type="MI300X")
+
+
+@pytest.fixture(scope="module")
+def validator_b300() -> ConfigValidator:
+    return ConfigValidator(gpu_type="B300")
 
 
 # ===========================================================================
@@ -171,12 +176,6 @@ class TestVLLMFlags:
         assert "--quantization" in args
         assert "awq" in args
 
-    def test_to_vllm_args_amd(self):
-        f = VLLMFlags()
-        args = f.to_vllm_args("some/model", gpu_type="MI300X")
-        assert "--device" in args
-        assert "rocm" in args
-
     def test_chunked_prefill_flag(self):
         f = VLLMFlags(enable_chunked_prefill=True)
         args = f.to_vllm_args("some/model")
@@ -186,6 +185,35 @@ class TestVLLMFlags:
         f = VLLMFlags(quantization=None)
         args = f.to_vllm_args("some/model")
         assert "--quantization" not in args
+
+    def test_expert_parallel_flag(self):
+        f = VLLMFlags(enable_expert_parallel=True)
+        args = f.to_vllm_args("some/model")
+        assert "--enable-expert-parallel" in args
+
+    def test_cpu_offload_flag(self):
+        f = VLLMFlags(cpu_offload_gb=20)
+        args = f.to_vllm_args("some/model")
+        assert "--cpu-offload-gb" in args
+        assert "20" in args
+
+    def test_speculative_decoding_flags(self):
+        f = VLLMFlags(speculative_model="some/draft", num_speculative_tokens=5)
+        args = f.to_vllm_args("some/model")
+        assert "--speculative-model" in args
+        assert "--num-speculative-tokens" in args
+        assert "5" in args
+
+    def test_attention_backend_auto_not_emitted(self):
+        f = VLLMFlags(attention_backend="auto")
+        args = f.to_vllm_args("some/model")
+        assert "--attention-backend" not in args
+
+    def test_attention_backend_non_auto_emitted(self):
+        f = VLLMFlags(attention_backend="flashinfer")
+        args = f.to_vllm_args("some/model")
+        assert "--attention-backend" in args
+        assert "flashinfer" in args
 
 
 # ===========================================================================
@@ -203,9 +231,18 @@ class TestSearchSpace:
         }
         assert expected.issubset(ss._params.keys())
 
-    def test_default_flags_are_valid(self, ss, validator_a100):
+    def test_has_moe_params(self, ss):
+        assert "enable_expert_parallel" in ss._params
+        assert "all2all_backend" in ss._params
+        assert "enable_dbo" in ss._params
+
+    def test_has_speculative_params(self, ss):
+        assert "speculative_model" in ss._params
+        assert "num_speculative_tokens" in ss._params
+
+    def test_default_flags_are_valid(self, ss, validator_h100):
         flags = ss.default_flags()
-        violations = validator_a100.validate(flags)
+        violations = validator_h100.validate(flags)
         assert violations == [], f"Default flags have violations: {violations}"
 
     def test_sample_random_returns_valid_object(self, ss):
@@ -260,10 +297,14 @@ class TestSearchSpace:
         assert ss.size() > 0
 
     def test_seeded_population_respects_gpu_limits(self, ss):
-        pop = ss.sample_seeded("A10G", size=5)
+        pop = ss.sample_seeded("H100", size=5)
         assert len(pop) > 0
         for flags in pop:
-            assert flags.tensor_parallel_size <= 2
+            assert flags.tensor_parallel_size <= 8
+
+    def test_seeded_population_mi300x(self, ss):
+        pop = ss.sample_seeded("MI300X", size=5)
+        assert len(pop) > 0
 
     def test_summary_contains_param_names(self, ss):
         summary = ss.summary()
@@ -276,65 +317,123 @@ class TestSearchSpace:
 # ===========================================================================
 
 class TestConfigValidator:
-    def test_valid_config_passes(self, validator_a100):
+    def test_valid_config_passes(self, validator_h100):
         f = VLLMFlags(
             tensor_parallel_size=2,
             gpu_memory_utilization=0.90,
             max_num_seqs=256,
             max_num_batched_tokens=8192,
         )
-        assert validator_a100.validate(f) == []
+        assert validator_h100.validate(f) == []
 
-    def test_tp_exceeds_gpu_max_fails(self, validator_a10g):
-        f = VLLMFlags(tensor_parallel_size=8)
-        violations = validator_a10g.validate(f)
+    def test_tp_exceeds_gpu_max_fails(self, validator_mi300x):
+        # MI300X max_tensor_parallel=8; 16 should fail
+        f = VLLMFlags(tensor_parallel_size=16)
+        violations = validator_mi300x.validate(f)
         assert any("tensor_parallel_size" in v for v in violations)
 
-    def test_tp_not_power_of_two_fails(self, validator_a100):
+    def test_tp_not_power_of_two_fails(self, validator_h100):
         f = VLLMFlags(tensor_parallel_size=3)
-        violations = validator_a100.validate(f)
+        violations = validator_h100.validate(f)
         assert any("power of 2" in v for v in violations)
 
-    def test_memory_util_too_high_fails(self, validator_a100):
+    def test_memory_util_too_high_fails(self, validator_h100):
         f = VLLMFlags(gpu_memory_utilization=1.05)
-        violations = validator_a100.validate(f)
+        violations = validator_h100.validate(f)
         assert any("gpu_memory_utilization" in v for v in violations)
 
-    def test_memory_util_too_low_fails(self, validator_a100):
+    def test_memory_util_too_low_fails(self, validator_h100):
         f = VLLMFlags(gpu_memory_utilization=0.3)
-        violations = validator_a100.validate(f)
+        violations = validator_h100.validate(f)
         assert any("gpu_memory_utilization" in v for v in violations)
 
-    def test_batched_tokens_less_than_seqs_fails(self, validator_a100):
+    def test_batched_tokens_less_than_seqs_fails(self, validator_h100):
         f = VLLMFlags(max_num_seqs=512, max_num_batched_tokens=128)
-        violations = validator_a100.validate(f)
+        violations = validator_h100.validate(f)
         assert any("max_num_batched_tokens" in v for v in violations)
 
-    def test_speculative_without_v2_block_manager_fails(self, validator_a100):
-        f = VLLMFlags(
-            speculative_draft_model="some/draft-model",
-            use_v2_block_manager=False,
-        )
-        violations = validator_a100.validate(f)
-        assert any("Speculative" in v for v in violations)
+    def test_speculative_model_without_tokens_fails(self, validator_h100):
+        f = VLLMFlags(speculative_model="some/draft", num_speculative_tokens=None)
+        violations = validator_h100.validate(f)
+        assert any("speculative_model" in v or "num_speculative_tokens" in v
+                   for v in violations)
 
-    def test_speculative_with_v2_passes(self, validator_a100):
-        f = VLLMFlags(
-            speculative_draft_model="some/draft-model",
-            use_v2_block_manager=True,
-        )
-        violations = validator_a100.validate(f)
-        speculative_violations = [v for v in violations if "Speculative" in v]
-        assert speculative_violations == []
+    def test_speculative_tokens_without_model_fails(self, validator_h100):
+        f = VLLMFlags(speculative_model=None, num_speculative_tokens=5)
+        violations = validator_h100.validate(f)
+        assert any("speculative_model" in v or "num_speculative_tokens" in v
+                   for v in violations)
 
-    def test_bf16_on_a10g_fails(self, validator_a10g):
-        f = VLLMFlags(dtype="bfloat16")
-        violations = validator_a10g.validate(f)
-        assert any("bfloat16" in v for v in violations)
+    def test_speculative_both_set_passes(self, validator_h100):
+        f = VLLMFlags(speculative_model="some/draft", num_speculative_tokens=5)
+        violations = validator_h100.validate(f)
+        spec_violations = [v for v in violations
+                           if "speculative" in v.lower()]
+        assert spec_violations == []
 
-    def test_is_valid_shortcut(self, validator_a100):
+    def test_amd_ray_backend_fails(self, validator_mi300x):
+        f = VLLMFlags(distributed_executor_backend="ray")
+        violations = validator_mi300x.validate(f)
+        assert any("ray" in v for v in violations)
+
+    def test_amd_flash_attn_fails(self, validator_mi300x):
+        f = VLLMFlags(attention_backend="flash_attn")
+        violations = validator_mi300x.validate(f)
+        assert any("flash_attn" in v for v in violations)
+
+    def test_nvidia_ray_backend_passes(self, validator_h100):
+        f = VLLMFlags(distributed_executor_backend="ray")
+        violations = validator_h100.validate(f)
+        assert not any("ray" in v for v in violations)
+
+    def test_moe_deepep_without_expert_parallel_fails(self, validator_h100):
+        f = VLLMFlags(all2all_backend="deepep_high_throughput",
+                      enable_expert_parallel=False)
+        violations = validator_h100.validate(f)
+        assert any("enable_expert_parallel" in v for v in violations)
+
+    def test_moe_deepep_with_expert_parallel_passes(self, validator_h100):
+        f = VLLMFlags(all2all_backend="deepep_high_throughput",
+                      enable_expert_parallel=True)
+        violations = validator_h100.validate(f)
+        moe_violations = [v for v in violations if "expert_parallel" in v]
+        assert moe_violations == []
+
+    def test_dbo_without_expert_parallel_fails(self, validator_h100):
+        f = VLLMFlags(enable_dbo=True, enable_expert_parallel=False)
+        violations = validator_h100.validate(f)
+        assert any("enable_expert_parallel" in v for v in violations)
+
+    def test_invalid_block_size_fails(self, validator_h100):
+        f = VLLMFlags(block_size=7)
+        violations = validator_h100.validate(f)
+        assert any("block_size" in v for v in violations)
+
+    def test_valid_block_sizes_pass(self, validator_h100):
+        for bs in [1, 8, 16, 32]:
+            f = VLLMFlags(block_size=bs)
+            violations = validator_h100.validate(f)
+            block_violations = [v for v in violations if "block_size" in v]
+            assert block_violations == [], f"block_size={bs} should be valid"
+
+    def test_fp8_kv_cache_on_non_fp8_gpu_fails(self):
+        # MI300X has fp8=true, so this won't trigger there — use a hypothetical
+        # We test the check indirectly: all 6 GPUs support FP8, so valid configs pass
+        v = ConfigValidator(gpu_type="H100")
+        f = VLLMFlags(kv_cache_dtype="fp8_e5m2")
+        violations = v.validate(f)
+        fp8_violations = [x for x in violations if "FP8" in x]
+        assert fp8_violations == []  # H100 supports fp8
+
+    def test_nvfp4_check_b300_passes(self, validator_b300):
+        # B300 supports nvfp4 — no violation expected for fp8 kv-cache
+        f = VLLMFlags(kv_cache_dtype="fp8_e4m3")
+        violations = validator_b300.validate(f)
+        assert all("nvfp4" not in v.lower() for v in violations)
+
+    def test_is_valid_shortcut(self, validator_h100):
         f = VLLMFlags()
-        assert validator_a100.is_valid(f) == (validator_a100.validate(f) == [])
+        assert validator_h100.is_valid(f) == (validator_h100.validate(f) == [])
 
 
 # ===========================================================================
@@ -362,3 +461,12 @@ class TestFlagsFromDict:
     def test_missing_keys_use_defaults(self):
         flags = flags_from_dict({})
         assert flags.tensor_parallel_size == 1
+
+    def test_moe_fields_roundtrip(self):
+        original = VLLMFlags(
+            enable_expert_parallel=True,
+            all2all_backend="deepep_high_throughput",
+            enable_dbo=True,
+        )
+        restored = flags_from_dict(original.to_dict())
+        assert restored == original

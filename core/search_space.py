@@ -3,24 +3,16 @@ core/search_space.py
 --------------------
 Typed search-space system for OceanTune AI.
 
-This module is the backbone of the optimisation engine.  It handles:
-
+Handles:
   1. Loading search_space.yaml into strongly-typed Parameter objects.
   2. Representing a single vLLM configuration as a VLLMFlags dataclass.
   3. Sampling initial populations (random, grid, or GPU-profile-seeded).
   4. Mutating configs for evolutionary search.
-  5. Validating configs to reject hardware-impossible combinations
-     before we waste a GPU spin-up on them.
+  5. Validating configs to reject hardware-impossible combinations.
 
-Key design decisions
---------------------
-- Every parameter is one of four types (choice, range_int, range_float,
-  bool_flag).  All sampling / mutation logic is type-dispatched, so adding
-  a new parameter to search_space.yaml requires zero code changes here.
-- VLLMFlags is a plain dataclass (not Pydantic) so it can be copied,
-  mutated, hashed, and serialised cheaply millions of times.
-- ConfigValidator returns a list of violations rather than raising, so the
-  optimiser can log failures without try/except overhead.
+Supported GPU targets:
+  NVIDIA: H100, H200, B300
+  AMD:    MI300X, MI325X, MI350X
 """
 
 from __future__ import annotations
@@ -46,6 +38,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SEARCH_SPACE_YAML = REPO_ROOT / "configs" / "search_space.yaml"
 GPU_PROFILES_YAML = REPO_ROOT / "configs" / "gpu_profiles.yaml"
 
+# ---------------------------------------------------------------------------
+# GPU type sets
+# ---------------------------------------------------------------------------
+_AMD_GPU_TYPES = {"MI300X", "MI325X", "MI350X"}
+_NVIDIA_GPU_TYPES = {"H100", "H200", "B300"}
+
 
 # ===========================================================================
 # 1.  Parameter types
@@ -67,7 +65,6 @@ class ChoiceParam:
         return current
 
     def neighbours(self, current: Any) -> List[Any]:
-        """Return all values except the current one (for grid search)."""
         return [v for v in self.values if v != current]
 
 
@@ -163,7 +160,6 @@ class BoolFlagParam:
         return [not current]
 
 
-# Union type for convenience
 AnyParam = ChoiceParam | RangeIntParam | RangeFloatParam | BoolFlagParam
 
 
@@ -176,92 +172,118 @@ class VLLMFlags:
     """
     Represents one set of vLLM server flags.
 
-    All fields mirror the keys in search_space.yaml.
-    Defaults match the YAML defaults so the object is always valid
-    even if partially constructed.
+    Fields are grouped by vLLM config class:
+      ParallelConfig, CacheConfig, ModelConfig, Scheduler, MoE, Stage-2
     """
-    # Parallelism
+    # ── ParallelConfig ────────────────────────────────────────────────────
     tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
+    enable_expert_parallel: bool = False
+    data_parallel_size: int = 1
+    distributed_executor_backend: str = "mp"
 
-    # Memory
+    # ── CacheConfig ───────────────────────────────────────────────────────
     gpu_memory_utilization: float = 0.90
+    block_size: int = 16
+    kv_cache_dtype: str = "auto"
+    enable_prefix_caching: bool = False
     max_num_seqs: int = 256
     max_num_batched_tokens: int = 8192
 
-    # KV cache
-    kv_cache_dtype: str = "auto"
-    block_size: int = 16
-
-    # Quantisation
+    # ── ModelConfig ───────────────────────────────────────────────────────
+    dtype: str = "auto"
     quantization: Optional[str] = None
+    max_model_len: int = 32768
+    enforce_eager: bool = False
+    load_format: str = "auto"
+    trust_remote_code: bool = False
 
-    # Scheduler
+    # ── Scheduler ─────────────────────────────────────────────────────────
     scheduler_delay_factor: float = 0.0
     enable_chunked_prefill: bool = False
 
-    # Stage-2 flags (populated later)
-    use_v2_block_manager: bool = False
-    speculative_draft_model: Optional[str] = None
+    # ── AttentionConfig ───────────────────────────────────────────────────
+    attention_backend: str = "auto"
 
-    # Dtype
-    dtype: str = "float16"
+    # ── MoE / EP communication ────────────────────────────────────────────
+    all2all_backend: str = "allgather_reducescatter"
+    enable_dbo: bool = False
 
-    # Metadata (not part of vLLM command line)
+    # ── CPU offload ───────────────────────────────────────────────────────
+    cpu_offload_gb: int = 0
+
+    # ── Prefix caching ────────────────────────────────────────────────────
+    prefix_caching_hash_algo: str = "sha256"
+
+    # ── Stage-2: Speculative Decoding (Step 13) ───────────────────────────
+    speculative_model: Optional[str] = None
+    num_speculative_tokens: Optional[int] = None
+
+    # ── Metadata (not part of vLLM CLI) ───────────────────────────────────
     run_id: str = field(default="", repr=False)
 
     def to_dict(self) -> dict:
-        """Return all fields as a plain dict (for CSV / JSON serialisation)."""
         return asdict(self)
 
-    def to_vllm_args(self, model_id: str, gpu_type: str = "A100") -> List[str]:
-        """
-        Convert this config into a list of vLLM CLI arguments.
-
-        Parameters
-        ----------
-        model_id : str
-            Hugging Face model ID.
-        gpu_type : str
-            Used to select AMD-specific flags.
-        """
+    def to_vllm_args(self, model_id: str, gpu_type: str = "H100") -> List[str]:
+        """Convert this config into a list of vLLM CLI arguments."""
         args = [
             "--model", model_id,
             "--tensor-parallel-size", str(self.tensor_parallel_size),
             "--pipeline-parallel-size", str(self.pipeline_parallel_size),
+            "--data-parallel-size", str(self.data_parallel_size),
+            "--distributed-executor-backend", self.distributed_executor_backend,
             "--gpu-memory-utilization", str(self.gpu_memory_utilization),
+            "--block-size", str(self.block_size),
+            "--kv-cache-dtype", self.kv_cache_dtype,
             "--max-num-seqs", str(self.max_num_seqs),
             "--max-num-batched-tokens", str(self.max_num_batched_tokens),
-            "--kv-cache-dtype", self.kv_cache_dtype,
-            "--block-size", str(self.block_size),
             "--dtype", self.dtype,
+            "--max-model-len", str(self.max_model_len),
+            "--load-format", self.load_format,
             "--scheduler-delay-factor", str(self.scheduler_delay_factor),
         ]
 
-        if self.quantization:
-            args += ["--quantization", self.quantization]
-
+        # Bool flags — only emit when True
+        if self.enable_expert_parallel:
+            args.append("--enable-expert-parallel")
+        if self.enable_prefix_caching:
+            args.append("--enable-prefix-caching")
+        if self.enforce_eager:
+            args.append("--enforce-eager")
+        if self.trust_remote_code:
+            args.append("--trust-remote-code")
         if self.enable_chunked_prefill:
             args.append("--enable-chunked-prefill")
+        if self.enable_dbo:
+            args.append("--enable-dbo")
 
-        if self.use_v2_block_manager:
-            args.append("--use-v2-block-manager")
+        # Optional value flags
+        if self.quantization:
+            args += ["--quantization", self.quantization]
+        if self.attention_backend != "auto":
+            args += ["--attention-backend", self.attention_backend]
+        if self.all2all_backend != "allgather_reducescatter":
+            args += ["--all2all-backend", self.all2all_backend]
+        if self.cpu_offload_gb > 0:
+            args += ["--cpu-offload-gb", str(self.cpu_offload_gb)]
+        if self.enable_prefix_caching and self.prefix_caching_hash_algo != "sha256":
+            args += ["--prefix-caching-hash-algo", self.prefix_caching_hash_algo]
 
-        if self.speculative_draft_model:
-            args += ["--speculative-model", self.speculative_draft_model]
+        # Stage-2: speculative decoding
+        if self.speculative_model:
+            args += ["--speculative-model", self.speculative_model]
+        if self.num_speculative_tokens is not None:
+            args += ["--num-speculative-tokens", str(self.num_speculative_tokens)]
 
-        if gpu_type == "MI300X":
+        # AMD ROCm device flag
+        if gpu_type in _AMD_GPU_TYPES:
             args += ["--device", "rocm"]
 
         return args
 
     def fingerprint(self) -> str:
-        """
-        Return a short, stable hash of this config's flags.
-
-        Used as a unique run identifier and to detect duplicate configs
-        before spending GPU time on them.
-        """
+        """Return a short, stable hash of this config's flags."""
         d = {k: v for k, v in asdict(self).items() if k != "run_id"}
         canonical = json.dumps(d, sort_keys=True, default=str)
         return hashlib.sha1(canonical.encode()).hexdigest()[:12]
@@ -279,7 +301,7 @@ class VLLMFlags:
 
 
 # ===========================================================================
-# 3.  SearchSpace — loads YAML, owns all parameter objects
+# 3.  SearchSpace
 # ===========================================================================
 
 class SearchSpace:
@@ -296,8 +318,6 @@ class SearchSpace:
     def __init__(self, params: dict[str, AnyParam]):
         self._params: dict[str, AnyParam] = params
         log_dict(log, "info", "SearchSpace ready", num_params=len(params))
-
-    # ── Loader ────────────────────────────────────────────────────────────
 
     @classmethod
     def load(cls, path: Path = SEARCH_SPACE_YAML) -> "SearchSpace":
@@ -316,39 +336,24 @@ class SearchSpace:
             default = spec.get("default")
 
             if ptype == "choice":
-                params[name] = ChoiceParam(
-                    name=name,
-                    values=spec["values"],
-                    default=default,
-                )
+                params[name] = ChoiceParam(name=name, values=spec["values"], default=default)
             elif ptype == "range_int":
                 params[name] = RangeIntParam(
-                    name=name,
-                    min=int(spec["min"]),
-                    max=int(spec["max"]),
-                    step=int(spec.get("step", 1)),
-                    default=int(default),
+                    name=name, min=int(spec["min"]), max=int(spec["max"]),
+                    step=int(spec.get("step", 1)), default=int(default),
                 )
             elif ptype == "range_float":
                 params[name] = RangeFloatParam(
-                    name=name,
-                    min=float(spec["min"]),
-                    max=float(spec["max"]),
-                    step=float(spec.get("step", 0.05)),
-                    default=float(default),
+                    name=name, min=float(spec["min"]), max=float(spec["max"]),
+                    step=float(spec.get("step", 0.05)), default=float(default),
                 )
             elif ptype == "bool_flag":
-                params[name] = BoolFlagParam(
-                    name=name,
-                    default=bool(default),
-                )
+                params[name] = BoolFlagParam(name=name, default=bool(default))
             else:
                 log.warning(f"Unknown parameter type '{ptype}' for '{name}' — skipping")
 
         log_dict(log, "info", "Loaded search space", path=str(path), params=list(params))
         return cls(params)
-
-    # ── Default config ────────────────────────────────────────────────────
 
     def default_flags(self) -> VLLMFlags:
         """Return a VLLMFlags with every parameter set to its YAML default."""
@@ -358,8 +363,6 @@ class SearchSpace:
                 setattr(flags, name, param.default)
         flags.run_id = flags.fingerprint()
         return flags
-
-    # ── Random sampling ───────────────────────────────────────────────────
 
     def sample_random(self) -> VLLMFlags:
         """Return a uniformly random VLLMFlags from the full search space."""
@@ -371,12 +374,7 @@ class SearchSpace:
         return flags
 
     def sample_population(self, size: int) -> List[VLLMFlags]:
-        """
-        Return *size* random configs, guaranteed to be unique.
-
-        If the search space is smaller than *size*, returns as many
-        unique configs as possible (with a warning).
-        """
+        """Return *size* unique random configs."""
         seen: set[str] = set()
         population: List[VLLMFlags] = []
         max_attempts = size * 20
@@ -398,25 +396,18 @@ class SearchSpace:
         log_dict(log, "info", "Population sampled", size=len(population))
         return population
 
-    # ── GPU-profile-seeded sampling ───────────────────────────────────────
-
     def sample_seeded(
         self,
         gpu_type: str,
         size: int,
         gpu_profiles_path: Path = GPU_PROFILES_YAML,
     ) -> List[VLLMFlags]:
-        """
-        Return a population seeded with sensible GPU-profile defaults,
-        then lightly perturbed so we explore near the hint.
-        """
+        """Return a population seeded from GPU-profile hints, lightly perturbed."""
         profile = _load_gpu_profile(gpu_type, gpu_profiles_path)
         seed = self.default_flags()
 
         if "default_gpu_memory_utilization" in profile:
-            seed.gpu_memory_utilization = float(
-                profile["default_gpu_memory_utilization"]
-            )
+            seed.gpu_memory_utilization = float(profile["default_gpu_memory_utilization"])
         if "max_tensor_parallel" in profile:
             max_tp = int(profile["max_tensor_parallel"])
             seed.tensor_parallel_size = 1
@@ -428,8 +419,7 @@ class SearchSpace:
         population: List[VLLMFlags] = [seed]
 
         seen = {seed.fingerprint()}
-        max_attempts = size * 30
-        for _ in range(max_attempts):
+        for _ in range(size * 30):
             if len(population) >= size:
                 break
             candidate = self.mutate(seed, mutation_rate=0.3)
@@ -438,56 +428,31 @@ class SearchSpace:
                 seen.add(fp)
                 population.append(candidate)
 
-        log_dict(
-            log, "info", "Seeded population ready",
-            gpu=gpu_type, size=len(population),
-        )
+        log_dict(log, "info", "Seeded population ready", gpu=gpu_type, size=len(population))
         return population
 
-    # ── Mutation ──────────────────────────────────────────────────────────
-
     def mutate(self, flags: VLLMFlags, mutation_rate: float = 0.2) -> VLLMFlags:
-        """
-        Return a mutated copy of *flags*.
-
-        Each parameter is independently mutated with probability
-        *mutation_rate*.  The original object is never modified.
-        """
+        """Return a mutated copy of *flags*. Original is never modified."""
         mutated = flags.copy()
         for name, param in self._params.items():
             if hasattr(mutated, name):
                 current = getattr(mutated, name)
-                new_val = param.mutate(current, mutation_rate)
-                setattr(mutated, name, new_val)
+                setattr(mutated, name, param.mutate(current, mutation_rate))
         mutated.run_id = mutated.fingerprint()
         return mutated
 
-    # ── Crossover ─────────────────────────────────────────────────────────
-
     def crossover(self, parent_a: VLLMFlags, parent_b: VLLMFlags) -> VLLMFlags:
-        """
-        Single-point crossover: for each parameter, randomly pick from
-        parent A or parent B.  Used by the evolutionary optimiser.
-        """
+        """Single-point crossover between two parents."""
         child = VLLMFlags()
         for name in self._params:
             if hasattr(child, name):
-                if random.random() < 0.5:
-                    setattr(child, name, getattr(parent_a, name))
-                else:
-                    setattr(child, name, getattr(parent_b, name))
+                src = parent_a if random.random() < 0.5 else parent_b
+                setattr(child, name, getattr(src, name))
         child.run_id = child.fingerprint()
         return child
 
-    # ── Grid expansion ────────────────────────────────────────────────────
-
     def grid_neighbours(self, flags: VLLMFlags) -> List[VLLMFlags]:
-        """
-        Return all single-step neighbours for grid search.
-
-        For each parameter, generate configs where only that parameter
-        changes by one step in either direction.
-        """
+        """Return all single-step neighbours for grid search."""
         neighbours: List[VLLMFlags] = []
         seen: set[str] = {flags.fingerprint()}
 
@@ -505,8 +470,6 @@ class SearchSpace:
 
         return neighbours
 
-    # ── Introspection ─────────────────────────────────────────────────────
-
     def size(self) -> int:
         """Return the total number of configs in the discrete search space."""
         total = 1
@@ -514,11 +477,9 @@ class SearchSpace:
             if isinstance(param, ChoiceParam):
                 total *= len(param.values)
             elif isinstance(param, RangeIntParam):
-                steps = (param.max - param.min) // param.step + 1
-                total *= steps
+                total *= (param.max - param.min) // param.step + 1
             elif isinstance(param, RangeFloatParam):
-                steps = round((param.max - param.min) / param.step) + 1
-                total *= steps
+                total *= round((param.max - param.min) / param.step) + 1
             elif isinstance(param, BoolFlagParam):
                 total *= 2
         return total
@@ -548,34 +509,36 @@ class ConfigValidator:
     """
     Validates VLLMFlags against hardware constraints and vLLM rules.
 
-    Returns a list of human-readable violation strings.
-    An empty list means the config is valid.
+    Covers all 6 supported GPU types:
+      NVIDIA: H100, H200, B300
+      AMD:    MI300X, MI325X, MI350X
 
-    Usage
-    -----
-        validator = ConfigValidator(gpu_type="A100", gpu_profiles_path=...)
-        violations = validator.validate(flags)
-        if violations:
-            log.warning("Invalid config", violations=violations)
+    Returns a list of human-readable violation strings (empty = valid).
     """
 
     def __init__(
         self,
-        gpu_type: str = "A100",
+        gpu_type: str = "H100",
         gpu_profiles_path: Path = GPU_PROFILES_YAML,
     ):
         self.gpu_type = gpu_type
         self.profile = _load_gpu_profile(gpu_type, gpu_profiles_path)
+        self.is_amd = gpu_type in _AMD_GPU_TYPES
+        self.is_nvidia = gpu_type in _NVIDIA_GPU_TYPES
 
     def validate(self, flags: VLLMFlags) -> List[str]:
-        """Return a list of violation strings.  Empty = valid."""
+        """Return a list of violation strings. Empty = valid."""
         violations: List[str] = []
         violations.extend(self._check_tensor_parallel(flags))
         violations.extend(self._check_memory(flags))
         violations.extend(self._check_batching(flags))
         violations.extend(self._check_quantization_compat(flags))
-        violations.extend(self._check_speculative_decoding(flags))
+        violations.extend(self._check_fp8_support(flags))
         violations.extend(self._check_dtype_compat(flags))
+        violations.extend(self._check_speculative_decoding(flags))
+        violations.extend(self._check_amd_specific(flags))
+        violations.extend(self._check_moe_flags(flags))
+        violations.extend(self._check_block_size(flags))
         return violations
 
     def is_valid(self, flags: VLLMFlags) -> bool:
@@ -589,12 +552,13 @@ class ConfigValidator:
                 f"tensor_parallel_size={f.tensor_parallel_size} exceeds "
                 f"GPU max ({max_tp}) for {self.gpu_type}"
             )
-        if f.tensor_parallel_size > 0 and (
-            f.tensor_parallel_size & (f.tensor_parallel_size - 1) != 0
-        ):
+        tp = f.tensor_parallel_size
+        if tp > 0 and (tp & (tp - 1) != 0):
             violations.append(
-                f"tensor_parallel_size={f.tensor_parallel_size} is not a power of 2"
+                f"tensor_parallel_size={tp} is not a power of 2 (valid: 1, 2, 4, 8)"
             )
+        if f.pipeline_parallel_size < 1:
+            violations.append("pipeline_parallel_size must be >= 1")
         return violations
 
     def _check_memory(self, f: VLLMFlags) -> List[str]:
@@ -612,34 +576,91 @@ class ConfigValidator:
                 f"max_num_batched_tokens ({f.max_num_batched_tokens}) must be "
                 f">= max_num_seqs ({f.max_num_seqs})"
             )
+        if f.max_model_len < 512:
+            violations.append(f"max_model_len={f.max_model_len} is unusably small (min 512)")
         return violations
 
     def _check_quantization_compat(self, f: VLLMFlags) -> List[str]:
         violations = []
-        if f.kv_cache_dtype == "fp8_e5m2" and f.quantization in ("gptq",):
-            violations.append(
-                f"kv_cache_dtype=fp8_e5m2 is incompatible with quantization={f.quantization}"
-            )
-        if f.enable_chunked_prefill and f.quantization in ("squeezellm",):
+        if f.kv_cache_dtype == "fp8_e5m2" and f.quantization == "gptq":
+            violations.append("kv_cache_dtype=fp8_e5m2 is incompatible with quantization=gptq")
+        if f.enable_chunked_prefill and f.quantization == "squeezellm":
             violations.append(
                 "enable_chunked_prefill=True is incompatible with squeezellm quantization"
             )
+        if f.quantization == "bitsandbytes" and f.load_format not in ("auto", "bitsandbytes"):
+            violations.append(
+                "quantization=bitsandbytes requires load_format=auto or bitsandbytes"
+            )
         return violations
 
-    def _check_speculative_decoding(self, f: VLLMFlags) -> List[str]:
+    def _check_fp8_support(self, f: VLLMFlags) -> List[str]:
         violations = []
-        if f.speculative_draft_model and not f.use_v2_block_manager:
+        fp8_dtypes = {"fp8", "fp8_e4m3", "fp8_e5m2"}
+        supports_fp8 = bool(self.profile.get("fp8", True))
+        if f.kv_cache_dtype in fp8_dtypes and not supports_fp8:
             violations.append(
-                "Speculative decoding requires use_v2_block_manager=True"
+                f"kv_cache_dtype={f.kv_cache_dtype} requires FP8 support "
+                f"(not available on {self.gpu_type})"
             )
+        if f.quantization == "fp8" and not supports_fp8:
+            violations.append(f"quantization=fp8 not supported on {self.gpu_type}")
         return violations
 
     def _check_dtype_compat(self, f: VLLMFlags) -> List[str]:
         violations = []
         supports_bf16 = bool(self.profile.get("bf16", True))
         if f.dtype == "bfloat16" and not supports_bf16:
+            violations.append(f"dtype=bfloat16 is not supported on {self.gpu_type}")
+        return violations
+
+    def _check_speculative_decoding(self, f: VLLMFlags) -> List[str]:
+        violations = []
+        if f.speculative_model and f.num_speculative_tokens is None:
             violations.append(
-                f"dtype=bfloat16 is not supported on {self.gpu_type}"
+                "speculative_model is set but num_speculative_tokens is None. "
+                "Set num_speculative_tokens (e.g. 3, 5, or 8)."
+            )
+        if f.num_speculative_tokens is not None and not f.speculative_model:
+            violations.append(
+                "num_speculative_tokens is set but speculative_model is None."
+            )
+        return violations
+
+    def _check_amd_specific(self, f: VLLMFlags) -> List[str]:
+        violations = []
+        if not self.is_amd:
+            return violations
+        if f.distributed_executor_backend == "ray":
+            violations.append(
+                f"{self.gpu_type} (AMD ROCm) requires distributed_executor_backend=mp, "
+                f"not ray. Ray is not supported on ROCm."
+            )
+        if f.attention_backend == "flash_attn":
+            violations.append(
+                f"{self.gpu_type}: use attention_backend=auto or aiter, "
+                f"not flash_attn (CUDA-only)."
+            )
+        return violations
+
+    def _check_moe_flags(self, f: VLLMFlags) -> List[str]:
+        violations = []
+        deepep_backends = {"deepep_high_throughput", "deepep_low_latency"}
+        if f.all2all_backend in deepep_backends and not f.enable_expert_parallel:
+            violations.append(
+                f"all2all_backend={f.all2all_backend} requires enable_expert_parallel=True"
+            )
+        if f.enable_dbo and not f.enable_expert_parallel:
+            violations.append("enable_dbo=True requires enable_expert_parallel=True")
+        return violations
+
+    def _check_block_size(self, f: VLLMFlags) -> List[str]:
+        violations = []
+        valid_block_sizes = {1, 8, 16, 32}
+        if f.block_size not in valid_block_sizes:
+            violations.append(
+                f"block_size={f.block_size} is not valid. "
+                f"Must be one of {sorted(valid_block_sizes)}."
             )
         return violations
 
@@ -665,8 +686,7 @@ def _load_gpu_profile(gpu_type: str, path: Path = GPU_PROFILES_YAML) -> dict:
 def flags_from_dict(d: dict) -> VLLMFlags:
     """
     Reconstruct a VLLMFlags from a plain dict (e.g. loaded from CSV/JSON).
-
-    Unknown keys are silently ignored, missing keys fall back to defaults.
+    Unknown keys are silently ignored; missing keys fall back to defaults.
     """
     flags = VLLMFlags()
     for k, v in d.items():

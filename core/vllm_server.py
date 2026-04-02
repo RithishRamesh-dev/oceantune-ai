@@ -52,9 +52,10 @@ from pathlib import Path
 from typing import Deque, List, Optional
 
 import httpx
+import yaml
 
 from core.logger import get_logger, log_dict
-from core.search_space import VLLMFlags
+from core.search_space import VLLMFlags, _AMD_GPU_TYPES
 
 log = get_logger("core.vllm_server")
 
@@ -63,6 +64,16 @@ log = get_logger("core.vllm_server")
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_VLLM_SH = REPO_ROOT / "scripts" / "run_vllm.sh"
+GPU_PROFILES_YAML = REPO_ROOT / "configs" / "gpu_profiles.yaml"
+
+
+def _load_gpu_profile(gpu_type: str) -> dict:
+    """Load a single GPU profile from gpu_profiles.yaml."""
+    if not GPU_PROFILES_YAML.exists():
+        return {}
+    with open(GPU_PROFILES_YAML, encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    return raw.get("gpu_profiles", {}).get(gpu_type, {})
 
 # ---------------------------------------------------------------------------
 # Failure hierarchy
@@ -190,7 +201,7 @@ class VLLMServer:
     host: str = "0.0.0.0"
     port: int = 8000
     startup_timeout: int = 300
-    gpu_type: str = "A100"
+    gpu_type: str = "H100"
     hf_token: str = ""
     log_buffer_size: int = 500
 
@@ -443,22 +454,25 @@ class VLLMServer:
     # ── Internal: build command ───────────────────────────────────────────
 
     def _build_command(self) -> List[str]:
-        """Build the vLLM server command."""
+        """Build the vLLM server command, appending vllm_extra_args from GPU profile."""
         vllm_args = self.flags.to_vllm_args(
             model_id=self.model_id,
             gpu_type=self.gpu_type,
         )
+        profile = _load_gpu_profile(self.gpu_type)
+        extra_args: List[str] = profile.get("vllm_extra_args", [])
         return [
             "python3", "-m", "vllm.entrypoints.openai.api_server",
             "--host", self.host,
             "--port", str(self.port),
             *vllm_args,
+            *extra_args,
         ]
 
     # ── Internal: build environment ───────────────────────────────────────
 
     def _build_env(self) -> dict:
-        """Build the subprocess environment."""
+        """Build the subprocess environment, injecting GPU-profile env vars."""
         env = os.environ.copy()
 
         if self.hf_token:
@@ -469,8 +483,16 @@ class VLLMServer:
         env.setdefault("NCCL_IB_DISABLE", "0")
         env["TOKENIZERS_PARALLELISM"] = "false"
 
-        if self.gpu_type == "MI300X":
-            env.setdefault("HIP_VISIBLE_DEVICES", env.get("CUDA_VISIBLE_DEVICES", ""))
+        # Inject profile-level env vars (ROCm perf vars, CUDA workspace config…)
+        profile = _load_gpu_profile(self.gpu_type)
+        for key, val in profile.get("env_vars", {}).items():
+            env.setdefault(key, str(val))
+
+        # AMD: also map CUDA_VISIBLE_DEVICES → HIP_VISIBLE_DEVICES
+        if self.gpu_type in _AMD_GPU_TYPES:
+            cuda_devs = env.get("CUDA_VISIBLE_DEVICES", "")
+            if cuda_devs:
+                env.setdefault("HIP_VISIBLE_DEVICES", cuda_devs)
 
         return env
 

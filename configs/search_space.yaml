@@ -1,79 +1,284 @@
 # OceanTune AI — Optimisation Search Space
-# Defines the ranges/choices the optimisation engine explores per flag.
-# Types: choice (list), range_int, range_float, bool_flag
+# ─────────────────────────────────────────────────────────────────────────────
+# All parameter names, types and values are derived directly from
+# `vllm serve -h` (EngineArgs documentation).
+#
+# Types:
+#   choice      — pick one value from the list
+#   range_int   — integer in [min, max] stepped by step
+#   range_float — float in [min, max] stepped by step
+#   bool_flag   — true / false
+#
+# Parameters are grouped by the vLLM config class they belong to.
+# The optimiser explores ALL groups simultaneously in Stage-1.
+# Stage-2 parameters (speculative decoding) are added in Step 11
+# and have default: null here.
+# ─────────────────────────────────────────────────────────────────────────────
 
 search_space:
 
-  # ── Parallelism ──────────────────────────────────────────────────────────
+  # ══════════════════════════════════════════════════════════════════════════
+  # ParallelConfig — tensor / pipeline / expert parallelism
+  # vLLM args: --tensor-parallel-size (-tp), --pipeline-parallel-size (-pp),
+  #            --enable-expert-parallel (-ep), --data-parallel-size (-dp)
+  # ══════════════════════════════════════════════════════════════════════════
+
   tensor_parallel_size:
     type: choice
     values: [1, 2, 4, 8]
     default: 1
+    vllm_flag: "--tensor-parallel-size"
+    notes: "Must be power of 2. Clamped to gpu_profiles.max_tensor_parallel."
 
   pipeline_parallel_size:
     type: choice
     values: [1, 2, 4]
     default: 1
+    vllm_flag: "--pipeline-parallel-size"
+    notes: "Only useful for models that exceed single-node VRAM."
 
-  # ── Memory ───────────────────────────────────────────────────────────────
+  enable_expert_parallel:
+    type: bool_flag
+    default: false
+    vllm_flag: "--enable-expert-parallel"
+    notes: "MoE models: use EP instead of TP for expert layers. Improves throughput."
+
+  data_parallel_size:
+    type: choice
+    values: [1, 2, 4]
+    default: 1
+    vllm_flag: "--data-parallel-size"
+    notes: "Replicate entire model. Only useful with multiple GPU nodes or DP+EP."
+
+  distributed_executor_backend:
+    type: choice
+    values: ["mp", "ray"]
+    default: "mp"
+    vllm_flag: "--distributed-executor-backend"
+    notes: "AMD ROCm requires mp. Ray needed for multi-node."
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # CacheConfig — KV cache
+  # vLLM args: --gpu-memory-utilization, --block-size, --kv-cache-dtype,
+  #            --enable-prefix-caching, --max-num-seqs,
+  #            --max-num-batched-tokens
+  # ══════════════════════════════════════════════════════════════════════════
+
   gpu_memory_utilization:
     type: range_float
     min: 0.70
     max: 0.95
     step: 0.05
     default: 0.90
-
-  max_num_seqs:
-    type: choice
-    values: [64, 128, 256, 512]
-    default: 256
-
-  max_num_batched_tokens:
-    type: choice
-    values: [2048, 4096, 8192, 16384, 32768]
-    default: 8192
-
-  # ── KV Cache ─────────────────────────────────────────────────────────────
-  kv_cache_dtype:
-    type: choice
-    values: ["auto", "fp8_e5m2"]
-    default: "auto"
+    vllm_flag: "--gpu-memory-utilization"
+    notes: "Fraction of GPU VRAM reserved for the model executor."
 
   block_size:
     type: choice
-    values: [8, 16, 32]
+    values: [1, 8, 16, 32]
     default: 16
+    vllm_flag: "--block-size"
+    notes: >
+      block_size=1 REQUIRED for DeepSeek MLA attention.
+      block_size=32 recommended for Qwen3 on AMD.
+      block_size=16 is the general default.
 
-  # ── Quantisation ─────────────────────────────────────────────────────────
+  kv_cache_dtype:
+    type: choice
+    values: ["auto", "fp8", "fp8_e4m3", "fp8_e5m2", "bfloat16", "float16"]
+    default: "auto"
+    vllm_flag: "--kv-cache-dtype"
+    notes: >
+      fp8 / fp8_e4m3: CUDA 11.8+ and ROCm.
+      auto: uses model dtype. Prefer fp8 on H100/H200/B300/MI300X/MI325X.
+
+  enable_prefix_caching:
+    type: bool_flag
+    default: false
+    vllm_flag: "--enable-prefix-caching"
+    notes: "Enables automatic prefix caching. Reduces TTFT for repeated prefixes."
+
+  max_num_seqs:
+    type: choice
+    values: [32, 64, 128, 256, 512]
+    default: 256
+    vllm_flag: "--max-num-seqs"
+    notes: "Maximum concurrent sequences. Higher = more parallelism but more VRAM."
+
+  max_num_batched_tokens:
+    type: choice
+    values: [2048, 4096, 8192, 16384, 32768, 65536]
+    default: 8192
+    vllm_flag: "--max-num-batched-tokens"
+    notes: "Must be >= max_num_seqs. 32768 recommended for Qwen3 on AMD."
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # ModelConfig — dtype, quantisation, model loading
+  # vLLM args: --dtype, --quantization (-q), --max-model-len,
+  #            --enforce-eager, --load-format, --trust-remote-code
+  # ══════════════════════════════════════════════════════════════════════════
+
+  dtype:
+    type: choice
+    values: ["auto", "bfloat16", "float16", "float32"]
+    default: "auto"
+    vllm_flag: "--dtype"
+    notes: >
+      auto: FP16 for FP32/FP16 models, BF16 for BF16 models.
+      bfloat16: Best for MoE models (DeepSeek, Qwen, MiniMax, Kimi).
+      Validated against gpu_profiles.bf16 at runtime.
+
   quantization:
     type: choice
-    values: [null, "awq", "gptq", "squeezellm"]
+    values: [null, "fp8", "awq", "gptq", "bitsandbytes"]
     default: null
+    vllm_flag: "--quantization"
+    notes: >
+      null: no quantisation (use model dtype).
+      fp8: fastest on H100/H200/B300/MI300X. Requires CUDA 11.8+.
+      awq/gptq: need pre-quantised model checkpoints.
 
-  # ── Scheduler ────────────────────────────────────────────────────────────
+  max_model_len:
+    type: choice
+    values: [4096, 8192, 16384, 32768, 65536, 131072]
+    default: 32768
+    vllm_flag: "--max-model-len"
+    notes: "Context window cap. Larger = more VRAM for KV cache."
+
+  enforce_eager:
+    type: bool_flag
+    default: false
+    vllm_flag: "--enforce-eager"
+    notes: "Disable CUDA graph capture. Reduces startup time but lowers throughput."
+
+  load_format:
+    type: choice
+    values: ["auto", "safetensors", "pt", "dummy"]
+    default: "auto"
+    vllm_flag: "--load-format"
+    notes: >
+      auto: safetensors first, then pytorch bin.
+      dummy: random weights — benchmark/profiling only.
+
+  trust_remote_code:
+    type: bool_flag
+    default: false
+    vllm_flag: "--trust-remote-code"
+    notes: "Required for MiniMax M2.5 and some DeepSeek variants."
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Scheduler / batching
+  # vLLM args: --scheduler-delay-factor, --enable-chunked-prefill
+  # ══════════════════════════════════════════════════════════════════════════
+
   scheduler_delay_factor:
     type: range_float
     min: 0.0
     max: 0.5
     step: 0.1
     default: 0.0
+    vllm_flag: "--scheduler-delay-factor"
+    notes: "Adds delay before scheduling to allow more requests to batch together."
 
   enable_chunked_prefill:
     type: bool_flag
     default: false
+    vllm_flag: "--enable-chunked-prefill"
+    notes: >
+      Splits long prefills across multiple steps.
+      Incompatible with squeezellm quantisation.
 
-  # ── Speculative Decoding (Stage-2) ────────────────────────────────────
-  use_v2_block_manager:
+  # ══════════════════════════════════════════════════════════════════════════
+  # AttentionConfig
+  # vLLM args: --attention-backend
+  # ══════════════════════════════════════════════════════════════════════════
+
+  attention_backend:
+    type: choice
+    values: ["auto", "flash_attn", "flashinfer", "triton", "rocm_flash_attn", "aiter"]
+    default: "auto"
+    vllm_flag: "--attention-backend"
+    notes: >
+      auto: vLLM selects best backend for the hardware.
+      flashinfer: often faster than flash_attn on Hopper.
+      aiter: AMD ROCm — do NOT set manually, let GPU profile handle it.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Stage-2 flags — Speculative Decoding (populated in Step 11)
+  # vLLM args: --speculative-model, --num-speculative-tokens
+  # ══════════════════════════════════════════════════════════════════════════
+
+  speculative_model:
+    type: choice
+    values: [null]                  # populated dynamically at Stage-2
+    default: null
+    vllm_flag: "--speculative-model"
+    notes: "Draft model for speculative decoding."
+
+  num_speculative_tokens:
+    type: choice
+    values: [null, 3, 5, 8]
+    default: null
+    vllm_flag: "--num-speculative-tokens"
+    notes: "Number of tokens to speculate ahead. Only active when speculative_model is set."
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # OffloadConfig — CPU offloading (for memory-constrained setups)
+  # vLLM args: --cpu-offload-gb
+  # ══════════════════════════════════════════════════════════════════════════
+
+  cpu_offload_gb:
+    type: choice
+    values: [0, 10, 20, 40]
+    default: 0
+    vllm_flag: "--cpu-offload-gb"
+    notes: >
+      GiB to offload to CPU per GPU. 0 = disabled.
+      Increases effective VRAM at the cost of latency.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # MoE-specific — all2all backend (expert parallel communication)
+  # vLLM args: --all2all-backend
+  # ══════════════════════════════════════════════════════════════════════════
+
+  all2all_backend:
+    type: choice
+    values:
+      - "allgather_reducescatter"
+      - "deepep_high_throughput"
+      - "deepep_low_latency"
+    default: "allgather_reducescatter"
+    vllm_flag: "--all2all-backend"
+    notes: >
+      Controls MoE expert parallel communication strategy.
+      deepep_high_throughput: better for large batch / high concurrency.
+      deepep_low_latency: better for interactive / low latency workloads.
+      Only used when enable_expert_parallel=true.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Prefix caching hash algorithm
+  # vLLM args: --prefix-caching-hash-algo
+  # ══════════════════════════════════════════════════════════════════════════
+
+  prefix_caching_hash_algo:
+    type: choice
+    values: ["sha256", "xxhash"]
+    default: "sha256"
+    vllm_flag: "--prefix-caching-hash-algo"
+    notes: >
+      xxhash: faster, non-cryptographic. Tiny collision risk.
+      sha256: default, safest for multi-tenant environments.
+      Only matters when enable_prefix_caching=true.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Dual Batch Overlap (Stage-2 advanced — Step 11)
+  # vLLM args: --enable-dbo
+  # ══════════════════════════════════════════════════════════════════════════
+
+  enable_dbo:
     type: bool_flag
     default: false
-
-  speculative_draft_model:
-    type: choice
-    values: [null]           # populated dynamically at Stage-2
-    default: null
-
-  # ── Dtype ────────────────────────────────────────────────────────────────
-  dtype:
-    type: choice
-    values: ["float16", "bfloat16"]
-    default: "float16"
+    vllm_flag: "--enable-dbo"
+    notes: >
+      Dual batch overlap: overlaps compute and communication in MoE layers.
+      Can improve throughput by 10-20% on large MoE models with EP.

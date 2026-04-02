@@ -1,39 +1,232 @@
 # OceanTune AI — Supported Models
-# Each entry maps a short alias to its Hugging Face model ID
-# and hints the system uses to select sensible defaults.
+# ─────────────────────────────────────────────────────────────────────────────
+# nvidia_only: true  → model only runs on NVIDIA GPUs (NVFP4 quantisation)
+# requires_trust_remote_code: true → pass --trust-remote-code to vLLM
+# moe: true → model is Mixture-of-Experts; use enable-expert-parallel
+# mla: true → uses Multi-head Latent Attention (DeepSeek); block_size=1 required
+# tool_call_parser / reasoning_parser → vLLM serve flags to set for this model
+# ─────────────────────────────────────────────────────────────────────────────
 
 models:
-  mistral:
-    hf_id: "mistralai/Mistral-7B-Instruct-v0.2"
-    params_b: 7
-    dtype_default: "float16"
-    min_gpu_mem_gb: 16
-    notes: "Fast baseline; excellent for initial calibration runs."
 
-  deepseek_v3:
-    hf_id: "deepseek-ai/DeepSeek-V3"
+  # ══════════════════════════════════════════════════════════════════════════
+  # DeepSeek V3.2
+  # ══════════════════════════════════════════════════════════════════════════
+
+  deepseek_v3_2:
+    hf_id: "deepseek-ai/DeepSeek-V3.2"
     params_b: 671
-    dtype_default: "float16"
-    min_gpu_mem_gb: 640          # requires multi-node or heavy quantisation
-    notes: "MoE architecture; needs tensor parallelism >= 8."
+    architecture: MoE + MLA
+    moe: true
+    mla: true                       # requires block_size=1
+    nvidia_only: false
+    dtype_default: "bfloat16"
+    dtype_fp8: "fp8_e4m3"
+    min_gpu_mem_gb: 640
+    recommended_tp: 8
+    recommended_dp: 1
+    quantization_options:
+      - null
+      - "fp8"
+    requires_trust_remote_code: true
+    reasoning_parser: null
+    tool_call_parser: null
+    vllm_extra_flags:
+      - "--enable-expert-parallel"
+    notes: >
+      Base DeepSeek-V3.2. MoE + MLA architecture.
+      Set block_size=1 for MLA. Use FP8 quant to fit on 8x H100/MI300X.
 
-  qwen3_235b:
-    hf_id: "Qwen/Qwen3-235B-Instruct"
-    params_b: 235
+  deepseek_v3_2_nvfp4:
+    hf_id: "nvidia/DeepSeek-V3.2-NVFP4"
+    params_b: 671
+    architecture: MoE + MLA (NVFP4 quantised)
+    moe: true
+    mla: true
+    nvidia_only: true               # NVFP4 requires Blackwell (B300) or Hopper+
     dtype_default: "float16"
-    min_gpu_mem_gb: 320
-    notes: "Large MoE; benefits from pipeline parallelism."
+    min_gpu_mem_gb: 320             # ~half VRAM vs BF16 thanks to NVFP4
+    recommended_tp: 4
+    recommended_dp: 1
+    quantization_options:
+      - null                        # already quantised at model level
+    requires_trust_remote_code: false
+    reasoning_parser: null
+    tool_call_parser: null
+    vllm_extra_flags:
+      - "--enable-expert-parallel"
+    notes: >
+      NVIDIA NVFP4 quantised variant of DeepSeek-V3.2.
+      NVIDIA GPUs only (H100, H200, B300). Optimal on B300 (native NVFP4).
 
-  kimi_k2:
-    hf_id: "moonshotai/Kimi-K2-Instruct"
+  # ══════════════════════════════════════════════════════════════════════════
+  # MiniMax M2.5
+  # ══════════════════════════════════════════════════════════════════════════
+
+  minimax_m2_5:
+    hf_id: "MiniMaxAI/MiniMax-M2.5"
+    params_b: 229
+    architecture: MoE
+    moe: true
+    mla: false
+    nvidia_only: false
+    dtype_default: "bfloat16"
+    dtype_supported:
+      - "float32"
+      - "bfloat16"
+      - "fp8_e4m3"
+    min_gpu_mem_gb: 460             # BF16
+    recommended_tp: 4               # 4-GPU deployment is baseline
+    recommended_dp: 1
+    quantization_options:
+      - null
+      - "fp8"
+    requires_trust_remote_code: true
+    tool_call_parser: "minimax_m2"
+    reasoning_parser: "minimax_m2_append_think"
+    deployment_examples:
+      tp4_1node:
+        cmd: >
+          SAFETENSORS_FAST_GPU=1 vllm serve MiniMaxAI/MiniMax-M2.5
+          --trust-remote-code
+          --tensor-parallel-size 4
+          --enable-auto-tool-choice
+          --tool-call-parser minimax_m2
+          --reasoning-parser minimax_m2_append_think
+      tp8_1node:
+        cmd: >
+          SAFETENSORS_FAST_GPU=1 vllm serve MiniMaxAI/MiniMax-M2.5
+          --trust-remote-code
+          --enable-expert-parallel
+          --tensor-parallel-size 8
+          --enable-auto-tool-choice
+          --tool-call-parser minimax_m2
+          --reasoning-parser minimax_m2_append_think
+      tp4_dp2_8gpu:
+        cmd: >
+          SAFETENSORS_FAST_GPU=1 vllm serve MiniMaxAI/MiniMax-M2.5
+          --trust-remote-code
+          --enable-expert-parallel
+          --tensor-parallel-size 4
+          --data-parallel-size 2
+          --enable-auto-tool-choice
+          --tool-call-parser minimax_m2
+          --reasoning-parser minimax_m2_append_think
+    vllm_extra_flags:
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "minimax_m2"
+      - "--reasoning-parser"
+      - "minimax_m2_append_think"
+    docker_image_override:
+      nvidia: "vllm/vllm-openai:v0.17.0-cu130"  # validated image from MiniMax docs
+    notes: >
+      229B MoE. 4-GPU minimum (tp=4). Supports tool use and reasoning parsing.
+      Reference: https://github.com/MiniMax-AI/MiniMax-M2.5/blob/main/docs/vllm_deploy_guide.md
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Kimi K2.5
+  # ══════════════════════════════════════════════════════════════════════════
+
+  kimi_k2_5:
+    hf_id: "moonshotai/Kimi-K2.5"
     params_b: 1000
+    architecture: MoE
+    moe: true
+    mla: false
+    nvidia_only: false
     dtype_default: "bfloat16"
     min_gpu_mem_gb: 800
-    notes: "Very large; use quantisation (AWQ/GPTQ) for single-node."
+    recommended_tp: 8
+    recommended_dp: 1
+    quantization_options:
+      - null
+      - "fp8"
+      - "awq"
+    requires_trust_remote_code: true
+    reasoning_parser: null
+    tool_call_parser: null
+    vllm_extra_flags:
+      - "--enable-expert-parallel"
+    notes: >
+      1T MoE. Requires multi-node or aggressive quantisation for single-node.
+      Use FP8 + tp=8 on 8x H200 or 8x MI300X for single-node deployment.
 
-  minimax_m2:
-    hf_id: "MiniMaxAI/MiniMax-M2-Instruct"   # placeholder — verify on HF
-    params_b: 456
-    dtype_default: "bfloat16"
+  kimi_k2_5_nvfp4:
+    hf_id: "nvidia/Kimi-K2.5-NVFP4"
+    params_b: 1000
+    architecture: MoE (NVFP4 quantised)
+    moe: true
+    mla: false
+    nvidia_only: true
+    dtype_default: "float16"
     min_gpu_mem_gb: 400
-    notes: "Mixture-of-experts; verify HF availability before use."
+    recommended_tp: 8
+    recommended_dp: 1
+    quantization_options:
+      - null
+    requires_trust_remote_code: false
+    reasoning_parser: null
+    tool_call_parser: null
+    vllm_extra_flags:
+      - "--enable-expert-parallel"
+    notes: >
+      NVIDIA NVFP4 quantised Kimi-K2.5. NVIDIA only. Best on B300.
+      Roughly halves VRAM vs BF16 — enables 8x H100 single-node deployment.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Qwen 3.5 397B
+  # ══════════════════════════════════════════════════════════════════════════
+
+  qwen3_5_397b:
+    hf_id: "Qwen/Qwen3.5-397B-A17B"
+    params_b: 397
+    active_params_b: 17             # MoE — 17B active per token
+    architecture: MoE
+    moe: true
+    mla: false
+    nvidia_only: false
+    dtype_default: "bfloat16"
+    min_gpu_mem_gb: 640
+    recommended_tp: 8
+    recommended_dp: 1
+    quantization_options:
+      - null
+      - "fp8"
+    requires_trust_remote_code: false
+    reasoning_parser: null
+    tool_call_parser: "hermes"
+    vllm_extra_flags:
+      - "--enable-expert-parallel"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "hermes"
+    notes: >
+      397B MoE, 17B active. Use enable-expert-parallel.
+      block_size=32 recommended. Works well on MI325X with FP8.
+
+  qwen3_5_397b_nvfp4:
+    hf_id: "nvidia/Qwen3.5-397B-A17B-NVFP4"
+    params_b: 397
+    active_params_b: 17
+    architecture: MoE (NVFP4 quantised)
+    moe: true
+    mla: false
+    nvidia_only: true
+    dtype_default: "float16"
+    min_gpu_mem_gb: 320
+    recommended_tp: 4
+    recommended_dp: 1
+    quantization_options:
+      - null
+    requires_trust_remote_code: false
+    reasoning_parser: null
+    tool_call_parser: "hermes"
+    vllm_extra_flags:
+      - "--enable-expert-parallel"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "hermes"
+    notes: >
+      NVIDIA NVFP4 Qwen3.5-397B. NVIDIA only. ~half VRAM vs BF16.
+      Fits on 4x H100 or 4x H200. Best on B300 (native NVFP4 ops).

@@ -6,10 +6,10 @@ OceanTune AI — Main CLI entry point.
 
 Usage
 -----
-    python oceantune.py --help
-    python oceantune.py run --model mistral --gpu A100
-    python oceantune.py run --config configs/oceantune.yaml
-    python oceantune.py validate-config
+    python3 oceantune.py --help
+    python3 oceantune.py run --model mistral --gpu H100
+    python3 oceantune.py run --config configs/oceantune.yaml
+    python3 oceantune.py validate-config
 """
 
 import sys
@@ -56,10 +56,10 @@ def validate_config(config):
     try:
         cfg = load_config(override_path=path)
     except (ValueError, FileNotFoundError) as exc:
-        click.echo(f"Config validation FAILED: {exc}", err=True)
+        click.echo(f"❌  Config validation FAILED: {exc}", err=True)
         sys.exit(1)
 
-    click.echo("\nConfig valid\n")
+    click.echo("\n✅  Config valid\n")
     click.echo(f"  Model ID   : {cfg.model_id}")
     click.echo(f"  GPU type   : {cfg.gpu_type}")
     click.echo(f"  Strategy   : {cfg.optimiser.strategy}")
@@ -75,12 +75,12 @@ def validate_config(config):
     click.echo(f"  vLLM port     : {cfg.vllm.port}")
     has_hf = bool(cfg.hf_token)
     has_spaces = bool(cfg.spaces.access_key and cfg.spaces.secret_key)
-    click.echo(f"\n  HF_TOKEN set       : {'YES' if has_hf else 'NOT SET'}")
-    click.echo(f"  DO_SPACES_KEY set  : {'YES' if has_spaces else 'NOT SET'}")
+    click.echo(f"\n  HF_TOKEN set       : {'✅' if has_hf else '⚠️  NOT SET'}")
+    click.echo(f"  DO_SPACES_KEY set  : {'✅' if has_spaces else '⚠️  NOT SET'}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# run  (wired to ControllerAgent — fully operational in Step 7)
+# run  (wired to ControllerAgent — fully operational in Step 8)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @cli.command("run")
@@ -107,11 +107,11 @@ def run(config, model, gpu, strategy, dry_run):
     try:
         cfg = load_config(override_path=path)
     except (ValueError, FileNotFoundError) as exc:
-        click.echo(f"Config error: {exc}", err=True)
+        click.echo(f"❌  Config error: {exc}", err=True)
         sys.exit(1)
 
     if dry_run:
-        click.echo("Dry run — config valid. Exiting.")
+        click.echo("✅  Dry run — config valid. Exiting.")
         return
 
     log.info(

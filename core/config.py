@@ -223,6 +223,19 @@ def _validate(cfg: OceanTuneConfig) -> None:
             f"Choose one of: {valid_strategies}"
         )
 
+    # All supported GPU SKUs
+    valid_gpus = {
+        # NVIDIA
+        "H100", "H200", "B300",
+        # AMD
+        "MI300X", "MI325X", "MI350X",
+    }
+    if cfg.gpu_type not in valid_gpus:
+        raise ValueError(
+            f"Unknown gpu_type '{cfg.gpu_type}'. "
+            f"Choose one of: {sorted(valid_gpus)}"
+        )
+
     if cfg.vllm.port < 1024 or cfg.vllm.port > 65535:
         raise ValueError(f"vLLM port {cfg.vllm.port} is out of range [1024, 65535]")
 
