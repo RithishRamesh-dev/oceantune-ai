@@ -17,6 +17,8 @@ OceanTune runs a closed-loop optimisation pipeline:
 
 ## Quick start
 
+### Local (Mac / Linux)
+
 ```bash
 # 1. Clone and create a virtual environment
 git clone https://github.com/RithishRamesh-dev/oceantune-ai
@@ -30,10 +32,29 @@ export DO_SPACES_KEY=...
 export DO_SPACES_SECRET=...
 
 # 3. Validate config
-python oceantune.py validate-config
+python3 oceantune.py validate-config
 
 # 4. Run the optimiser
-python oceantune.py run --model mistral --gpu A100
+python3 oceantune.py run --model mistral --gpu A100
+```
+
+### GPU Droplet (Docker — recommended)
+
+```bash
+# SSH in and run the one-shot bootstrap script
+ssh root@YOUR_DROPLET_IP
+
+export REPO_URL=https://github.com/RithishRamesh-dev/oceantune-ai.git
+export HF_TOKEN=hf_...           # optional — needed for gated models
+git clone $REPO_URL /opt/oceantune-ai
+cd /opt/oceantune-ai
+bash scripts/docker_test.sh      # installs Docker, builds image, runs 98 tests
+
+# Day-to-day after that:
+docker compose run --rm tests            # run test suite (no GPU needed)
+docker compose run --rm tests-gpu        # run tests with GPU passthrough
+docker compose up vllm-server            # launch vLLM on port 8000
+docker compose run --rm optimizer        # full optimisation pipeline
 ```
 
 ---
@@ -42,30 +63,39 @@ python oceantune.py run --model mistral --gpu A100
 
 ```
 oceantune-ai/
-├── oceantune.py          # CLI entry point
-├── requirements.txt      # Pinned dependencies
-├── core/                 # Shared modules
-│   ├── logger.py         # Structured logging (console + JSONL file)
-│   ├── config.py         # YAML + env-var config loader
-│   ├── experiment_runner.py
-│   ├── benchmark_runner.py
-│   ├── metrics_collector.py
-│   ├── log_analyzer.py
-│   ├── optimizer.py
-│   └── recipe_generator.py
+├── oceantune.py              # CLI entry point
+├── requirements.txt          # Pinned dependencies
+├── Dockerfile                # Extends vllm/vllm-openai:latest; runs tests by default
+├── docker-compose.yml        # Services: tests, tests-gpu, vllm-server, optimizer
+├── core/                     # Shared modules
+│   ├── logger.py             # Structured logging (console + JSONL file)
+│   ├── config.py             # YAML + env-var config loader
+│   ├── search_space.py       # Typed params, VLLMFlags, SearchSpace, ConfigValidator
+│   ├── vllm_server.py        # Async vLLM process manager + failure hierarchy
+│   ├── experiment_runner.py  # stub — Step 3
+│   ├── benchmark_runner.py   # stub — Step 4
+│   ├── metrics_collector.py  # stub — Step 5
+│   ├── log_analyzer.py       # stub — Step 5
+│   ├── optimizer.py          # stub — Step 6
+│   └── recipe_generator.py   # stub — Step 9
 ├── agents/
-│   ├── controller_agent.py   # Orchestrates the full pipeline
-│   └── research_agent.py     # Scrapes papers / GitHub for new flag ideas
+│   ├── controller_agent.py   # stub — Step 7
+│   └── research_agent.py     # stub — Step 13
 ├── configs/
 │   ├── oceantune.yaml        # Main config (edit this)
 │   ├── models.yaml           # Supported model registry
 │   ├── gpu_profiles.yaml     # Per-GPU vLLM defaults
 │   └── search_space.yaml     # Parameter ranges for optimisation
+├── scripts/
+│   ├── run_vllm.sh           # Shell wrapper for vLLM (ulimits, PID file, signals)
+│   └── docker_test.sh        # One-shot droplet bootstrap + test runner
 ├── storage/
-│   ├── logs/                 # Per-session JSONL logs
-│   └── results/              # Benchmark results and recipes
-├── scripts/                  # Shell helpers
-└── ci/                       # GitHub Actions workflows
+│   ├── logs/                 # Per-session JSONL logs (gitignored)
+│   └── results/              # Benchmark results and recipes (gitignored)
+├── tests/
+│   ├── test_search_space.py  # 49 tests — Step 2
+│   └── test_vllm_server.py   # 49 tests — Step 3
+└── ci/                       # GitHub Actions workflows (Step 10)
 ```
 
 ---
@@ -95,6 +125,34 @@ python oceantune.py run --model mistral      # run full pipeline
 python oceantune.py run --strategy bayesian  # override search strategy
 python oceantune.py info                     # print system / GPU info
 ```
+
+---
+
+## Docker
+
+The repo ships with a [Dockerfile](Dockerfile) and [docker-compose.yml](docker-compose.yml) that extend `vllm/vllm-openai:latest`. This is the canonical way to run on the GPU droplet.
+
+```bash
+# Build once (or after requirements.txt / Dockerfile change)
+docker build -t oceantune-ai:latest .
+
+# Run the full 98-test suite (no GPU needed — all tests are mocked)
+docker compose run --rm tests
+
+# Run with GPU passthrough
+docker compose run --rm tests-gpu
+
+# Launch an interactive vLLM server on port 8000
+docker compose up vllm-server
+
+# Full optimisation pipeline
+docker compose run --rm optimizer
+```
+
+Secrets are loaded from `.env` (see `.env.example` for the template — never commit `.env`).
+
+### Known behaviour of the base image
+The `vllm/vllm-openai:latest` base image sets `ENTRYPOINT ["vllm"]`. The Dockerfile overrides this with `ENTRYPOINT []` so `CMD` / `docker run <args>` work normally without accidentally invoking the vLLM CLI. The base image also ships its own versions of `pydantic`, `numpy`, `openai`, and `httpx` — the Dockerfile only installs packages that are genuinely missing (`pyyaml`, `python-dotenv`, `structlog`, `boto3`, `pytest`, `pytest-asyncio`) to avoid downgrading vLLM's own dependencies.
 
 ---
 
@@ -295,13 +353,12 @@ Key files: [core/vllm_server.py](core/vllm_server.py), [scripts/run_vllm.sh](scr
 
 **Test suite — 49/49 new tests, 98/98 total (zero regressions)**
 
-Ran on the DigitalOcean droplet (165.245.171.90) inside `python:3.12-slim` Docker container — no GPU, no vLLM installation required (all subprocess and HTTP calls are mocked):
+Ran on the DigitalOcean droplet (165.245.171.90) inside `oceantune-ai:latest` — built on `vllm/vllm-openai:latest` with `ENTRYPOINT []` so pytest runs directly. All subprocess and HTTP calls are mocked; no GPU required:
 
 ```
-$ docker run --rm -v /opt/oceantune-ai:/workspace -w /workspace python:3.12-slim \
-    bash -c 'pip install pytest pytest-asyncio pyyaml httpx click --quiet && pytest tests/ -v'
+$ docker run --rm oceantune-ai:latest
 
-platform linux -- Python 3.12.13, pytest-9.0.2
+platform linux -- Python 3.12.13, pytest-8.2.0
 collected 98 items
 
 tests/test_search_space.py::TestChoiceParam::test_sample_is_in_values PASSED
@@ -326,16 +383,16 @@ tests/test_vllm_server.py::TestExceptionHierarchy::test_formatted_tail_truncates
 
 ---
 
-### Step 3 — Experiment runner
+### Step 4 — Experiment runner
 **Status: pending**
 
-Composes the vLLM manager (Step 2) and benchmark runner (Step 4) into a single `run_experiment(config, vllm_flags) -> ExperimentResult` call. Handles retries on startup failure and persists raw results to `storage/results/`.
+Composes the vLLM server manager (Step 3) and benchmark runner (Step 5) into a single `run_experiment(config, vllm_flags) -> ExperimentResult` call. Handles retries on startup failure and persists raw results to `storage/results/`.
 
 Key files: `core/experiment_runner.py`
 
 ---
 
-### Step 4 — Benchmark engine
+### Step 5 — Benchmark engine
 **Status: pending**
 
 Drives the vLLM OpenAI-compatible endpoint with controlled concurrency ramps. Measures throughput (tokens/s), p50/p95/p99 latency, and time-to-first-token across all `context_configs`. Uses `asyncio` + `httpx` for accurate concurrent load.
@@ -344,7 +401,7 @@ Key files: `core/benchmark_runner.py`
 
 ---
 
-### Step 5 — Metrics collector & log analyser
+### Step 6 — Metrics collector & log analyser
 **Status: pending**
 
 Parses benchmark output into structured `MetricsSnapshot` objects. Also tails vLLM's own logs to extract KV-cache hit rate, scheduler queue depth, and OOM events — signals the optimiser uses to avoid dead regions of the search space.
@@ -353,7 +410,7 @@ Key files: `core/metrics_collector.py`, `core/log_analyzer.py`
 
 ---
 
-### Step 6 — Optimisation engine
+### Step 7 — Optimisation engine
 **Status: pending**
 
 Implements four search strategies over the parameter space defined in `configs/search_space.yaml`:
@@ -367,16 +424,16 @@ Key files: `core/optimizer.py`
 
 ---
 
-### Step 7 — Controller agent
+### Step 8 — Controller agent
 **Status: pending**
 
-Top-level orchestrator that wires Steps 2–6 into the full pipeline loop. Reads config, initialises the search strategy, drives generations, emits progress to the logger, and hands the best result to the recipe generator. Entry point for `python oceantune.py run`.
+Top-level orchestrator that wires Steps 3–7 into the full pipeline loop. Reads config, initialises the search strategy, drives generations, emits progress to the logger, and hands the best result to the recipe generator. Entry point for `python3 oceantune.py run`.
 
 Key files: `agents/controller_agent.py`
 
 ---
 
-### Step 8 — DigitalOcean Spaces storage
+### Step 9 — DigitalOcean Spaces storage
 **Status: pending**
 
 Uploads experiment results, logs, and final recipes to the configured DO Spaces bucket using `boto3`. Implements a local-first cache so re-runs skip already-completed experiments.
@@ -385,7 +442,7 @@ Key files: `core/storage.py`
 
 ---
 
-### Step 9 — Recipe generator
+### Step 10 — Recipe generator
 **Status: pending**
 
 Takes the best `ExperimentResult` and produces a human-readable, copy-paste-ready vLLM launch recipe: a shell script, a `docker run` command, and a JSON summary. Recipes are versioned by model + GPU + context profile.
@@ -394,7 +451,7 @@ Key files: `core/recipe_generator.py`
 
 ---
 
-### Step 10 — GitHub Actions CI
+### Step 11 — GitHub Actions CI
 **Status: pending**
 
 Workflow that runs on push: installs dependencies, runs `validate-config`, executes the unit-test suite, and (on `main`) triggers a real optimisation run on a self-hosted GPU runner.
@@ -403,7 +460,7 @@ Key files: `ci/oceantune.yml`
 
 ---
 
-### Step 11 — Multi-model & multi-GPU matrix
+### Step 12 — Multi-model & multi-GPU matrix
 **Status: pending**
 
 Extends the controller to fan out experiments across all entries in `configs/models.yaml` and `configs/gpu_profiles.yaml` in parallel, using `asyncio` task groups. Produces a comparison table of best recipes per (model, GPU) pair.
@@ -412,7 +469,7 @@ Key files: `agents/controller_agent.py` (extended), `core/matrix_runner.py`
 
 ---
 
-### Step 12 — Speculative decoding support
+### Step 13 — Speculative decoding support
 **Status: pending**
 
 Adds draft-model selection to the search space. The optimiser can now evaluate `speculative_draft_model` + `num_speculative_tokens` combinations and measure the acceptance rate vs. latency trade-off.
@@ -421,7 +478,7 @@ Key files: `core/spec_decoding.py`, `configs/search_space.yaml` (extended)
 
 ---
 
-### Step 13 — Research agent
+### Step 14 — Research agent
 **Status: pending**
 
 Periodically scrapes arXiv, vLLM's GitHub issues, and the vLLM changelog for new flags or techniques. Summarises findings using Claude and proposes additions to `configs/search_space.yaml` as a pull request.
