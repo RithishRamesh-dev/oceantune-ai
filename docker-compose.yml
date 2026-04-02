@@ -1,0 +1,115 @@
+# OceanTune AI — Docker Compose
+#
+# Usage on GPU droplet:
+#
+#   # Run tests only (no GPU required)
+#   docker compose run --rm tests
+#
+#   # Run tests WITH GPU access
+#   docker compose run --rm tests-gpu
+#
+#   # Launch the vLLM server interactively
+#   docker compose up vllm-server
+#
+#   # Full optimisation pipeline
+#   docker compose run --rm optimizer
+
+name: oceantune-ai
+
+services:
+
+  # ── Test runner (no GPU — works on any machine) ───────────────────────
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oceantune-ai:latest
+    container_name: oceantune-tests
+    command: pytest tests/ -v --tb=short --asyncio-mode=auto
+    volumes:
+      - ./storage:/workspace/oceantune-ai/storage
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - DO_SPACES_KEY=${DO_SPACES_KEY:-}
+      - DO_SPACES_SECRET=${DO_SPACES_SECRET:-}
+
+  # ── Test runner WITH GPU (verifies CUDA is accessible) ───────────────
+  tests-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oceantune-ai:latest
+    container_name: oceantune-tests-gpu
+    command: pytest tests/ -v --tb=short --asyncio-mode=auto
+    volumes:
+      - ./storage:/workspace/oceantune-ai/storage
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - DO_SPACES_KEY=${DO_SPACES_KEY:-}
+      - DO_SPACES_SECRET=${DO_SPACES_SECRET:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Interactive vLLM server (for manual testing) ──────────────────────
+  vllm-server:
+    image: oceantune-ai:latest
+    container_name: oceantune-vllm
+    command: >
+      python -m vllm.entrypoints.openai.api_server
+        --model ${OCEANTUNE_MODEL_ID:-mistralai/Mistral-7B-Instruct-v0.2}
+        --host 0.0.0.0
+        --port 8000
+        --gpu-memory-utilization 0.90
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./storage:/workspace/oceantune-ai/storage
+      - huggingface-cache:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - TOKENIZERS_PARALLELISM=false
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # ── Full optimisation pipeline ────────────────────────────────────────
+  optimizer:
+    image: oceantune-ai:latest
+    container_name: oceantune-optimizer
+    command: python oceantune.py run
+    volumes:
+      - ./storage:/workspace/oceantune-ai/storage
+      - huggingface-cache:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - DO_SPACES_KEY=${DO_SPACES_KEY:-}
+      - DO_SPACES_SECRET=${DO_SPACES_SECRET:-}
+      - OCEANTUNE_MODEL_ID=${OCEANTUNE_MODEL_ID:-mistralai/Mistral-7B-Instruct-v0.2}
+      - OCEANTUNE_GPU_TYPE=${OCEANTUNE_GPU_TYPE:-A100}
+      - OCEANTUNE_STRATEGY=${OCEANTUNE_STRATEGY:-evolutionary}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  huggingface-cache:
+    driver: local
