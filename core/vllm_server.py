@@ -449,7 +449,7 @@ class VLLMServer:
             gpu_type=self.gpu_type,
         )
         return [
-            "python", "-m", "vllm.entrypoints.openai.api_server",
+            "python3", "-m", "vllm.entrypoints.openai.api_server",
             "--host", self.host,
             "--port", str(self.port),
             *vllm_args,

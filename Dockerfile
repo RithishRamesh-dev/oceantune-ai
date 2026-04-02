@@ -31,23 +31,14 @@ RUN apt-get update -qq && \
 WORKDIR /workspace/oceantune-ai
 
 # ── Python test dependencies ───────────────────────────────────────────────
-# Copy requirements first so Docker layer-caches the pip install
-COPY requirements.txt .
-
-# Skip vllm — already in base image
+# Only install packages not already provided by the vLLM base image.
+# We do NOT re-pin pydantic/numpy/openai/httpx — the base image has
+# compatible versions already. Pinning them here would downgrade vLLM's deps.
 RUN pip install --no-cache-dir \
-        pyyaml==6.0.1 \
-        python-dotenv==1.0.1 \
-        pydantic==2.7.1 \
-        httpx==0.27.0 \
-        requests==2.32.2 \
-        pandas==2.2.2 \
-        numpy==1.26.4 \
-        boto3==1.34.107 \
-        rich==13.7.1 \
-        structlog==24.1.0 \
-        openai==1.30.1 \
-        click==8.1.7 \
+        pyyaml \
+        python-dotenv \
+        structlog \
+        boto3 \
         pytest==8.2.0 \
         pytest-asyncio==0.23.6
 
@@ -60,7 +51,7 @@ RUN mkdir -p storage/logs storage/results
 # ── Smoke test at build time ───────────────────────────────────────────────
 # Validates imports and config loading work inside the container.
 # Runs without GPU — pure Python only.
-RUN python oceantune.py validate-config
+RUN python3 oceantune.py validate-config
 
 # ── Default command: run the full test suite ───────────────────────────────
-CMD ["pytest", "tests/", "-v", "--tb=short", "--asyncio-mode=auto"]
+CMD ["python3", "-m", "pytest", "tests/", "-v", "--tb=short", "--asyncio-mode=auto"]

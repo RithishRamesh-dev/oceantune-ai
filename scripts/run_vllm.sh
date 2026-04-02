@@ -57,7 +57,7 @@ echo "[run_vllm.sh] Launching vLLM on ${HOST}:${PORT}" >&2
 echo "[run_vllm.sh] Log file: ${LOG_FILE}" >&2
 echo "[run_vllm.sh] Args: $*" >&2
 
-python -m vllm.entrypoints.openai.api_server \
+python3 -m vllm.entrypoints.openai.api_server \
     --host "$HOST" \
     --port "$PORT" \
     "$@" \

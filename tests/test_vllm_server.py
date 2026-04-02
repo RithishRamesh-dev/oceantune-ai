@@ -181,7 +181,7 @@ class TestBuildCommand:
     def test_starts_with_python_m(self):
         s = make_server_instance()
         cmd = s._build_command()
-        assert cmd[0] == "python"
+        assert cmd[0] == "python3"
         assert cmd[1] == "-m"
 
     def test_tensor_parallel_in_args(self):

@@ -25,7 +25,7 @@ services:
       dockerfile: Dockerfile
     image: oceantune-ai:latest
     container_name: oceantune-tests
-    command: pytest tests/ -v --tb=short --asyncio-mode=auto
+    command: python3 -m pytest tests/ -v --tb=short --asyncio-mode=auto
     volumes:
       - ./storage:/workspace/oceantune-ai/storage
     environment:
@@ -40,7 +40,7 @@ services:
       dockerfile: Dockerfile
     image: oceantune-ai:latest
     container_name: oceantune-tests-gpu
-    command: pytest tests/ -v --tb=short --asyncio-mode=auto
+    command: python3 -m pytest tests/ -v --tb=short --asyncio-mode=auto
     volumes:
       - ./storage:/workspace/oceantune-ai/storage
     environment:

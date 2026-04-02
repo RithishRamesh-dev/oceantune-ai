@@ -144,7 +144,7 @@ docker run \
     --env-file .env \
     --volume "$CLONE_DIR/storage:/workspace/oceantune-ai/storage" \
     "$IMAGE_NAME" \
-    pytest tests/ -v --tb=short --asyncio-mode=auto
+    python3 -m pytest tests/ -v --tb=short --asyncio-mode=auto
 
 TEST_EXIT=$?
 echo ""
