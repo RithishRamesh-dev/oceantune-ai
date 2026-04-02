@@ -1,0 +1,55 @@
+# OceanTune AI — GPU Profiles
+# These are starting-point hints for vLLM flags per GPU type.
+# The optimisation engine will mutate these during search.
+
+gpu_profiles:
+  A100:
+    vendor: "nvidia"
+    vram_gb: 80
+    fp16: true
+    bf16: true
+    flash_attention: true
+    default_gpu_memory_utilization: 0.90
+    max_tensor_parallel: 8
+    notes: "Primary target GPU — high-bandwidth HBM2e."
+
+  H100:
+    vendor: "nvidia"
+    vram_gb: 80
+    fp16: true
+    bf16: true
+    flash_attention: true
+    default_gpu_memory_utilization: 0.92
+    max_tensor_parallel: 8
+    notes: "Higher throughput than A100; FP8 native support."
+
+  A10G:
+    vendor: "nvidia"
+    vram_gb: 24
+    fp16: true
+    bf16: false
+    flash_attention: true
+    default_gpu_memory_utilization: 0.88
+    max_tensor_parallel: 2
+    notes: "Cost-effective; limited VRAM means more aggressive quant."
+
+  RTX4090:
+    vendor: "nvidia"
+    vram_gb: 24
+    fp16: true
+    bf16: true
+    flash_attention: true
+    default_gpu_memory_utilization: 0.85
+    max_tensor_parallel: 1
+    notes: "Consumer GPU; GDDR6X vs HBM — lower bandwidth."
+
+  MI300X:
+    vendor: "amd"
+    vram_gb: 192
+    fp16: true
+    bf16: true
+    flash_attention: false       # use ROCm-native FlashAttention
+    default_gpu_memory_utilization: 0.90
+    max_tensor_parallel: 8
+    notes: "AMD GPU; pass --device rocm to vLLM."
+    vllm_extra_flags: ["--device", "rocm"]

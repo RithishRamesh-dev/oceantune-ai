@@ -1,0 +1,39 @@
+# OceanTune AI — Supported Models
+# Each entry maps a short alias to its Hugging Face model ID
+# and hints the system uses to select sensible defaults.
+
+models:
+  mistral:
+    hf_id: "mistralai/Mistral-7B-Instruct-v0.2"
+    params_b: 7
+    dtype_default: "float16"
+    min_gpu_mem_gb: 16
+    notes: "Fast baseline; excellent for initial calibration runs."
+
+  deepseek_v3:
+    hf_id: "deepseek-ai/DeepSeek-V3"
+    params_b: 671
+    dtype_default: "float16"
+    min_gpu_mem_gb: 640          # requires multi-node or heavy quantisation
+    notes: "MoE architecture; needs tensor parallelism >= 8."
+
+  qwen3_235b:
+    hf_id: "Qwen/Qwen3-235B-Instruct"
+    params_b: 235
+    dtype_default: "float16"
+    min_gpu_mem_gb: 320
+    notes: "Large MoE; benefits from pipeline parallelism."
+
+  kimi_k2:
+    hf_id: "moonshotai/Kimi-K2-Instruct"
+    params_b: 1000
+    dtype_default: "bfloat16"
+    min_gpu_mem_gb: 800
+    notes: "Very large; use quantisation (AWQ/GPTQ) for single-node."
+
+  minimax_m2:
+    hf_id: "MiniMaxAI/MiniMax-M2-Instruct"   # placeholder — verify on HF
+    params_b: 456
+    dtype_default: "bfloat16"
+    min_gpu_mem_gb: 400
+    notes: "Mixture-of-experts; verify HF availability before use."

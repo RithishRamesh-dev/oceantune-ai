@@ -1,0 +1,79 @@
+# OceanTune AI — Optimisation Search Space
+# Defines the ranges/choices the optimisation engine explores per flag.
+# Types: choice (list), range_int, range_float, bool_flag
+
+search_space:
+
+  # ── Parallelism ──────────────────────────────────────────────────────────
+  tensor_parallel_size:
+    type: choice
+    values: [1, 2, 4, 8]
+    default: 1
+
+  pipeline_parallel_size:
+    type: choice
+    values: [1, 2, 4]
+    default: 1
+
+  # ── Memory ───────────────────────────────────────────────────────────────
+  gpu_memory_utilization:
+    type: range_float
+    min: 0.70
+    max: 0.95
+    step: 0.05
+    default: 0.90
+
+  max_num_seqs:
+    type: choice
+    values: [64, 128, 256, 512]
+    default: 256
+
+  max_num_batched_tokens:
+    type: choice
+    values: [2048, 4096, 8192, 16384, 32768]
+    default: 8192
+
+  # ── KV Cache ─────────────────────────────────────────────────────────────
+  kv_cache_dtype:
+    type: choice
+    values: ["auto", "fp8_e5m2"]
+    default: "auto"
+
+  block_size:
+    type: choice
+    values: [8, 16, 32]
+    default: 16
+
+  # ── Quantisation ─────────────────────────────────────────────────────────
+  quantization:
+    type: choice
+    values: [null, "awq", "gptq", "squeezellm"]
+    default: null
+
+  # ── Scheduler ────────────────────────────────────────────────────────────
+  scheduler_delay_factor:
+    type: range_float
+    min: 0.0
+    max: 0.5
+    step: 0.1
+    default: 0.0
+
+  enable_chunked_prefill:
+    type: bool_flag
+    default: false
+
+  # ── Speculative Decoding (Stage-2) ────────────────────────────────────
+  use_v2_block_manager:
+    type: bool_flag
+    default: false
+
+  speculative_draft_model:
+    type: choice
+    values: [null]           # populated dynamically at Stage-2
+    default: null
+
+  # ── Dtype ────────────────────────────────────────────────────────────────
+  dtype:
+    type: choice
+    values: ["float16", "bfloat16"]
+    default: "float16"

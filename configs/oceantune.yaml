@@ -1,0 +1,56 @@
+# OceanTune AI — Main Configuration
+# Edit this file to change what model / GPU / search strategy to use.
+# Secrets (API keys, tokens) MUST be set as environment variables, not here.
+
+# ── Model ─────────────────────────────────────────────────────────────────
+# Hugging Face model ID — any model supported by vLLM works here.
+# Supported: mistralai/Mistral-7B-Instruct-v0.2, deepseek-ai/DeepSeek-V3,
+#            Qwen/Qwen3-235B-Instruct, moonshotai/Kimi-K2, etc.
+model_id: "mistralai/Mistral-7B-Instruct-v0.2"
+
+# GPU profile used for vendor-specific flag selection
+# Options: A100 | H100 | A10G | RTX4090 | MI300X (AMD)
+gpu_type: "A100"
+
+# ── DigitalOcean Spaces ───────────────────────────────────────────────────
+spaces:
+  bucket: "oceantune-results"
+  region: "nyc3"
+  endpoint_url: "https://nyc3.digitaloceanspaces.com"
+  # Credentials → env vars: DO_SPACES_KEY  DO_SPACES_SECRET
+
+# ── vLLM Server ───────────────────────────────────────────────────────────
+vllm:
+  host: "0.0.0.0"
+  port: 8000
+  startup_timeout_sec: 300
+
+# ── Benchmark Engine ──────────────────────────────────────────────────────
+benchmark:
+  # Concurrency ramp — how many concurrent requests per benchmark run
+  concurrency_levels: [1, 2, 4, 8, 16, 32, 64]
+  # Number of prompts to send per concurrency level
+  num_prompts: 200
+  # Default token lengths (overridden per context_config)
+  input_len: 1024
+  output_len: 1024
+
+# ── Optimisation Engine ───────────────────────────────────────────────────
+optimiser:
+  strategy: "evolutionary"      # evolutionary | grid | random | bayesian
+  population_size: 10
+  generations: 5
+  mutation_rate: 0.2
+  elite_fraction: 0.2
+  primary_metric: "throughput"  # throughput | p95_latency | ttft
+
+# ── Context-Length Evaluation Matrix ─────────────────────────────────────
+# Each pair is [input_tokens, output_tokens].
+# Each combination generates a separate optimisation recipe.
+context_configs:
+  - [1024,  1024]
+  - [1024,  4096]
+  - [1024,  8192]
+  - [2048,  8192]
+  - [4096, 16384]
+  - [8192, 32768]
