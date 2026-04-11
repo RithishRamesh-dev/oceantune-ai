@@ -1,0 +1,163 @@
+# OceanTune AI — DigitalOcean Serverless Inference Model Registry
+# ─────────────────────────────────────────────────────────────────────────────
+# These models are available via DigitalOcean's Serverless Inference endpoint.
+# The endpoint is OpenAI-compatible: use the openai SDK with base_url set to
+# your DO Serverless Inference URL.
+#
+# DO Serverless Inference docs:
+#   https://docs.digitalocean.com/products/ai-ml/serverless-inference/
+#
+# How to get your credentials:
+#   1. Go to cloud.digitalocean.com → AI & ML → Serverless Inference
+#   2. Create a deployment for your chosen model
+#   3. Copy the endpoint URL and API key
+#   4. Set in .env:
+#        DO_INFERENCE_KEY=your_key
+#        DO_INFERENCE_ENDPOINT=https://inference.do-ai.run/v1
+#        DO_INFERENCE_MODEL=deepseek-ai/DeepSeek-R1          # optional override
+#
+# suitability_score: 0.0–1.0 rating for OceanTune's reasoning task
+#   Criteria: instruction following, structured JSON output, tool use,
+#             reasoning about performance metrics and system configuration
+#
+# supports_function_calling: whether the model supports OpenAI tool_use
+#   If false, the agent falls back to JSON-in-prompt mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+inference_models:
+
+  # ── Recommended: best reasoning + tool use ────────────────────────────────
+
+  deepseek_r1:
+    model_id: "deepseek-ai/DeepSeek-R1"
+    display_name: "DeepSeek R1"
+    provider: "deepseek"
+    context_window: 128000
+    supports_function_calling: true
+    suitability_score: 0.97
+    strengths:
+      - "State-of-the-art reasoning (thinks before answering)"
+      - "Excellent at analysing metrics and proposing targeted changes"
+      - "Strong structured JSON output"
+      - "Deep knowledge of ML infrastructure and distributed systems"
+    recommended_for: "primary agent — highest reasoning quality"
+    notes: >
+      Best choice for OceanTune. The chain-of-thought reasoning helps it
+      identify non-obvious performance bottlenecks (e.g. NCCL vs compute bound).
+      Use as default if available in your DO region.
+
+  deepseek_v3:
+    model_id: "deepseek-ai/DeepSeek-V3"
+    display_name: "DeepSeek V3"
+    provider: "deepseek"
+    context_window: 128000
+    supports_function_calling: true
+    suitability_score: 0.93
+    strengths:
+      - "Strong instruction following"
+      - "Reliable structured JSON"
+      - "Good ML infrastructure knowledge"
+      - "Faster than R1"
+    recommended_for: "primary agent — good balance of speed and quality"
+    notes: >
+      Slightly faster than R1 with marginally lower reasoning depth.
+      Good choice when you want faster iteration between experiments.
+
+  llama3_3_70b:
+    model_id: "meta-llama/Llama-3.3-70B-Instruct"
+    display_name: "Llama 3.3 70B Instruct"
+    provider: "meta"
+    context_window: 128000
+    supports_function_calling: true
+    suitability_score: 0.82
+    strengths:
+      - "Strong function calling support"
+      - "Good instruction following"
+      - "Open weights — predictable behaviour"
+    recommended_for: "secondary agent — open model, strong baseline"
+    notes: >
+      Solid open-source alternative. Function calling works well.
+      May need more explicit prompting for nuanced performance analysis.
+
+  llama3_1_405b:
+    model_id: "meta-llama/Llama-3.1-405B-Instruct"
+    display_name: "Llama 3.1 405B Instruct"
+    provider: "meta"
+    context_window: 128000
+    supports_function_calling: true
+    suitability_score: 0.85
+    strengths:
+      - "Large model — strong reasoning"
+      - "Excellent instruction following"
+      - "Good at complex multi-step analysis"
+    recommended_for: "high-quality open model option"
+    notes: >
+      Larger than 70B, better at complex reasoning tasks.
+      Higher latency per call but better proposal quality.
+
+  mistral_large:
+    model_id: "mistralai/Mistral-Large-Instruct-2411"
+    display_name: "Mistral Large 2411"
+    provider: "mistral"
+    context_window: 128000
+    supports_function_calling: true
+    suitability_score: 0.84
+    strengths:
+      - "Native function calling"
+      - "Strong at structured output"
+      - "Fast inference"
+      - "Good at following complex schemas"
+    recommended_for: "fast agent with reliable tool use"
+    notes: >
+      Mistral's function calling is very reliable — low rate of
+      malformed JSON proposals. Good for high-throughput experiment loops.
+
+  mixtral_8x22b:
+    model_id: "mistralai/Mixtral-8x22B-Instruct-v0.1"
+    display_name: "Mixtral 8x22B Instruct"
+    provider: "mistral"
+    context_window: 65536
+    supports_function_calling: true
+    suitability_score: 0.80
+    strengths:
+      - "MoE architecture — fast inference"
+      - "Good reasoning at lower cost"
+      - "Reliable JSON output"
+    recommended_for: "cost-effective agent option"
+    notes: >
+      Good balance of cost and quality. The MoE architecture means
+      fast tokens without sacrificing too much reasoning depth.
+
+  # ── JSON-prompt mode (no native tool calling) ────────────────────────────
+
+  llama3_2_90b:
+    model_id: "meta-llama/Llama-3.2-90B-Vision-Instruct"
+    display_name: "Llama 3.2 90B Vision"
+    provider: "meta"
+    context_window: 128000
+    supports_function_calling: false
+    suitability_score: 0.72
+    strengths:
+      - "Vision capability (can read charts/graphs)"
+      - "Good reasoning"
+    recommended_for: "experimental — vision not used by OceanTune currently"
+    notes: >
+      Uses JSON-in-prompt mode since function calling support varies.
+      Vision capability is not used by OceanTune but may be useful
+      for future chart-reading features.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model selection strategy
+# ─────────────────────────────────────────────────────────────────────────────
+# OceanTune selects the model in this order:
+#   1. DO_INFERENCE_MODEL env var (explicit override)
+#   2. Highest suitability_score model that supports_function_calling
+#   3. Any model in the registry (JSON-prompt fallback)
+#   4. Evolutionary optimiser (if DO_INFERENCE_KEY not set)
+#
+# The selected model is logged at agent startup so you can verify which
+# model is driving your optimisation session.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default model used when DO_INFERENCE_MODEL is not set
+default_model: "deepseek-ai/DeepSeek-R1"

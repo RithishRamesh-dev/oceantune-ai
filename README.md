@@ -251,7 +251,7 @@ oceantune-ai/
 │   ├── do_client.py           # DO Serverless Inference HTTP client
 │   └── research_agent.py      # stub — future arXiv/GitHub flag scraper
 ├── core/
-│   ├── config.py              # Config dataclasses (DatabaseConfig, NodeConfig, CoordinatorConfig added)
+│   ├── config.py              # Config dataclasses (DatabaseConfig, NodeConfig, CoordinatorConfig)
 │   ├── db.py                  # MongoDB async client + 5 collections + analytics pipelines
 │   ├── coordinator.py         # Parallel dispatch loop across GPU Droplets
 │   ├── node_client.py         # HTTP client for remote Node Servers
@@ -263,8 +263,6 @@ oceantune-ai/
 │   ├── benchmark_runner.py    # BenchmarkEngine (22 regex patterns)
 │   ├── metrics_collector.py   # EnrichedMetrics + fitness scoring
 │   ├── log_analyzer.py        # 14 error-class patterns + startup timing
-│   ├── optimizer.py           # Evolutionary/Grid/Random/Bayesian optimisers
-│   ├── storage.py             # Legacy CSV+JSON+Spaces storage (kept for compatibility)
 │   └── logger.py              # Structured logging
 ├── node/
 │   ├── node_server.py         # FastAPI server running on each GPU Droplet
@@ -394,10 +392,8 @@ tests/test_vllm_server.py        50 passed
 tests/test_benchmark_runner.py   53 passed
 tests/test_log_analyzer.py       36 passed
 tests/test_metrics_collector.py  32 passed
-tests/test_storage.py            33 passed
-tests/test_optimizer.py          61 passed
 ─────────────────────────────────────────
-Total                           331 passed
+Total                           238 passed
 ```
 
 All tests are mocked — no GPU, no live server, no Hugging Face token required.
