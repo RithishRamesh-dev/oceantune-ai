@@ -5,7 +5,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-# Full Hugging Face model ID or alias from configs/models.yaml.
+# Alias from configs/models.yaml  OR  a full Hugging Face model ID.
 #
 # Available aliases:
 #   NVIDIA + AMD:
@@ -28,6 +28,68 @@ model_id: "deepseek-ai/DeepSeek-V3.2"
 # AMD:     MI300X  |  MI325X  |  MI350X
 #
 gpu_type: "H100"
+
+# ── AI Agent — DigitalOcean Serverless Inference ─────────────────────────────
+# All agents (Planner, Executor, Analyst, Kernel Optimizer) call DO Serverless
+# Inference. Credentials go in .env (DO_INFERENCE_KEY, DO_INFERENCE_ENDPOINT).
+#
+# Override which model the agent uses (optional — defaults to highest-rated):
+#   export DO_INFERENCE_MODEL=deepseek-ai/DeepSeek-R1
+#
+# Available models are defined in configs/inference_models.yaml.
+# If DO_INFERENCE_KEY is not set, the agent falls back to evolutionary search.
+agent:
+  # Model selection: "auto" picks highest suitability_score from registry
+  # or set a specific model_id from configs/inference_models.yaml
+  model: "auto"
+  # Max tokens the agent can use per reasoning turn
+  max_tokens: 4096
+  # Seconds before an agent API call times out
+  timeout_sec: 120
+  # Max tool-call turns per proposal round (prevents infinite loops)
+  max_turns: 6
+  # Temperature: lower = more deterministic proposals
+  temperature: 0.3
+
+# ── Database — MongoDB ────────────────────────────────────────────────────────
+# All benchmark results, session metadata, and kernel results are stored in
+# MongoDB for analytics and cross-session deduplication.
+# Credentials go in .env: MONGO_URI (full connection string)
+database:
+  # Connection URI — override via MONGO_URI env var
+  uri: "mongodb://localhost:27017"
+  # Database name
+  name: "oceantune"
+  # Collections (rarely need changing)
+  collections:
+    sessions: "sessions"
+    nodes: "nodes"
+    configs: "configs"
+    benchmark_runs: "benchmark_runs"
+    kernel_runs: "kernel_runs"
+
+# ── GPU Nodes ─────────────────────────────────────────────────────────────────
+# List of GPU droplets that the Coordinator dispatches work to.
+# Each node runs node/node_server.py (FastAPI) on node_port.
+# gpu_indices: which physical GPU indices this node exposes.
+# For a single-node setup, point to localhost.
+nodes:
+  - host: "localhost"
+    node_port: 9000
+    gpu_type: "H100"
+    gpu_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+
+# ── Coordinator ───────────────────────────────────────────────────────────────
+coordinator:
+  # Max vLLM instances per node (limited by GPU count and tensor_parallel_size)
+  max_parallel_per_node: 2
+  # Port pool for vLLM instances on each node (8000–8099)
+  port_pool_start: 8000
+  port_pool_end: 8099
+  # Seconds between coordinator dispatch-loop ticks
+  poll_interval_sec: 5
+  # Retry a config this many times before marking it failed
+  max_retries: 2
 
 # ── DigitalOcean Spaces ───────────────────────────────────────────────────────
 spaces:

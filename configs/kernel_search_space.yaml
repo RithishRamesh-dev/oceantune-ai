@@ -1,0 +1,179 @@
+# OceanTune AI — Stage 2 Kernel Search Space
+# ─────────────────────────────────────────────────────────────────────────────
+# These parameters control low-level kernel and runtime behaviour in vLLM.
+# Unlike Stage 1 (VLLMFlags), these are explored via iterative LLM-guided
+# search rather than evolutionary algorithms.
+#
+# Each parameter has:
+#   type     : choice | bool | range_int | range_float
+#   values   : list of allowed values (for choice / bool)
+#   min/max  : bounds (for range_int / range_float)
+#   env_var  : environment variable to set (if applicable)
+#   vllm_flag: CLI flag to pass to vLLM (if applicable)
+#   vendor   : all | nvidia | amd  (skip if vendor doesn't match)
+#   note     : human-readable description
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Attention Backend ─────────────────────────────────────────────────────────
+attention_backend:
+  type: choice
+  vllm_flag: "--attention-backend"
+  values:
+    - FLASH_ATTN
+    - FLASHINFER
+    - XFORMERS
+    - ROCM_FLASH
+    - TORCH_SDPA
+  vendor: all
+  note: >
+    Controls the attention kernel implementation.
+    FLASH_ATTN is default for NVIDIA Hopper+.
+    ROCM_FLASH is recommended for AMD CDNA3+.
+    FLASHINFER may outperform FLASH_ATTN on certain MoE models.
+
+# ── MoE All-to-All Backend ────────────────────────────────────────────────────
+all2all_backend:
+  type: choice
+  vllm_flag: "--moe-all2all-backend"
+  values:
+    - deepep_normal
+    - deepep_low_latency
+    - vllm
+  vendor: nvidia
+  note: >
+    Controls the expert dispatch kernel for MoE models.
+    deepep_normal: high throughput, requires enable_expert_parallel.
+    deepep_low_latency: optimised for small batches / low latency.
+    vllm: default, compatible with all configs.
+
+# ── Dynamic Batching Optimiser (DBO) ─────────────────────────────────────────
+enable_dbo:
+  type: bool
+  vllm_flag: "--enable-dbo"
+  values: [true, false]
+  vendor: nvidia
+  note: >
+    Enables vLLM's Dynamic Batch Optimiser which adjusts batch size
+    dynamically to reduce stalls.  Experimental on some models.
+
+# ── AMD AITER Kernels ─────────────────────────────────────────────────────────
+vllm_rocm_use_aiter:
+  type: bool
+  env_var: VLLM_ROCM_USE_AITER
+  values: [true, false]
+  vendor: amd
+  note: AMD AIter fused-attention kernel (CDNA3+).
+
+vllm_rocm_use_aiter_mla:
+  type: bool
+  env_var: VLLM_ROCM_USE_AITER_MLA
+  values: [true, false]
+  vendor: amd
+  note: AMD AIter MLA (Multi-head Latent Attention) kernel for DeepSeek MLA.
+
+vllm_rocm_use_aiter_rmsnorm:
+  type: bool
+  env_var: VLLM_ROCM_USE_AITER_RMSNORM
+  values: [true, false]
+  vendor: amd
+  note: AMD AIter fused RMSNorm kernel.
+
+vllm_rocm_use_aiter_moe:
+  type: bool
+  env_var: VLLM_ROCM_USE_AITER_MOE
+  values: [true, false]
+  vendor: amd
+  note: AMD AIter MoE fused-GEMM kernel.
+
+# ── NCCL / RCCL Communication ─────────────────────────────────────────────────
+nccl_min_nchannels:
+  type: range_int
+  env_var: NCCL_MIN_NCHANNELS
+  min: 1
+  max: 16
+  vendor: nvidia
+  note: Minimum NCCL channels per NVLINK ring.  Higher = more BW but more CPU.
+
+nccl_socket_nthreads:
+  type: range_int
+  env_var: NCCL_SOCKET_NTHREADS
+  min: 1
+  max: 8
+  vendor: nvidia
+  note: Threads per NCCL socket connection.
+
+rccl_enable_intranode:
+  type: bool
+  env_var: RCCL_ENABLE_INTRANODE_COMM
+  values: [true, false]
+  vendor: amd
+  note: Enable intra-node RCCL optimised path.
+
+hsa_no_scratch_reclaim:
+  type: bool
+  env_var: HSA_NO_SCRATCH_RECLAIM
+  values: [true, false]
+  vendor: amd
+  note: Disable HSA scratch buffer reclamation (reduces GFX overhead on AMD).
+
+# ── Quantization Kernels ──────────────────────────────────────────────────────
+quant_dtype:
+  type: choice
+  vllm_flag: "--dtype"
+  values:
+    - auto
+    - float16
+    - bfloat16
+  vendor: all
+  note: Compute dtype.  bfloat16 preferred on Hopper+; float16 for AMD CDNA3.
+
+kv_cache_dtype:
+  type: choice
+  vllm_flag: "--kv-cache-dtype"
+  values:
+    - auto
+    - fp8
+    - fp8_e5m2
+    - fp8_e4m3
+  vendor: all
+  note: >
+    KV-cache quantization.  fp8 halves KV memory at ~0.2% quality loss.
+    e5m2 = NVIDIA default; e4m3 = AMD preferred.
+
+# ── Scheduler Tuning ──────────────────────────────────────────────────────────
+scheduler_delay_factor:
+  type: range_float
+  vllm_flag: "--scheduler-delay-factor"
+  min: 0.0
+  max: 1.0
+  vendor: all
+  note: >
+    Fraction of token budget the scheduler reserves before launching a
+    new decode step.  Higher values improve throughput at the cost of TTFT.
+
+max_num_batched_tokens:
+  type: range_int
+  vllm_flag: "--max-num-batched-tokens"
+  min: 512
+  max: 131072
+  vendor: all
+  note: >
+    Maximum tokens processed in a single forward pass.
+    Increasing this improves throughput but raises peak VRAM.
+
+# ── Prefix Caching ────────────────────────────────────────────────────────────
+enable_prefix_caching:
+  type: bool
+  vllm_flag: "--enable-prefix-caching"
+  values: [true, false]
+  vendor: all
+  note: Cache KV states for repeated prefixes (useful for multi-turn workloads).
+
+prefix_caching_hash_algo:
+  type: choice
+  vllm_flag: "--prefix-caching-hash-algo"
+  values:
+    - builtin
+    - sha256
+  vendor: all
+  note: Hash algorithm for prefix cache keys (sha256 = collision-resistant).
