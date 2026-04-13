@@ -11,136 +11,190 @@ Benchmarks run **in parallel** across GPU Droplets. All results are stored in **
 OceanTune runs a two-stage closed-loop optimisation pipeline:
 
 **Stage 1 — vLLM Config Search**
-1. Sample candidate vLLM flag combinations from the search space
-2. PlannerAgent validates hardware compatibility and LLM-ranks the candidates
-3. Coordinator dispatches configs in parallel to GPU Droplet Node Servers
-4. Each ExecutorAgent starts a vLLM instance, runs the benchmark ramp, and writes results to MongoDB
-5. AnalystAgent reads MongoDB, picks the winner, and produces an LLM explanation
+1. `SearchSpace` samples `population_size × generations` candidate `VLLMFlags` combinations
+2. `PlannerAgent` validates hardware compatibility and LLM-ranks the candidates; skips any fingerprints already benchmarked in prior sessions (cross-session deduplication via MongoDB)
+3. Ranked configs are inserted into MongoDB as `pending` documents
+4. `Coordinator` polls MongoDB, checks node capacity, and dispatches configs in parallel to GPU Droplet Node Servers
+5. Each `ExecutorAgent` acquires a GPU slot (`CUDA_VISIBLE_DEVICES`) and port, starts a vLLM instance, runs the full benchmark ramp, computes fitness via `MetricsCollector`, and writes the result to MongoDB
+6. `AnalystAgent` reads `benchmark_runs`, runs aggregation pipelines, picks the winner, and produces an LLM explanation
 
 **Stage 2 — Kernel-Level Search**
-6. KernelOptimizerAgent iteratively proposes low-level kernel/attention/NCCL flag combinations
-7. Each proposal is benchmarked; the LLM learns from the history to guide the next iteration
-8. ReportGenerator emits a YAML recipe, shell script, and Markdown report
+
+7. `ControllerAgent` passes the Stage 1 winner config as the Stage 2 baseline
+8. `KernelOptimizerAgent` iteratively proposes low-level kernel/attention/NCCL flag combinations via DO Serverless Inference; each proposal is benchmarked and the LLM learns from the result history
+9. `ReportGenerator` emits a YAML recipe, ready-to-run shell script, and Markdown summary
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        oceantune.py run                             │
-└─────────────────────────────┬───────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                       ControllerAgent                               │
-│                  agents/controller_agent.py                         │
-└──────────────┬──────────────────────────────────┬───────────────────┘
-               │                                  │
-    ┌──────────▼──────────┐            ┌──────────▼──────────┐
-    │     STAGE 1         │            │     STAGE 2         │
-    │  vLLM Config Search │            │  Kernel-Level Search│
-    └──────────┬──────────┘            └──────────┬──────────┘
-               │                                  │
-    ┌──────────▼──────────┐            ┌──────────▼──────────┐
-    │    PlannerAgent     │            │  KernelOptimizer    │
-    │  agents/planner.py  │            │     Agent           │
-    │                     │            │ agents/kernel_       │
-    │ • Hardware validate │            │   optimizer.py      │
-    │ • LLM-rank configs  │            │                     │
-    │ • Skip seen configs │            │ • LLM proposes next │
-    └──────────┬──────────┘            │   kernel flags      │
-               │                       │ • Benchmarks each   │
-    ┌──────────▼──────────┐            │ • Learns from hist  │
-    │      MongoDB        │            └──────────┬──────────┘
-    │     core/db.py      │                       │
-    │                     │            ┌──────────▼──────────┐
-    │ configs → "pending" │            │  ReportGenerator    │
-    └──────────┬──────────┘            │ core/report_        │
-               │                       │   generator.py      │
-    ┌──────────▼──────────┐            │                     │
-    │    Coordinator      │            │ • YAML recipe       │
-    │ core/coordinator.py │            │ • Shell script      │
-    │                     │            │ • Markdown report   │
-    │ • Poll pending      │            └─────────────────────┘
-    │ • Check node cap.   │
-    │ • Dispatch jobs     │
-    │ • Retry on failure  │
-    └──────────┬──────────┘
-               │  HTTP  (core/node_client.py)
-    ┌──────────▼──────────────────────────────────┐
-    │            GPU Droplet Node Server           │
-    │             node/node_server.py              │
-    │                                              │
-    │  POST /jobs  ──►  NodeWorker                 │
-    │                   node/node_worker.py        │
-    │                         │                   │
-    │              ┌──────────▼──────────┐        │
-    │              │   ExecutorAgent     │        │
-    │              │ agents/executor.py  │        │
-    │              │                     │        │
-    │              │ GPUSlotAllocator    │        │
-    │              │  (CUDA_VISIBLE_     │        │
-    │              │   DEVICES)          │        │
-    │              │ PortAllocator       │        │
-    │              │  (8000–8099)        │        │
-    │              │        │            │        │
-    │              │   VLLMServer  ◄─────┤        │
-    │              │ core/vllm_server.py │        │
-    │              │        │            │        │
-    │              │   BenchmarkEngine   │        │
-    │              │ core/benchmark_     │        │
-    │              │   runner.py         │        │
-    │              │        │            │        │
-    │              │   MetricsCollector  │        │
-    │              │ core/metrics_       │        │
-    │              │   collector.py      │        │
-    │              │        │            │        │
-    │              │   MongoDB write     │        │
-    │              │  benchmark_runs     │        │
-    │              └─────────────────────┘        │
-    └──────────────────────────────────────────────┘
-               │
-    ┌──────────▼──────────┐
-    │    AnalystAgent     │
-    │  agents/analyst.py  │
-    │                     │
-    │ • top_configs()     │
-    │ • oom_patterns()    │
-    │ • perf_over_time()  │
-    │ • LLM explanation   │
-    └─────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         oceantune.py run                             │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                        ControllerAgent                               │
+│                   agents/controller_agent.py                         │
+│                                                                      │
+│  1. calls _stage1()  →  returns winner_flags                         │
+│  2. passes winner_flags as baseline to _stage2()                     │
+│  3. calls _generate_report() with best_kernel merged over winner     │
+└──────────────────┬────────────────────────────┬─────────────────────┘
+                   │                            │
+       ┌───────────▼────────────┐   ┌───────────▼────────────┐
+       │       STAGE 1          │   │       STAGE 2          │
+       │   vLLM Config Search   │   │  Kernel-Level Search   │
+       └───────────┬────────────┘   └───────────┬────────────┘
+                   │                            │
+       ┌───────────▼────────────┐   ┌───────────▼────────────┐
+       │     SearchSpace        │   │  KernelOptimizerAgent  │
+       │  core/search_space.py  │   │ agents/kernel_          │
+       │                        │   │   optimizer.py          │
+       │  samples N candidates  │   │                        │
+       │  (VLLMFlags objects)   │   │ • vendor-filtered      │
+       └───────────┬────────────┘   │   kernel search space  │
+                   │                │ • LLM proposes next    │
+       ┌───────────▼────────────┐   │   kernel config        │
+       │      PlannerAgent      │   │ • benchmarks proposal  │
+       │   agents/planner.py    │   │ • learns from history  │
+       │                        │   │ • 10 iterations        │
+       │ • ConfigValidator      │   └───────────┬────────────┘
+       │   (hardware check)     │               │
+       │ • skip seen            │   ┌───────────▼────────────┐
+       │   fingerprints         │   │   ReportGenerator      │
+       │ • LLM-rank remainder   │   │ core/report_generator  │
+       └───────────┬────────────┘   │                        │
+                   │                │ • YAML recipe          │
+       ┌───────────▼────────────┐   │ • Shell script         │
+       │        MongoDB         │   │ • Markdown report      │
+       │      core/db.py        │   └────────────────────────┘
+       │                        │
+       │  configs → "pending"   │
+       │  (priority-ordered)    │
+       └───────────┬────────────┘
+                   │
+       ┌───────────▼────────────┐
+       │      Coordinator       │
+       │  core/coordinator.py   │
+       │                        │
+       │ • poll pending configs │
+       │ • check node capacity  │
+       │ • dispatch via HTTP    │
+       │ • retry on failure     │
+       │   (max_retries)        │
+       └───────────┬────────────┘
+                   │  HTTP  (core/node_client.py)
+       ┌───────────▼────────────────────────────────────────┐
+       │                GPU Droplet Node Server              │
+       │                 node/node_server.py                 │
+       │                                                     │
+       │  POST /jobs  ──►  NodeWorker                        │
+       │                   node/node_worker.py               │
+       │                          │                          │
+       │               ┌──────────▼──────────┐              │
+       │               │    ExecutorAgent     │              │
+       │               │  agents/executor.py  │              │
+       │               │                      │              │
+       │               │  GPUSlotAllocator    │              │
+       │               │  core/gpu_allocator  │              │
+       │               │  (CUDA_VISIBLE_      │              │
+       │               │   DEVICES per slot)  │              │
+       │               │                      │              │
+       │               │  PortAllocator       │              │
+       │               │  core/port_allocator │              │
+       │               │  (pool 8000–8099)    │              │
+       │               │          │           │              │
+       │               │    VLLMServer        │              │
+       │               │  core/vllm_server.py │              │
+       │               │  (GPU-profile env)   │              │
+       │               │          │           │              │
+       │               │   BenchmarkEngine    │              │
+       │               │  core/benchmark_     │              │
+       │               │    runner.py         │              │
+       │               │  (22 regex patterns) │              │
+       │               │          │           │              │
+       │               │  LogAnalyzer         │              │
+       │               │  core/log_analyzer   │              │
+       │               │  (OOM / crash detect)│              │
+       │               │          │           │              │
+       │               │  MetricsCollector    │              │
+       │               │  core/metrics_       │              │
+       │               │    collector.py      │              │
+       │               │  (fitness scoring)   │              │
+       │               │          │           │              │
+       │               │  LLM metric parse    │              │
+       │               │  (DO Inference)      │              │
+       │               │          │           │              │
+       │               │  MongoDB write       │              │
+       │               │  benchmark_runs      │              │
+       └───────────────┴──────────────────────┴──────────────┘
+                   │
+       ┌───────────▼────────────┐
+       │      AnalystAgent      │
+       │   agents/analyst.py    │
+       │                        │
+       │ • top_configs()        │
+       │ • oom_patterns()       │
+       │ • perf_over_time()     │
+       │ • LLM winner analysis  │
+       │                        │
+       │  returns winner_flags  │
+       │  → Stage 2 baseline    │
+       └────────────────────────┘
+```
+
+### Stage 1 → Stage 2 handoff
+
+```
+AnalystAgent.analyse()
+        │
+        │  returns AnalysisResult.winner_flags (dict)
+        ▼
+ControllerAgent._stage1() → (winner_flags, winner_fingerprint)
+        │
+        │  winner_flags passed directly as baseline
+        ▼
+KernelOptimizerAgent.run(baseline_flags=winner_flags)
+        │
+        │  each iteration: merged_flags = winner_flags + kernel_override
+        ▼
+ReportGenerator.generate(analysis, best_kernel_config)
+        │  final recipe = winner_flags merged with best_kernel_config
 ```
 
 ### Data flow
 
 ```
-Search Space (configs/search_space.yaml)
+configs/search_space.yaml
         │
-        │  sample N candidates
+        │  SearchSpace.sample_random() × (population_size × generations)
         ▼
-  PlannerAgent  ──── DO Serverless Inference ────►  ranked order + rationale
+PlannerAgent  ──── DO Serverless Inference ───►  ranked order + rationale
+        │                                        (skips cross-session seen)
+        │  insert priority-ordered "pending" docs
+        ▼
+MongoDB: configs collection
         │
-        │  insert as "pending" documents
+        │  Coordinator claims pending, checks node /capacity
         ▼
-     MongoDB  ◄──────────────────────────────────── all writes go here
-   (5 collections)
+Node Servers  (one per GPU Droplet)
         │
-        │  Coordinator polls + claims pending configs
+        │  parallel ExecutorAgents on GPU subsets
         ▼
-  Node Servers  (one per GPU Droplet, FastAPI)
+MongoDB: benchmark_runs  ◄── fitness_score from MetricsCollector
         │
-        │  parallel vLLM instances on GPU slot subsets
         ▼
-  Benchmark Results  ──► MongoDB  ──► AnalystAgent  ──► winner flags
+AnalystAgent  ──── DO Serverless Inference ───►  winner explanation
         │
-        │  Stage 2: winner flags as baseline
+        │  winner_flags → Stage 2 baseline
         ▼
-  KernelOptimizer  ──── DO Serverless Inference ────►  kernel config proposals
+KernelOptimizerAgent  ──── DO Serverless Inference ───►  kernel proposals
         │
-        │  iterate 10 rounds
+        │  10 iterations → MongoDB: kernel_runs
         ▼
-  ReportGenerator  ──►  YAML recipe + shell script + Markdown report
+ReportGenerator  ──►  storage/results/  (YAML + shell + Markdown)
 ```
 
 ---
@@ -181,13 +235,18 @@ pip install -r requirements.txt
 export MONGO_URI=mongodb://YOUR_MONGO_HOST:27017
 export DO_INFERENCE_KEY=...
 export HF_TOKEN=hf_...
+export NODE_HOST=YOUR_DROPLET_IP     # reported back to the Coordinator
 
 python3 -m node.node_server \
     --port 9000 \
     --gpu-type H100 \
     --gpu-indices 0,1,2,3,4,5,6,7
 
-# Then on the orchestrator machine, point configs/oceantune.yaml nodes: to this droplet's IP
+# Then add this node to configs/oceantune.yaml under nodes:
+#   - host: YOUR_DROPLET_IP
+#     node_port: 9000
+#     gpu_type: H100
+#     gpu_indices: [0,1,2,3,4,5,6,7]
 ```
 
 ### Docker
@@ -223,40 +282,41 @@ oceantune-ai/
 ├── docker-compose.yml
 │
 ├── agents/
-│   ├── controller_agent.py         # Top-level orchestrator — wires all agents + both stages
-│   ├── planner.py                  # Hardware validation + LLM-ranked config ordering
+│   ├── controller_agent.py         # Top-level orchestrator: Stage 1 → handoff → Stage 2
+│   ├── planner.py                  # Hardware validation + cross-session dedup + LLM ranking
 │   ├── executor.py                 # Single-config: vLLM + benchmark + LLM metric parse + MongoDB
 │   ├── analyst.py                  # Winner selection + aggregation pipelines + LLM explanation
-│   ├── kernel_optimizer.py         # Stage 2: iterative LLM-guided kernel search
+│   ├── kernel_optimizer.py         # Stage 2: iterative LLM-guided kernel search (10 iterations)
 │   └── do_client.py                # DO Serverless Inference HTTP client (retry, json_mode)
 │
 ├── core/
-│   ├── config.py                   # Config dataclasses: OceanTuneConfig, DatabaseConfig,
-│   │                               #   NodeConfig, CoordinatorConfig, AgentConfig
+│   ├── config.py                   # OceanTuneConfig, DatabaseConfig, NodeConfig,
+│   │                               #   CoordinatorConfig, AgentConfig, OptimiserConfig
 │   ├── db.py                       # MongoDB async client — 5 collections + analytics pipelines
-│   ├── coordinator.py              # Parallel dispatch loop: poll MongoDB → assign to nodes
+│   ├── coordinator.py              # Parallel dispatch: poll MongoDB → assign to nodes → retry
 │   ├── node_client.py              # HTTP client for remote Node Servers
-│   ├── gpu_allocator.py            # GPU slot partitioning via CUDA_VISIBLE_DEVICES
-│   ├── port_allocator.py           # Port pool (8000–8099) for parallel vLLM instances
-│   ├── report_generator.py         # YAML recipe + shell script + Markdown report
-│   ├── search_space.py             # VLLMFlags (25 fields), SearchSpace, ConfigValidator
-│   ├── vllm_server.py              # Async vLLM process manager + profile-driven env/args
-│   ├── benchmark_runner.py         # BenchmarkEngine — 22 regex patterns, concurrency ramp
-│   ├── metrics_collector.py        # EnrichedMetrics — fitness scoring, GPU efficiency
-│   ├── log_analyzer.py             # 14 error classes, startup timing, OOM detection
+│   ├── gpu_allocator.py            # GPU slot partitioning via CUDA_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES
+│   ├── port_allocator.py           # Port pool (default 8000–8099) for parallel vLLM instances
+│   ├── report_generator.py         # Emits YAML recipe + shell script + Markdown report
+│   ├── search_space.py             # VLLMFlags (25 fields), SearchSpace (candidate sampling),
+│   │                               #   ConfigValidator (10 hardware-constraint checks)
+│   ├── vllm_server.py              # Async vLLM process manager + GPU-profile env injection
+│   ├── benchmark_runner.py         # BenchmarkEngine — concurrency ramp, 22 regex patterns
+│   ├── metrics_collector.py        # EnrichedMetrics — fitness scoring, GPU efficiency, OOM penalty
+│   ├── log_analyzer.py             # 14 error-class patterns, startup timing, OOM/crash detection
 │   └── logger.py                   # Structured logging (console + JSONL)
 │
 ├── node/
-│   ├── node_server.py              # FastAPI server running on each GPU Droplet
-│   └── node_worker.py              # Executes vLLM + benchmark jobs for the Coordinator
+│   ├── node_server.py              # FastAPI on each GPU Droplet — job queue + capacity API
+│   └── node_worker.py              # Executes benchmark jobs; threads primary_metric to ExecutorAgent
 │
 ├── configs/
-│   ├── oceantune.yaml              # Main config: model, GPU, database, nodes, coordinator
+│   ├── oceantune.yaml              # Main config: model, GPU, database, nodes, coordinator, optimiser
 │   ├── models.yaml                 # 7 supported models with MoE/MLA/NVFP4 metadata
 │   ├── gpu_profiles.yaml           # 6 GPU profiles: H100, H200, B300, MI300X, MI325X, MI350X
-│   ├── search_space.yaml           # 20 Stage 1 vLLM flag parameters
+│   ├── search_space.yaml           # 20 Stage 1 vLLM flag parameters with bounds and defaults
 │   ├── kernel_search_space.yaml    # 15 Stage 2 kernel parameters (attention, NCCL, AITER, DBO)
-│   └── inference_models.yaml       # DO Serverless Inference model registry
+│   └── inference_models.yaml       # DO Serverless Inference model registry (suitability scores)
 │
 ├── scripts/
 │   ├── run_vllm.sh                 # Shell wrapper for vLLM (ulimits, PID file, signals)
@@ -269,10 +329,10 @@ oceantune-ai/
 │
 └── tests/
     ├── test_search_space.py        # 66 tests — VLLMFlags, SearchSpace, ConfigValidator
-    ├── test_vllm_server.py         # 50 tests — profile-driven server runner
-    ├── test_benchmark_runner.py    # 53 tests — regex parsing, concurrency ramp
-    ├── test_log_analyzer.py        # 36 tests — error patterns, startup timing
-    └── test_metrics_collector.py   # 32 tests — fitness scoring, GPU efficiency
+    ├── test_vllm_server.py         # 50 tests — profile-driven server runner, AMD env injection
+    ├── test_benchmark_runner.py    # 53 tests — regex parsing, concurrency ramp, early abort
+    ├── test_log_analyzer.py        # 36 tests — 14 error classes, startup timing
+    └── test_metrics_collector.py   # 32 tests — fitness scoring, GPU efficiency, primary metrics
 ```
 
 ---
@@ -287,15 +347,21 @@ Edit [configs/oceantune.yaml](configs/oceantune.yaml). Secrets always come from 
 |-----|---------|-------------|
 | `model_id` | `deepseek-ai/DeepSeek-V3.2` | Hugging Face model ID |
 | `gpu_type` | `H100` | GPU profile key |
-| `agent.model` | `auto` | DO Inference model (`auto` = highest suitability score) |
-| `agent.temperature` | `0.3` | LLM temperature for all agents |
-| `database.uri` | `mongodb://localhost:27017` | MongoDB connection string |
-| `nodes` | `[localhost:9000]` | GPU Droplet node list |
-| `coordinator.max_parallel_per_node` | `2` | Max concurrent vLLM instances per node |
-| `optimiser.population_size` | `10` | Candidates per generation |
-| `optimiser.generations` | `5` | Number of optimisation generations |
-| `optimiser.primary_metric` | `throughput` | `throughput` / `p95_latency` / `ttft` / `tpot` |
-| `benchmark.concurrency_levels` | `[1,2,4,8,16,32,64]` | Concurrency ramp |
+| `agent.model` | `auto` | `auto` picks highest `suitability_score` from `configs/inference_models.yaml`; or set a specific model ID |
+| `agent.temperature` | `0.3` | LLM temperature for all 4 agents (lower = more deterministic) |
+| `agent.max_tokens` | `4096` | Max completion tokens per agent reasoning turn |
+| `agent.timeout_sec` | `120` | HTTP timeout per DO Inference call |
+| `database.uri` | `mongodb://localhost:27017` | MongoDB connection string (override via `MONGO_URI`) |
+| `database.name` | `oceantune` | MongoDB database name |
+| `nodes` | `[localhost:9000]` | GPU Droplet node list — each entry needs `host`, `node_port`, `gpu_type`, `gpu_indices` |
+| `coordinator.max_parallel_per_node` | `2` | Cap on concurrent vLLM instances per node (bounded by GPU count ÷ tensor_parallel_size) |
+| `coordinator.port_pool_start` | `8000` | First port in the per-node pool |
+| `coordinator.port_pool_end` | `8099` | Last port in the per-node pool |
+| `coordinator.max_retries` | `2` | Times to re-queue a config after node failure before marking it failed |
+| `optimiser.population_size` | `10` | Candidates sampled per generation (passed to PlannerAgent) |
+| `optimiser.generations` | `5` | Number of search rounds (`population_size × generations` = total configs) |
+| `optimiser.primary_metric` | `throughput` | Fitness metric: `throughput` / `p95_latency` / `ttft` / `tpot` — used by MetricsCollector and Analyst |
+| `benchmark.concurrency_levels` | `[1,2,4,8,16,32,64]` | Concurrency ramp per benchmark run |
 
 ---
 
@@ -305,8 +371,8 @@ Edit [configs/oceantune.yaml](configs/oceantune.yaml). Secrets always come from 
 python3 oceantune.py --help
 python3 oceantune.py validate-config          # check YAML + env vars
 python3 oceantune.py run --dry-run            # validate only, no GPU needed
-python3 oceantune.py run --gpu H100           # run full pipeline
-python3 oceantune.py run --strategy bayesian  # override search strategy
+python3 oceantune.py run --gpu H100           # run full two-stage pipeline
+python3 oceantune.py run --strategy bayesian  # override search strategy label
 python3 oceantune.py info                     # print system / GPU info
 ```
 
@@ -314,10 +380,15 @@ python3 oceantune.py info                     # print system / GPU info
 
 ## Node Server API
 
-Each GPU Droplet runs `node/node_server.py` (FastAPI). The Coordinator communicates with it over HTTP.
+Each GPU Droplet runs `node/node_server.py` (FastAPI). The Coordinator communicates with it over HTTP. It threads `optimiser.primary_metric` from the config down to each `ExecutorAgent`.
 
 ```bash
-python3 -m node.node_server --port 9000 --gpu-type H100 --gpu-indices 0,1,2,3,4,5,6,7
+python3 -m node.node_server \
+    --port 9000 \
+    --gpu-type H100 \
+    --gpu-indices 0,1,2,3,4,5,6,7 \
+    --port-pool-start 8000 \
+    --port-pool-end 8099
 ```
 
 | Endpoint | Method | Description |
@@ -331,23 +402,38 @@ python3 -m node.node_server --port 9000 --gpu-type H100 --gpu-indices 0,1,2,3,4,
 
 ## MongoDB collections
 
-| Collection | Document | Purpose |
-|------------|----------|---------|
-| `sessions` | model, gpu, strategy, status, timestamps | One per optimisation run |
-| `nodes` | host, gpu_type, gpu_count, last_seen | GPU Droplet heartbeats |
-| `configs` | fingerprint, flags, status, retry_count | Candidate configs queue |
-| `benchmark_runs` | raw_metrics, enriched_metrics, fitness_score | All benchmark results |
-| `kernel_runs` | kernel_config, fitness_score, llm_reasoning | Stage 2 results |
+| Collection | Key fields | Purpose |
+|------------|-----------|---------|
+| `sessions` | model_id, gpu_type, strategy, status, created_at | One document per optimisation run |
+| `nodes` | host, node_port, gpu_type, gpu_count, last_seen | GPU Droplet heartbeats (liveness via `last_seen`) |
+| `configs` | session_id, fingerprint, flags, status, priority, retry_count | Candidate configs queue (`pending→running→done/failed`) |
+| `benchmark_runs` | session_id, config_id, context, raw_metrics, fitness_score | All benchmark results (all contexts per config) |
+| `kernel_runs` | session_id, iteration, kernel_config, fitness_score, llm_reasoning | Stage 2 results with LLM rationale |
 
 ### Analytics pipelines (`core/db.py`)
 
 | Method | Returns |
 |--------|---------|
-| `top_configs_by_throughput(session_id, n)` | Top-N configs ranked by max throughput |
-| `kernel_impact_analysis(session_id)` | Kernel flags ranked by average fitness impact |
-| `oom_patterns(session_id)` | Configs associated with OOM errors |
-| `performance_over_time(session_id)` | Fitness time-series for progress charts |
-| `cross_session_seen_fingerprints(model_id, gpu_type)` | Deduplication across restarts |
+| `top_configs_by_throughput(session_id, n)` | Top-N configs by max throughput across all contexts |
+| `kernel_impact_analysis(session_id)` | Kernel flags ranked by average fitness delta |
+| `oom_patterns(session_id)` | Configs associated with OOM errors + their flag patterns |
+| `performance_over_time(session_id)` | Fitness time-series — used by AnalystAgent convergence check |
+| `cross_session_seen_fingerprints(model_id, gpu_type)` | Fingerprints from all prior sessions for deduplication |
+
+---
+
+## DO Serverless Inference
+
+All four agents (`PlannerAgent`, `ExecutorAgent`, `AnalystAgent`, `KernelOptimizerAgent`) share a single `DOClient` instance that calls the DO Serverless Inference API.
+
+```
+Base URL:   https://inference.do-ai.run/v1   (override via DO_INFERENCE_ENDPOINT)
+Auth:       Bearer DO_INFERENCE_KEY
+Model:      auto-selected from configs/inference_models.yaml by suitability_score
+            or pinned via DO_INFERENCE_MODEL env var
+```
+
+`agent.model: auto` in `oceantune.yaml` means the highest-rated model from `configs/inference_models.yaml` is used. Set `agent.model` to a specific model ID to pin it. All agents fall back to deterministic (non-LLM) behaviour when `DO_INFERENCE_KEY` is not set.
 
 ---
 
@@ -355,8 +441,8 @@ python3 -m node.node_server --port 9000 --gpu-type H100 --gpu-indices 0,1,2,3,4,
 
 | Alias | Hugging Face ID | Params | Notes |
 |-------|-----------------|--------|-------|
-| `deepseek_v3_2` | `deepseek-ai/DeepSeek-V3.2` | 671B | MoE + MLA; requires block_size=1 |
-| `deepseek_v3_2_nvfp4` | `nvidia/DeepSeek-V3.2-NVFP4` | 671B | NVIDIA Hopper/Blackwell only |
+| `deepseek_v3_2` | `deepseek-ai/DeepSeek-V3.2` | 671B | MoE + MLA; requires `block_size=1` |
+| `deepseek_v3_2_nvfp4` | `nvidia/DeepSeek-V3.2-NVFP4` | 671B | NVIDIA Hopper/Blackwell only (NVFP4) |
 | `minimax_m2_5` | `MiniMaxAI/MiniMax-M2.5` | 229B | MoE; tool-call + reasoning parsers |
 | `kimi_k2_5` | `moonshotai/Kimi-K2.5` | 1T | MoE; FP8 recommended |
 | `kimi_k2_5_nvfp4` | `nvidia/Kimi-K2.5-NVFP4` | 1T | NVIDIA only |
@@ -380,27 +466,27 @@ AMD profiles automatically inject 12 ROCm performance env vars (`VLLM_ROCM_USE_A
 
 ---
 
-## Stage 2 kernel search space
+## Stage 2 kernel search space (`configs/kernel_search_space.yaml`)
 
-The `configs/kernel_search_space.yaml` defines 15 parameters explored in Stage 2:
+15 parameters explored by `KernelOptimizerAgent`. Each is tagged by vendor so the LLM only proposes flags valid for the target GPU.
 
-| Parameter | Scope | What it controls |
-|-----------|-------|-----------------|
-| `attention_backend` | All | `FLASH_ATTN` / `FLASHINFER` / `ROCM_FLASH` / `XFORMERS` / `TORCH_SDPA` |
-| `all2all_backend` | NVIDIA | MoE expert dispatch: `deepep_normal` / `deepep_low_latency` / `vllm` |
-| `enable_dbo` | NVIDIA | Dynamic Batch Optimiser |
-| `vllm_rocm_use_aiter` | AMD | AIter fused-attention kernel |
-| `vllm_rocm_use_aiter_mla` | AMD | AIter MLA kernel (DeepSeek MLA) |
-| `vllm_rocm_use_aiter_rmsnorm` | AMD | AIter fused RMSNorm |
-| `vllm_rocm_use_aiter_moe` | AMD | AIter MoE fused-GEMM |
-| `nccl_min_nchannels` | NVIDIA | NCCL channels per NVLINK ring |
-| `nccl_socket_nthreads` | NVIDIA | NCCL socket threads |
-| `rccl_enable_intranode` | AMD | RCCL intra-node optimised path |
-| `hsa_no_scratch_reclaim` | AMD | Disable HSA scratch reclamation |
-| `quant_dtype` | All | `auto` / `float16` / `bfloat16` |
-| `kv_cache_dtype` | All | `auto` / `fp8` / `fp8_e5m2` / `fp8_e4m3` |
-| `scheduler_delay_factor` | All | Scheduler token budget fraction |
-| `enable_prefix_caching` | All | KV-cache reuse for repeated prefixes |
+| Parameter | Vendor | Type | What it controls |
+|-----------|--------|------|-----------------|
+| `attention_backend` | All | choice | `FLASH_ATTN` / `FLASHINFER` / `ROCM_FLASH` / `XFORMERS` / `TORCH_SDPA` |
+| `all2all_backend` | NVIDIA | choice | MoE expert dispatch: `deepep_normal` / `deepep_low_latency` / `vllm` |
+| `enable_dbo` | NVIDIA | bool | Dynamic Batch Optimiser |
+| `vllm_rocm_use_aiter` | AMD | bool | AIter fused-attention kernel |
+| `vllm_rocm_use_aiter_mla` | AMD | bool | AIter MLA kernel (DeepSeek MLA) |
+| `vllm_rocm_use_aiter_rmsnorm` | AMD | bool | AIter fused RMSNorm |
+| `vllm_rocm_use_aiter_moe` | AMD | bool | AIter MoE fused-GEMM |
+| `nccl_min_nchannels` | NVIDIA | range_int 1–16 | NCCL channels per NVLINK ring |
+| `nccl_socket_nthreads` | NVIDIA | range_int 1–8 | NCCL socket threads |
+| `rccl_enable_intranode` | AMD | bool | RCCL intra-node optimised path |
+| `hsa_no_scratch_reclaim` | AMD | bool | Disable HSA scratch buffer reclamation |
+| `quant_dtype` | All | choice | `auto` / `float16` / `bfloat16` |
+| `kv_cache_dtype` | All | choice | `auto` / `fp8` / `fp8_e5m2` / `fp8_e4m3` |
+| `scheduler_delay_factor` | All | range_float 0–1 | Scheduler token budget fraction (higher = more throughput, worse TTFT) |
+| `enable_prefix_caching` | All | bool | KV-cache reuse for repeated prefixes |
 
 ---
 
@@ -409,18 +495,18 @@ The `configs/kernel_search_space.yaml` defines 15 parameters explored in Stage 2
 | Variable | Purpose |
 |----------|---------|
 | `HF_TOKEN` | Hugging Face access token (required for gated models) |
-| `DO_INFERENCE_KEY` | DigitalOcean Serverless Inference API key |
-| `DO_INFERENCE_ENDPOINT` | Inference base URL (default: `https://inference.do-ai.run/v1`) |
-| `DO_INFERENCE_MODEL` | Override the agent LLM model ID |
+| `DO_INFERENCE_KEY` | DigitalOcean Serverless Inference API key — used by all 4 agents |
+| `DO_INFERENCE_ENDPOINT` | Override inference base URL (default: `https://inference.do-ai.run/v1`) |
+| `DO_INFERENCE_MODEL` | Pin a specific inference model ID (overrides `agent.model: auto`) |
 | `MONGO_URI` | MongoDB connection string (default: `mongodb://localhost:27017`) |
 | `DO_SPACES_KEY` | DigitalOcean Spaces access key |
 | `DO_SPACES_SECRET` | DigitalOcean Spaces secret key |
+| `NODE_HOST` | Hostname this Node Server reports to the Coordinator (important for multi-node routing) |
 | `OCEANTUNE_MODEL_ID` | Override `model_id` from YAML |
 | `OCEANTUNE_GPU_TYPE` | Override `gpu_type` from YAML |
 | `OCEANTUNE_PORT` | Override vLLM port |
-| `OCEANTUNE_STRATEGY` | Override optimisation strategy |
-| `OCEANTUNE_PRIMARY_METRIC` | Override primary metric |
-| `NODE_HOST` | Hostname reported by a Node Server to the Coordinator |
+| `OCEANTUNE_STRATEGY` | Override optimisation strategy label |
+| `OCEANTUNE_PRIMARY_METRIC` | Override primary fitness metric |
 
 ---
 
@@ -429,11 +515,11 @@ The `configs/kernel_search_space.yaml` defines 15 parameters explored in Stage 2
 ```
 pytest tests/ --asyncio-mode=auto
 
-tests/test_search_space.py       66 passed
-tests/test_vllm_server.py        50 passed
-tests/test_benchmark_runner.py   53 passed
-tests/test_log_analyzer.py       36 passed
-tests/test_metrics_collector.py  32 passed
+tests/test_search_space.py       66 passed   VLLMFlags, SearchSpace, ConfigValidator
+tests/test_vllm_server.py        50 passed   profile-driven server, AMD/NVIDIA env
+tests/test_benchmark_runner.py   53 passed   regex parsing, concurrency ramp
+tests/test_log_analyzer.py       36 passed   14 error classes, startup timing
+tests/test_metrics_collector.py  32 passed   fitness scoring, GPU efficiency
 ─────────────────────────────────────────
 Total                           238 passed
 ```

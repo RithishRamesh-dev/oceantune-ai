@@ -74,6 +74,8 @@ class NodeWorker:
         Hostname of this node (stored in benchmark_run documents).
     startup_timeout_sec : int
         vLLM startup timeout.
+    primary_metric : str
+        Fitness metric forwarded to MetricsCollector: throughput | p95_latency | ttft | tpot.
     """
 
     def __init__(
@@ -85,6 +87,7 @@ class NodeWorker:
         port_alloc: PortAllocator,
         node_host: str = "localhost",
         startup_timeout_sec: int = 1200,
+        primary_metric: str = "throughput",
     ) -> None:
         self._db = db
         self._do_client = do_client
@@ -92,6 +95,7 @@ class NodeWorker:
         self._port_alloc = port_alloc
         self._node_host = node_host
         self._startup_timeout_sec = startup_timeout_sec
+        self._primary_metric = primary_metric
 
         # Track running jobs (config_id → asyncio.Task)
         self._running: Dict[str, asyncio.Task] = {}
@@ -122,6 +126,7 @@ class NodeWorker:
             model_id=job.model_id,
             startup_timeout_sec=self._startup_timeout_sec,
             node_host=self._node_host,
+            primary_metric=self._primary_metric,
         )
 
         config_doc = {

@@ -118,13 +118,17 @@ benchmark:
   duration_sec: 60
 
 # ── Optimisation Engine ───────────────────────────────────────────────────────
+# In v4, the LLM-guided Planner handles candidate ordering.
+# population_size × generations = total configs benchmarked per run.
+# strategy is kept for compatibility; "evolutionary" = use LLM guidance
+#   (falls back to random sampling when DO_INFERENCE_KEY is not set).
 optimiser:
-  strategy: "evolutionary"      # evolutionary | grid | random | bayesian
-  population_size: 10
-  generations: 5
-  mutation_rate: 0.2
-  elite_fraction: 0.2
-  # Primary metric drives fitness scoring; secondary metrics are recorded
+  strategy: "evolutionary"      # config-compat label; v4 uses LLM-guided search
+  population_size: 10           # candidates sampled per generation
+  generations: 5                # number of search rounds
+  mutation_rate: 0.2            # used by search_space crossover helpers
+  elite_fraction: 0.2           # used by search_space crossover helpers
+  # Primary metric drives fitness scoring in MetricsCollector and Analyst ranking
   primary_metric: "throughput"  # throughput | p95_latency | ttft | tpot
 
 # ── Context-Length Evaluation Matrix ─────────────────────────────────────────

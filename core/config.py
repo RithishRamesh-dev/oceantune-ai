@@ -134,13 +134,26 @@ class BenchmarkConfig:
 
 @dataclass
 class OptimiserConfig:
-    """Optimisation engine settings."""
-    strategy: str = "evolutionary"       # evolutionary | grid | random | bayesian
-    population_size: int = 10
-    generations: int = 5
-    mutation_rate: float = 0.2
-    elite_fraction: float = 0.2
-    primary_metric: str = "throughput"   # throughput | p95_latency | ttft
+    """
+    Optimisation search settings.
+
+    In v4 these fields control the LLM-guided search, not an evolutionary
+    algorithm:
+      - population_size : number of candidates sampled from the search space
+                          per generation and passed to the PlannerAgent
+      - generations     : how many rounds of sampling + benchmarking to run
+      - strategy        : kept for config compatibility; in v4 the Planner
+                          always uses LLM-guided ordering (falls back to
+                          random when DO_INFERENCE_KEY is not set)
+      - primary_metric  : fitness metric used by MetricsCollector and the
+                          Analyst to rank results
+    """
+    strategy: str = "evolutionary"       # config compat — v4 uses LLM-guided search
+    population_size: int = 10            # candidates sampled per generation
+    generations: int = 5                 # number of search rounds
+    mutation_rate: float = 0.2           # retained for search_space crossover helpers
+    elite_fraction: float = 0.2          # retained for search_space crossover helpers
+    primary_metric: str = "throughput"   # throughput | p95_latency | ttft | tpot
 
 
 @dataclass
@@ -332,7 +345,8 @@ def load_config(override_path: Optional[Path] = None) -> OceanTuneConfig:
 
 def _validate(cfg: OceanTuneConfig) -> None:
     """Raise ValueError for obviously invalid configs."""
-    valid_strategies = {"evolutionary", "grid", "random", "bayesian"}
+    # strategy is kept for config compatibility; v4 uses LLM-guided search
+    valid_strategies = {"evolutionary", "grid", "random", "bayesian", "llm"}
     if cfg.optimiser.strategy not in valid_strategies:
         raise ValueError(
             f"Unknown optimisation strategy '{cfg.optimiser.strategy}'. "

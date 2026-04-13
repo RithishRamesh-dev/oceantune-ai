@@ -106,6 +106,7 @@ def create_app(
         port_alloc=port_alloc,
         node_host=node_host,
         startup_timeout_sec=startup_timeout_sec,
+        primary_metric=cfg.optimiser.primary_metric,
     )
 
     # In-memory job registry  job_id → {"status": ..., "result": JobResult|None}

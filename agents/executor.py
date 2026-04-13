@@ -91,6 +91,9 @@ class ExecutorAgent:
         Max seconds to wait for vLLM to become healthy.
     node_host : str
         Hostname of this node (recorded in the benchmark_run document).
+    primary_metric : str
+        Fitness metric: throughput | p95_latency | ttft | tpot.
+        Passed to MetricsCollector — comes from optimiser.primary_metric in config.
     """
 
     def __init__(
@@ -106,6 +109,7 @@ class ExecutorAgent:
         num_prompts: int = 200,
         startup_timeout_sec: int = 1200,
         node_host: str = "localhost",
+        primary_metric: str = "throughput",
     ) -> None:
         self._client = do_client
         self._db = db
@@ -117,6 +121,7 @@ class ExecutorAgent:
         self._num_prompts = num_prompts
         self._startup_timeout_sec = startup_timeout_sec
         self._node_host = node_host
+        self._primary_metric = primary_metric
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -268,7 +273,7 @@ class ExecutorAgent:
         collector = MetricsCollector(
             ramp_result=ramp_result,
             gpu_type=self._gpu_type,
-            primary_metric="throughput",
+            primary_metric=self._primary_metric,
         )
         enriched_metrics = collector.collect()
         fitness = enriched_metrics.fitness_score
