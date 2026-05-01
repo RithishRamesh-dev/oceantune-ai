@@ -45,7 +45,6 @@ import asyncio
 import os
 import re
 import signal
-import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -206,6 +205,9 @@ class VLLMServer:
     hf_token: str = ""
     log_buffer_size: int = 500
     extra_env: dict = field(default_factory=dict)
+    # Docker image override — empty means use gpu_profiles.yaml default.
+    # Can also be set via VLLM_IMAGE env var.
+    docker_image: str = ""
 
     # Internal state — not part of __init__ signature
     _process: Optional[asyncio.subprocess.Process] = field(
@@ -362,6 +364,18 @@ class VLLMServer:
         self._process = None
         self._state = ServerState.STOPPED
 
+        # Belt-and-suspenders: ensure the Docker container is gone
+        # (handles cases where SIGTERM doesn't propagate into the container)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "stop", "-t", "5", f"oceantune-vllm-{self.port}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except Exception:
+            pass
+
         log_dict(
             log, "info", "vLLM server stopped",
             run_id=self.flags.run_id, port=self.port,
@@ -453,53 +467,99 @@ class VLLMServer:
         except Exception as exc:
             log.warning(f"Log capture error: {exc}")
 
+    # ── Internal: resolve docker image ───────────────────────────────────
+
+    def _resolve_docker_image(self) -> str:
+        """
+        Resolve the Docker image to use, in priority order:
+          1. VLLM_IMAGE env var
+          2. self.docker_image (from YAML vllm.docker_image)
+          3. gpu_profiles.yaml docker_image for this gpu_type
+        """
+        if img := os.environ.get("VLLM_IMAGE"):
+            return img
+        if self.docker_image:
+            return self.docker_image
+        profile = _load_gpu_profile(self.gpu_type)
+        if img := profile.get("docker_image"):
+            return img
+        raise ServerFailure(
+            f"No Docker image configured for gpu_type={self.gpu_type}. "
+            f"Set VLLM_IMAGE env var or vllm.docker_image in oceantune.yaml."
+        )
+
     # ── Internal: build command ───────────────────────────────────────────
 
     def _build_command(self) -> List[str]:
-        """Build the vLLM server command, appending vllm_extra_args from GPU profile."""
-        vllm_args = self.flags.to_vllm_args(
-            model_id=self.model_id,
-            gpu_type=self.gpu_type,
-        )
+        """Build the docker run command that launches vLLM inside a container."""
         profile = _load_gpu_profile(self.gpu_type)
-        extra_args: List[str] = profile.get("vllm_extra_args", [])
-        return [
-            sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-            "--host", self.host,
+        docker_image = self._resolve_docker_image()
+
+        hf_token = (
+            self.hf_token
+            or os.environ.get("HF_TOKEN", "")
+            or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
+        )
+        hf_cache = os.path.expanduser("~/.cache/huggingface")
+
+        cmd = [
+            "docker", "run", "--rm",
+            "--name", f"oceantune-vllm-{self.port}",
+            "-p", f"{self.port}:{self.port}",
+            "--shm-size", "2g",
+            "-v", f"{hf_cache}:/root/.cache/huggingface",
+        ]
+
+        # IPC host mode — required for tensor-parallel shared memory
+        if profile.get("ipc_host", False):
+            cmd.append("--ipc=host")
+
+        # GPU assignment
+        if self.gpu_type in _AMD_GPU_TYPES:
+            # AMD ROCm: expose KFD/DRI devices; use ROCR_VISIBLE_DEVICES for slot isolation
+            cmd += ["--device", "/dev/kfd", "--device", "/dev/dri", "--group-add", "video"]
+            rocr_devs = self.extra_env.get("ROCR_VISIBLE_DEVICES", "")
+            if rocr_devs:
+                cmd += ["-e", f"ROCR_VISIBLE_DEVICES={rocr_devs}"]
+        else:
+            # NVIDIA: --gpus device=X,Y for slot isolation
+            gpu_devices = self.extra_env.get("CUDA_VISIBLE_DEVICES", "all")
+            cmd += ["--gpus", f"device={gpu_devices}"]
+
+        # HuggingFace auth
+        if hf_token:
+            cmd += ["-e", f"HF_TOKEN={hf_token}", "-e", f"HUGGING_FACE_HUB_TOKEN={hf_token}"]
+
+        # Profile env vars (NCCL, ROCm perf knobs, etc.)
+        for key, val in profile.get("env_vars", {}).items():
+            cmd += ["-e", f"{key}={val}"]
+
+        # Any extra env vars (excluding GPU visibility — handled above)
+        skip = {"CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"}
+        for key, val in self.extra_env.items():
+            if key not in skip:
+                cmd += ["-e", f"{key}={val}"]
+
+        # Docker image
+        cmd.append(docker_image)
+
+        # vLLM server args (passed as container CMD)
+        vllm_args = self.flags.to_vllm_args(model_id=self.model_id, gpu_type=self.gpu_type)
+        extra_vllm_args: List[str] = profile.get("vllm_extra_args", [])
+        cmd += [
+            "--host", "0.0.0.0",
             "--port", str(self.port),
             *vllm_args,
-            *extra_args,
+            *extra_vllm_args,
         ]
+
+        return cmd
 
     # ── Internal: build environment ───────────────────────────────────────
 
     def _build_env(self) -> dict:
-        """Build the subprocess environment, injecting GPU-profile env vars."""
-        env = os.environ.copy()
-
-        if self.hf_token:
-            env["HUGGING_FACE_HUB_TOKEN"] = self.hf_token
-            env["HF_TOKEN"] = self.hf_token
-
-        env.setdefault("NCCL_DEBUG", "WARN")
-        env.setdefault("NCCL_IB_DISABLE", "0")
-        env["TOKENIZERS_PARALLELISM"] = "false"
-
-        # Inject profile-level env vars (ROCm perf vars, CUDA workspace config…)
-        profile = _load_gpu_profile(self.gpu_type)
-        for key, val in profile.get("env_vars", {}).items():
-            env.setdefault(key, str(val))
-
-        # Inject caller-supplied overrides (e.g. CUDA_VISIBLE_DEVICES from GPUSlotAllocator)
-        env.update(self.extra_env)
-
-        # AMD: also map CUDA_VISIBLE_DEVICES → HIP_VISIBLE_DEVICES
-        if self.gpu_type in _AMD_GPU_TYPES:
-            cuda_devs = env.get("CUDA_VISIBLE_DEVICES", "")
-            if cuda_devs:
-                env.setdefault("HIP_VISIBLE_DEVICES", cuda_devs)
-
-        return env
+        """Return host OS environment for the docker CLI subprocess."""
+        return os.environ.copy()
 
     # ── Diagnostics ───────────────────────────────────────────────────────
 

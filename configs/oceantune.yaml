@@ -116,6 +116,14 @@ vllm:
   port: 8000
   # Large MoE models can take 10–20 min to load weights
   startup_timeout_sec: 1200
+  # Docker image used to run vLLM. Leave empty to use the default from
+  # configs/gpu_profiles.yaml for your gpu_type (recommended).
+  # Override priority: VLLM_IMAGE env var > this field > gpu_profiles.yaml default
+  #
+  # NVIDIA latest:  vllm/vllm-openai:latest-cu130
+  # NVIDIA pinned:  vllm/vllm-openai:v0.18.1-cu130
+  # AMD latest:     vllm/vllm-openai-rocm:v0.18.1
+  docker_image: ""   # or: export VLLM_IMAGE="vllm/vllm-openai:v0.18.1-cu130"
 
 # ── Benchmark Engine ──────────────────────────────────────────────────────────
 benchmark:

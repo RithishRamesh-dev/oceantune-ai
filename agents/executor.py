@@ -110,6 +110,7 @@ class ExecutorAgent:
         startup_timeout_sec: int = 1200,
         node_host: str = "localhost",
         primary_metric: str = "throughput",
+        docker_image: str = "",
     ) -> None:
         self._client = do_client
         self._db = db
@@ -122,6 +123,7 @@ class ExecutorAgent:
         self._startup_timeout_sec = startup_timeout_sec
         self._node_host = node_host
         self._primary_metric = primary_metric
+        self._docker_image = docker_image
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -178,6 +180,7 @@ class ExecutorAgent:
             port=port,
             startup_timeout=self._startup_timeout_sec,
             extra_env=device_env,
+            docker_image=self._docker_image,
         )
 
         best_fitness = 0.0

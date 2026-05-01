@@ -272,6 +272,7 @@ class ControllerAgent:
                 num_prompts=self.cfg.benchmark.num_prompts,
                 startup_timeout_sec=self.cfg.vllm.startup_timeout_sec,
                 primary_metric=self.cfg.optimiser.primary_metric,
+                docker_image=self.cfg.vllm.docker_image,
             )
             await executor.run(
                 session_id=session_id,
@@ -314,6 +315,7 @@ class ControllerAgent:
             concurrency_levels=self.cfg.benchmark.concurrency_levels,
             num_prompts=self.cfg.benchmark.num_prompts,
             startup_timeout_sec=self.cfg.vllm.startup_timeout_sec,
+            docker_image=self.cfg.vllm.docker_image,
         )
 
         best_kernel = await ko.run(

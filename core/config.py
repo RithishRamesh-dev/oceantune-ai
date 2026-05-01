@@ -118,6 +118,9 @@ class VLLMConfig:
     port: int = 8000
     startup_timeout_sec: int = 300       # 5 min; large models take time
     health_check_interval_sec: int = 5
+    # Docker image override — empty means use gpu_profiles.yaml default.
+    # Override at runtime via VLLM_IMAGE env var or vllm.docker_image in YAML.
+    docker_image: str = field(default_factory=lambda: os.getenv("VLLM_IMAGE", ""))
 
 
 @dataclass
@@ -272,6 +275,9 @@ def load_config(override_path: Optional[Path] = None) -> OceanTuneConfig:
         cfg.vllm.startup_timeout_sec = v.get(
             "startup_timeout_sec", cfg.vllm.startup_timeout_sec
         )
+        # Only override docker_image from YAML if VLLM_IMAGE env var is not set
+        if not cfg.vllm.docker_image and v.get("docker_image"):
+            cfg.vllm.docker_image = v["docker_image"]
 
     if "benchmark" in raw:
         b = raw["benchmark"]

@@ -120,6 +120,7 @@ class KernelOptimizerAgent:
         num_prompts: int = 200,
         startup_timeout_sec: int = 1200,
         node_host: str = "localhost",
+        docker_image: str = "",
     ) -> None:
         self._client = do_client
         self._db = db
@@ -131,6 +132,7 @@ class KernelOptimizerAgent:
         self._num_prompts = num_prompts
         self._startup_timeout_sec = startup_timeout_sec
         self._node_host = node_host
+        self._docker_image = docker_image
         self._vendor = "amd" if gpu_type in _AMD_GPU_TYPES else "nvidia"
         self._search_space = self._load_search_space()
 
@@ -315,8 +317,9 @@ class KernelOptimizerAgent:
             flags=flags,
             gpu_type=self._gpu_type,
             port=port,
-            startup_timeout_sec=self._startup_timeout_sec,
+            startup_timeout=self._startup_timeout_sec,
             extra_env=combined_env,
+            docker_image=self._docker_image,
         )
 
         fitness = 0.0
