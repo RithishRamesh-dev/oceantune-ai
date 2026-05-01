@@ -23,7 +23,6 @@ Entry point:
 from __future__ import annotations
 
 import asyncio
-import logging
 import uuid
 from pathlib import Path
 from typing import Optional, Tuple
@@ -37,10 +36,11 @@ from core.config import OceanTuneConfig, load_config
 from core.db import Database
 from core.gpu_allocator import GPUSlotAllocator
 from core.port_allocator import PortAllocator
+from core.logger import get_logger
 from core.report_generator import ReportGenerator
 from core.search_space import SearchSpace
 
-log = logging.getLogger("agents.controller_agent")
+log = get_logger("agents.controller_agent")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -152,13 +152,24 @@ class ControllerAgent:
         """
         log.info("=== Stage 1: vLLM Config Search ===")
 
-        # 1. Sample candidates from search space
+        # 1. Sample candidates, keeping only those runnable on available GPUs
+        n_gpus = len(self.cfg.nodes[0].gpu_indices)
         n_candidates = self.cfg.optimiser.population_size * self.cfg.optimiser.generations
-        candidates = [
+        all_candidates = [
             self._search_space.sample_random()
-            for _ in range(n_candidates)
+            for _ in range(n_candidates * 4)   # oversample to ensure enough valid ones
         ]
-        log.info("Sampled %d candidate configs", len(candidates))
+        candidates = [
+            c for c in all_candidates
+            if (c.tensor_parallel_size or 1) <= n_gpus
+        ][:n_candidates]
+        log.info(
+            "Sampled %d runnable configs (tp≤%d) from %d total candidates",
+            len(candidates), n_gpus, len(all_candidates),
+        )
+        if not candidates:
+            log.error("No runnable configs found for %d GPU(s) — check search space", n_gpus)
+            return {}, ""
 
         # 2. Planner: validate + LLM-rank
         planner = PlannerAgent(
@@ -251,8 +262,9 @@ class ControllerAgent:
             # Skip configs that need more GPUs than available
             tp = config_doc.get("flags", {}).get("tensor_parallel_size") or 1
             if tp > n_gpus:
-                log.info(
-                    "Skipping config %s: tp=%d requires %d GPUs, only %d available",
+                log.warning(
+                    "Skipping config %s: tp=%d requires %d GPUs, only %d available — "
+                    "reduce tensor_parallel_size in search space or add more GPUs",
                     config_doc.get("fingerprint", "?")[:8], tp, tp, n_gpus,
                 )
                 await self._db.mark_config_failed(
