@@ -115,10 +115,8 @@ def run(config, model, gpu, strategy, dry_run):
         return
 
     log.info(
-        "Starting OceanTune pipeline",
-        model=cfg.model_id,
-        gpu=cfg.gpu_type,
-        strategy=cfg.optimiser.strategy,
+        "Starting OceanTune pipeline model=%s gpu=%s strategy=%s",
+        cfg.model_id, cfg.gpu_type, cfg.optimiser.strategy,
     )
 
     from agents.controller_agent import ControllerAgent
