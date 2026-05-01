@@ -45,6 +45,7 @@ import asyncio
 import os
 import re
 import signal
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -463,7 +464,7 @@ class VLLMServer:
         profile = _load_gpu_profile(self.gpu_type)
         extra_args: List[str] = profile.get("vllm_extra_args", [])
         return [
-            "python3", "-m", "vllm.entrypoints.openai.api_server",
+            sys.executable, "-m", "vllm.entrypoints.openai.api_server",
             "--host", self.host,
             "--port", str(self.port),
             *vllm_args,
