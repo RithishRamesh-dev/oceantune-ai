@@ -227,9 +227,13 @@ class ControllerAgent:
         """
         Run all pending configs directly in-process using ExecutorAgent.
         Replaces the Coordinator → Node Server HTTP path for single-droplet use.
-        Concurrency is bounded by coordinator.max_parallel_per_node.
+        Configs are processed one at a time — on a single GPU there is no benefit
+        to parallelism, and serial execution keeps GPU slot accounting simple.
+        Configs whose tensor_parallel_size exceeds the available GPU count are
+        skipped (marked failed) rather than silently re-queued forever.
         """
         node_cfg = self.cfg.nodes[0]
+        n_gpus = len(node_cfg.gpu_indices)
         gpu_alloc = GPUSlotAllocator(
             gpu_indices=node_cfg.gpu_indices,
             gpu_type=node_cfg.gpu_type,
@@ -238,37 +242,42 @@ class ControllerAgent:
             start=self.cfg.coordinator.port_pool_start,
             end=self.cfg.coordinator.port_pool_end,
         )
-        sem = asyncio.Semaphore(self.cfg.coordinator.max_parallel_per_node)
 
-        async def _run_one(config_doc: dict) -> None:
-            async with sem:
-                executor = ExecutorAgent(
-                    do_client=self._do_client,
-                    db=self._db,
-                    gpu_alloc=gpu_alloc,
-                    port_alloc=port_alloc,
-                    gpu_type=self.cfg.gpu_type,
-                    model_id=self.cfg.model_id,
-                    concurrency_levels=self.cfg.benchmark.concurrency_levels,
-                    num_prompts=self.cfg.benchmark.num_prompts,
-                    startup_timeout_sec=self.cfg.vllm.startup_timeout_sec,
-                    primary_metric=self.cfg.optimiser.primary_metric,
-                )
-                await executor.run(
-                    session_id=session_id,
-                    config_doc=config_doc,
-                    context_configs=context_configs,
-                )
-
-        tasks = []
         for _ in range(total_configs):
             config_doc = await self._db.claim_pending_config(session_id)
             if config_doc is None:
                 break
-            tasks.append(asyncio.create_task(_run_one(config_doc)))
 
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Skip configs that need more GPUs than available
+            tp = config_doc.get("flags", {}).get("tensor_parallel_size") or 1
+            if tp > n_gpus:
+                log.info(
+                    "Skipping config %s: tp=%d requires %d GPUs, only %d available",
+                    config_doc.get("fingerprint", "?")[:8], tp, tp, n_gpus,
+                )
+                await self._db.mark_config_failed(
+                    str(config_doc["_id"]),
+                    f"tensor_parallel_size={tp} exceeds available GPUs ({n_gpus})",
+                )
+                continue
+
+            executor = ExecutorAgent(
+                do_client=self._do_client,
+                db=self._db,
+                gpu_alloc=gpu_alloc,
+                port_alloc=port_alloc,
+                gpu_type=self.cfg.gpu_type,
+                model_id=self.cfg.model_id,
+                concurrency_levels=self.cfg.benchmark.concurrency_levels,
+                num_prompts=self.cfg.benchmark.num_prompts,
+                startup_timeout_sec=self.cfg.vllm.startup_timeout_sec,
+                primary_metric=self.cfg.optimiser.primary_metric,
+            )
+            await executor.run(
+                session_id=session_id,
+                config_doc=config_doc,
+                context_configs=context_configs,
+            )
 
     # ------------------------------------------------------------------
     # Stage 2
