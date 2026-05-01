@@ -127,7 +127,7 @@ class PlannerAgent:
             rationale  : str
         """
         # 1. Hardware-validate every candidate
-        validator = ConfigValidator(gpu_type=gpu_type, model_id=model_id)
+        validator = ConfigValidator(gpu_type=gpu_type)
         valid: List[VLLMFlags] = []
         for c in candidates:
             errs = validator.validate(c)
