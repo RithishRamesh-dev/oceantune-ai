@@ -212,7 +212,8 @@ pip install -r requirements.txt
 
 # 2. Set secrets (.env file or export)
 export HF_TOKEN=hf_...
-export DO_INFERENCE_KEY=...          # DigitalOcean Serverless Inference key
+export DO_INFERENCE_KEY=...                                    # DigitalOcean Serverless Inference key
+export DO_INFERENCE_ENDPOINT=https://inference.do-ai.run/v1   # DO Inference base URL
 export MONGO_URI=mongodb://localhost:27017
 
 # 3. Validate config
@@ -234,6 +235,7 @@ pip install -r requirements.txt
 
 export MONGO_URI=mongodb://YOUR_MONGO_HOST:27017
 export DO_INFERENCE_KEY=...
+export DO_INFERENCE_ENDPOINT=https://inference.do-ai.run/v1
 export HF_TOKEN=hf_...
 export NODE_HOST=YOUR_DROPLET_IP     # reported back to the Coordinator
 
