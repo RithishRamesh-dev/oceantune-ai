@@ -30,10 +30,10 @@ from typing import Optional, Tuple
 
 from agents.analyst import AnalystAgent
 from agents.do_client import DOClient
+from agents.executor import ExecutorAgent
 from agents.kernel_optimizer import KernelOptimizerAgent
 from agents.planner import PlannerAgent
 from core.config import OceanTuneConfig, load_config
-from core.coordinator import Coordinator
 from core.db import Database
 from core.gpu_allocator import GPUSlotAllocator
 from core.port_allocator import PortAllocator
@@ -192,20 +192,13 @@ class ControllerAgent:
                 inserted += 1
         log.info("Inserted %d configs into MongoDB", inserted)
 
-        # 4. Coordinator: parallel dispatch
-        coordinator = Coordinator(
-            db=self._db,
-            node_configs=self.cfg.nodes,
-            coordinator_cfg=self.cfg.coordinator,
-        )
-        await coordinator.run(
+        # 4. Run configs in-process (no node server required)
+        await self._run_local(
             session_id=session_id,
-            model_id=self.cfg.model_id,
-            gpu_type=self.cfg.gpu_type,
-            context_configs=list(self.cfg.context_configs),
             total_configs=inserted,
+            context_configs=list(self.cfg.context_configs),
         )
-        log.info("Coordinator finished all configs")
+        log.info("Local execution finished all configs")
 
         # 5. Analyst: pick winner + explain
         analyst = AnalystAgent(do_client=self._do_client, db=self._db)
@@ -220,6 +213,62 @@ class ControllerAgent:
             analysis.winner_fingerprint[:8], analysis.winner_fitness,
         )
         return analysis.winner_flags, analysis.winner_fingerprint
+
+    # ------------------------------------------------------------------
+    # Local in-process execution (single-droplet, no node server)
+    # ------------------------------------------------------------------
+
+    async def _run_local(
+        self,
+        session_id: str,
+        total_configs: int,
+        context_configs: list,
+    ) -> None:
+        """
+        Run all pending configs directly in-process using ExecutorAgent.
+        Replaces the Coordinator → Node Server HTTP path for single-droplet use.
+        Concurrency is bounded by coordinator.max_parallel_per_node.
+        """
+        node_cfg = self.cfg.nodes[0]
+        gpu_alloc = GPUSlotAllocator(
+            gpu_indices=node_cfg.gpu_indices,
+            gpu_type=node_cfg.gpu_type,
+        )
+        port_alloc = PortAllocator(
+            start=self.cfg.coordinator.port_pool_start,
+            end=self.cfg.coordinator.port_pool_end,
+        )
+        sem = asyncio.Semaphore(self.cfg.coordinator.max_parallel_per_node)
+
+        async def _run_one(config_doc: dict) -> None:
+            async with sem:
+                executor = ExecutorAgent(
+                    do_client=self._do_client,
+                    db=self._db,
+                    gpu_alloc=gpu_alloc,
+                    port_alloc=port_alloc,
+                    gpu_type=self.cfg.gpu_type,
+                    model_id=self.cfg.model_id,
+                    concurrency_levels=self.cfg.benchmark.concurrency_levels,
+                    num_prompts=self.cfg.benchmark.num_prompts,
+                    startup_timeout_sec=self.cfg.vllm.startup_timeout_sec,
+                    primary_metric=self.cfg.optimiser.primary_metric,
+                )
+                await executor.run(
+                    session_id=session_id,
+                    config_doc=config_doc,
+                    context_configs=context_configs,
+                )
+
+        tasks = []
+        for _ in range(total_configs):
+            config_doc = await self._db.claim_pending_config(session_id)
+            if config_doc is None:
+                break
+            tasks.append(asyncio.create_task(_run_one(config_doc)))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # ------------------------------------------------------------------
     # Stage 2
