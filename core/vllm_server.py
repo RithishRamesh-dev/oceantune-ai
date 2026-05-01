@@ -204,6 +204,7 @@ class VLLMServer:
     gpu_type: str = "H100"
     hf_token: str = ""
     log_buffer_size: int = 500
+    extra_env: dict = field(default_factory=dict)
 
     # Internal state — not part of __init__ signature
     _process: Optional[asyncio.subprocess.Process] = field(
@@ -487,6 +488,9 @@ class VLLMServer:
         profile = _load_gpu_profile(self.gpu_type)
         for key, val in profile.get("env_vars", {}).items():
             env.setdefault(key, str(val))
+
+        # Inject caller-supplied overrides (e.g. CUDA_VISIBLE_DEVICES from GPUSlotAllocator)
+        env.update(self.extra_env)
 
         # AMD: also map CUDA_VISIBLE_DEVICES → HIP_VISIBLE_DEVICES
         if self.gpu_type in _AMD_GPU_TYPES:

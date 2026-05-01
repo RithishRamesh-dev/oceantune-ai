@@ -176,7 +176,7 @@ class ExecutorAgent:
             flags=flags,
             gpu_type=self._gpu_type,
             port=port,
-            startup_timeout_sec=self._startup_timeout_sec,
+            startup_timeout=self._startup_timeout_sec,
             extra_env=device_env,
         )
 
