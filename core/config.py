@@ -295,7 +295,10 @@ def load_config(override_path: Optional[Path] = None) -> OceanTuneConfig:
 
     if "database" in raw:
         d = raw["database"]
-        cfg.database.uri = d.get("uri", cfg.database.uri)
+        # Only use YAML uri if non-empty — env var (MONGO_URI) takes precedence
+        yaml_uri = d.get("uri", "")
+        if yaml_uri:
+            cfg.database.uri = yaml_uri
         cfg.database.name = d.get("name", cfg.database.name)
         if "collections" in d:
             cfg.database.collections.update(d["collections"])
