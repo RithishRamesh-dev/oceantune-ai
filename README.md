@@ -214,7 +214,7 @@ pip install -r requirements.txt
 export HF_TOKEN=hf_...
 export DO_INFERENCE_KEY=...                                    # DigitalOcean Serverless Inference key
 export DO_INFERENCE_ENDPOINT=https://inference.do-ai.run/v1   # DO Inference base URL
-export MONGO_URI=mongodb://localhost:27017
+export MONGO_URI=mongodb+srv://user:pass@your-cluster/oceantune?tls=true  # required — no local MongoDB
 
 # 3. Validate config
 python3 oceantune.py validate-config
@@ -233,7 +233,7 @@ git clone https://github.com/RithishRamesh-dev/oceantune-ai.git /opt/oceantune-a
 cd /opt/oceantune-ai
 pip install -r requirements.txt
 
-export MONGO_URI=mongodb://YOUR_MONGO_HOST:27017
+export MONGO_URI=mongodb+srv://user:pass@your-cluster/oceantune?tls=true
 export DO_INFERENCE_KEY=...
 export DO_INFERENCE_ENDPOINT=https://inference.do-ai.run/v1
 export HF_TOKEN=hf_...
@@ -500,7 +500,7 @@ AMD profiles automatically inject 12 ROCm performance env vars (`VLLM_ROCM_USE_A
 | `DO_INFERENCE_KEY` | DigitalOcean Serverless Inference API key — used by all 4 agents |
 | `DO_INFERENCE_ENDPOINT` | Override inference base URL (default: `https://inference.do-ai.run/v1`) |
 | `DO_INFERENCE_MODEL` | Pin a specific inference model ID (overrides `agent.model: auto`) |
-| `MONGO_URI` | MongoDB connection string (default: `mongodb://localhost:27017`) |
+| `MONGO_URI` | MongoDB connection string — **required**, no local MongoDB assumed |
 | `DO_SPACES_KEY` | DigitalOcean Spaces access key |
 | `DO_SPACES_SECRET` | DigitalOcean Spaces secret key |
 | `NODE_HOST` | Hostname this Node Server reports to the Coordinator (important for multi-node routing) |

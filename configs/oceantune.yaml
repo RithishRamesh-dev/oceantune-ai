@@ -65,8 +65,10 @@ agent:
 # MongoDB for analytics and cross-session deduplication.
 # Credentials go in .env: MONGO_URI (full connection string)
 database:
-  # Connection URI — override via MONGO_URI env var
-  uri: "mongodb://localhost:27017"
+  # Connection URI — MUST be set via MONGO_URI env var (no local MongoDB assumed).
+  # DO Managed MongoDB:  mongodb+srv://user:pass@host/oceantune?tls=true&authSource=admin
+  # MongoDB Atlas:       mongodb+srv://user:pass@cluster.mongodb.net/oceantune?retryWrites=true
+  uri: ""   # set via: export MONGO_URI="mongodb+srv://..."
   # Database name
   name: "oceantune"
   # Collections (rarely need changing)

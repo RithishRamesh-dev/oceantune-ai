@@ -41,7 +41,7 @@ STORAGE_DIR = REPO_ROOT / "storage"
 @dataclass
 class DatabaseConfig:
     """MongoDB connection settings."""
-    uri: str = field(default_factory=lambda: os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+    uri: str = field(default_factory=lambda: os.getenv("MONGO_URI", ""))
     name: str = "oceantune"
     collections: Dict[str, str] = field(default_factory=lambda: {
         "sessions": "sessions",
@@ -371,5 +371,11 @@ def _validate(cfg: OceanTuneConfig) -> None:
 
     if not cfg.model_id:
         raise ValueError("model_id must not be empty")
+
+    if not cfg.database.uri:
+        raise ValueError(
+            "MONGO_URI is not set. Export it before starting:\n"
+            "  export MONGO_URI='mongodb+srv://user:pass@host/oceantune?tls=true'"
+        )
 
     log.debug("Config validation passed")

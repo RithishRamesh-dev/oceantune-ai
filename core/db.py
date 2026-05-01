@@ -58,7 +58,7 @@ class Database:
     Call ``await db.close()`` on shutdown.
     """
 
-    def __init__(self, uri: str = "mongodb://localhost:27017", db_name: str = "oceantune"):
+    def __init__(self, uri: str, db_name: str = "oceantune"):
         self._uri = uri
         self._db_name = db_name
         self._client: Optional[AsyncIOMotorClient] = None
