@@ -5,9 +5,18 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-# Alias from configs/models.yaml  OR  a full Hugging Face model ID.
+# Set to ANY Hugging Face model ID — aliases below are just shortcuts.
+# Examples of custom models that work directly:
+#   "meta-llama/Llama-3.1-70B-Instruct"
+#   "mistralai/Mistral-7B-Instruct-v0.3"
+#   "google/gemma-2-27b-it"
+#   "Qwen/Qwen2.5-72B-Instruct"
 #
-# Available aliases:
+# Override at runtime (no YAML edit needed):
+#   CLI flag:   oceantune run --model meta-llama/Llama-3.1-70B-Instruct
+#   Env var:    export OCEANTUNE_MODEL_ID=meta-llama/Llama-3.1-70B-Instruct
+#
+# Pre-defined aliases (configs/models.yaml):
 #   NVIDIA + AMD:
 #     deepseek_v3_2            deepseek-ai/DeepSeek-V3.2            (671B MoE)
 #     minimax_m2_5             MiniMaxAI/MiniMax-M2.5               (229B MoE)
@@ -27,7 +36,7 @@ model_id: "deepseek-ai/DeepSeek-V3.2"
 # NVIDIA:  H100  |  H200  |  B300
 # AMD:     MI300X  |  MI325X  |  MI350X
 #
-gpu_type: "H100"
+gpu_type: "H200"
 
 # ── AI Agent — DigitalOcean Serverless Inference ─────────────────────────────
 # All agents (Planner, Executor, Analyst, Kernel Optimizer) call DO Serverless
@@ -76,13 +85,14 @@ database:
 nodes:
   - host: "localhost"
     node_port: 9000
-    gpu_type: "H100"
-    gpu_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+    gpu_type: "H200"
+    gpu_indices: [0]             # single H200; add more indices (e.g. [0,1]) for multi-GPU
 
 # ── Coordinator ───────────────────────────────────────────────────────────────
 coordinator:
   # Max vLLM instances per node (limited by GPU count and tensor_parallel_size)
-  max_parallel_per_node: 2
+  # Single GPU → 1; 8 GPUs → up to 8 (but bound by model's tensor_parallel_size)
+  max_parallel_per_node: 1
   # Port pool for vLLM instances on each node (8000–8099)
   port_pool_start: 8000
   port_pool_end: 8099

@@ -27,18 +27,6 @@ structlog==24.1.0     # structured JSON logging
 # Benchmarking / server interaction
 openai==1.30.1        # used to talk to the vLLM OpenAI-compatible endpoint
 
-# Optimization
-scipy==1.13.0         # for Bayesian optimization helpers (Stage 3+)
-scikit-learn==1.4.2   # for random search, cross-validation helpers
-
-# Research agent (Stage 4)
-beautifulsoup4==4.12.3
-lxml==5.2.2
-arxiv==2.1.0
-
-# GitHub interaction
-PyGithub==2.3.0
-
 # Node server (FastAPI on each GPU droplet)
 fastapi==0.111.0
 uvicorn==0.30.1
