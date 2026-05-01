@@ -543,10 +543,12 @@ class VLLMServer:
         # Docker image
         cmd.append(docker_image)
 
-        # vLLM server args (passed as container CMD)
+        # vLLM server args (passed as container CMD to `vllm serve`)
+        # model_id is a positional arg that MUST come first
         vllm_args = self.flags.to_vllm_args(model_id=self.model_id, gpu_type=self.gpu_type)
         extra_vllm_args: List[str] = profile.get("vllm_extra_args", [])
         cmd += [
+            self.model_id,          # positional: vllm serve <model>
             "--host", "0.0.0.0",
             "--port", str(self.port),
             *vllm_args,

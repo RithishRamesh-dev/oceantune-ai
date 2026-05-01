@@ -226,23 +226,41 @@ class VLLMFlags:
         return asdict(self)
 
     def to_vllm_args(self, model_id: str, gpu_type: str = "H100") -> List[str]:
-        """Convert this config into a list of vLLM CLI arguments."""
+        """
+        Convert this config into vLLM CLI arguments for `vllm serve`.
+
+        NOTE: model_id is NOT included here — it is a positional argument
+        that must come first in the `vllm serve <model>` invocation.
+        VLLMServer._build_command() prepends it before these args.
+
+        Only non-default / non-trivial flags are emitted to avoid passing
+        flags that may have been renamed or removed in the installed vLLM version.
+        """
         args = [
-            "--model", model_id,
             "--tensor-parallel-size", str(self.tensor_parallel_size),
-            "--pipeline-parallel-size", str(self.pipeline_parallel_size),
-            "--data-parallel-size", str(self.data_parallel_size),
-            "--distributed-executor-backend", self.distributed_executor_backend,
             "--gpu-memory-utilization", str(self.gpu_memory_utilization),
             "--block-size", str(self.block_size),
-            "--kv-cache-dtype", self.kv_cache_dtype,
             "--max-num-seqs", str(self.max_num_seqs),
             "--max-num-batched-tokens", str(self.max_num_batched_tokens),
             "--dtype", self.dtype,
             "--max-model-len", str(self.max_model_len),
-            "--load-format", self.load_format,
-            "--scheduler-delay-factor", str(self.scheduler_delay_factor),
         ]
+
+        # Only emit parallelism flags when non-trivial
+        if self.pipeline_parallel_size > 1:
+            args += ["--pipeline-parallel-size", str(self.pipeline_parallel_size)]
+        if self.data_parallel_size > 1:
+            args += ["--data-parallel-size", str(self.data_parallel_size)]
+        if self.distributed_executor_backend != "mp":
+            args += ["--distributed-executor-backend", self.distributed_executor_backend]
+
+        # KV cache dtype — only when not default
+        if self.kv_cache_dtype != "auto":
+            args += ["--kv-cache-dtype", self.kv_cache_dtype]
+
+        # Load format — only when not default
+        if self.load_format != "auto":
+            args += ["--load-format", self.load_format]
 
         # Bool flags — only emit when True
         if self.enable_expert_parallel:
@@ -255,16 +273,10 @@ class VLLMFlags:
             args.append("--trust-remote-code")
         if self.enable_chunked_prefill:
             args.append("--enable-chunked-prefill")
-        if self.enable_dbo:
-            args.append("--enable-dbo")
 
         # Optional value flags
         if self.quantization:
             args += ["--quantization", self.quantization]
-        if self.attention_backend != "auto":
-            args += ["--attention-backend", self.attention_backend]
-        if self.all2all_backend != "allgather_reducescatter":
-            args += ["--all2all-backend", self.all2all_backend]
         if self.cpu_offload_gb > 0:
             args += ["--cpu-offload-gb", str(self.cpu_offload_gb)]
         if self.enable_prefix_caching and self.prefix_caching_hash_algo != "sha256":
