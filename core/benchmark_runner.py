@@ -42,6 +42,7 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple
