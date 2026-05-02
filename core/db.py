@@ -99,9 +99,19 @@ class Database:
         await self.db["nodes"].create_indexes([
             IndexModel([("host", ASCENDING), ("node_port", ASCENDING)], unique=True),
         ])
+        # Drop the old global fingerprint unique index if it exists
+        # (it was incorrectly global; the correct scope is per-session)
+        try:
+            await self.db["configs"].drop_index("fingerprint_1")
+        except Exception:
+            pass
         await self.db["configs"].create_indexes([
             IndexModel([("session_id", ASCENDING), ("status", ASCENDING)]),
-            IndexModel([("fingerprint", ASCENDING)], unique=True),
+            IndexModel(
+                [("session_id", ASCENDING), ("fingerprint", ASCENDING)],
+                unique=True,
+                name="session_fingerprint_unique",
+            ),
         ])
         await self.db["benchmark_runs"].create_indexes([
             IndexModel([("session_id", ASCENDING), ("config_id", ASCENDING)]),
