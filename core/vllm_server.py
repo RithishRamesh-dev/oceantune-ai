@@ -202,7 +202,11 @@ class VLLMServer:
     port: int = 8000
     startup_timeout: int = 300
     gpu_type: str = "H100"
-    hf_token: str = ""
+    hf_token: str = field(
+        default_factory=lambda: (
+            os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
+        )
+    )
     log_buffer_size: int = 500
     extra_env: dict = field(default_factory=dict)
     # Docker image override — empty means use gpu_profiles.yaml default.
@@ -501,6 +505,7 @@ class VLLMServer:
             or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
         )
         hf_cache = os.path.expanduser("~/.cache/huggingface")
+        os.makedirs(hf_cache, exist_ok=True)   # must exist before docker -v mount
 
         cmd = [
             "docker", "run", "--rm",
