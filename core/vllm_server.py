@@ -277,6 +277,20 @@ class VLLMServer:
         self._started_at = time.monotonic()
         self._log_buffer = deque(maxlen=self.log_buffer_size)
 
+        # Force-remove any stale container with the same name before starting.
+        # This handles the case where a previous run was killed before stop()
+        # could clean up (e.g. SIGKILL, crash, leftover from prior session).
+        container_name = f"oceantune-vllm-{self.port}"
+        try:
+            rm_proc = await asyncio.create_subprocess_exec(
+                "docker", "rm", "-f", container_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(rm_proc.wait(), timeout=15)
+        except Exception:
+            pass
+
         cmd = self._build_command()
         env = self._build_env()
 
