@@ -42,7 +42,7 @@ from core.db import Database
 from core.gpu_allocator import GPUSlotAllocator
 from core.port_allocator import PortAllocator
 from core.search_space import VLLMFlags
-from core.vllm_server import VLLMServer, OOMError, StartupTimeout, PortConflict, CUDAError
+from core.vllm_server import VLLMServer, OOMError, StartupTimeout, PortConflict, CUDAError, _load_gpu_profile
 from core.benchmark_runner import BenchmarkEngine
 from core.metrics_collector import MetricsCollector
 from core.log_analyzer import LogAnalyzer
@@ -200,6 +200,7 @@ class ExecutorAgent:
                         server=server,
                         port=port,
                         context=context,
+                        flags=flags,
                     )
                     best_fitness = max(best_fitness, fitness)
                     log.info(
@@ -257,6 +258,7 @@ class ExecutorAgent:
         server: VLLMServer,
         port: int,
         context: Dict[str, int],
+        flags: VLLMFlags,
     ) -> Tuple[str, float]:
         """Run the benchmark ramp for one context length. Returns (run_id, fitness)."""
         engine = BenchmarkEngine(
@@ -280,13 +282,16 @@ class ExecutorAgent:
             context=context,
         )
 
-        # Compute fitness score
-        collector = MetricsCollector(
-            ramp_result=ramp_result,
-            gpu_type=self._gpu_type,
+        # Compute fitness score using server log analysis + GPU profile
+        analysis = LogAnalyzer.analyze(server.log_tail)
+        gpu_profile = _load_gpu_profile(self._gpu_type)
+        enriched_metrics = MetricsCollector.collect(
+            ramp=ramp_result,
+            analysis=analysis,
+            flags=flags,
+            gpu_profile=gpu_profile,
             primary_metric=self._primary_metric,
         )
-        enriched_metrics = collector.collect()
         fitness = enriched_metrics.fitness_score
 
         run_id = await self._db.insert_benchmark_run(

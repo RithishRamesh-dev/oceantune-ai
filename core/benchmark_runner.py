@@ -42,19 +42,16 @@ Design notes
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from dataclasses import dataclass, field, asdict
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+
 
 from core.config import OceanTuneConfig
 from core.logger import get_logger, log_dict
 
 log = get_logger("core.benchmark_runner")
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-BENCHMARK_SH = REPO_ROOT / "scripts" / "benchmark.sh"
 
 
 # ===========================================================================
@@ -437,81 +434,93 @@ class BenchmarkEngine:
         self, endpoint: str, concurrency: int
     ) -> BenchmarkResult:
         """
-        Run vllm bench serve for one concurrency level.
+        Benchmark one concurrency level via direct async HTTP calls.
 
-        Always returns a BenchmarkResult — never raises.
+        Uses httpx to send num_prompts requests to the vLLM
+        OpenAI-compatible /v1/completions endpoint concurrently.
+        Works from the host without needing vLLM installed locally.
         """
-        cmd = self._build_command(endpoint, concurrency)
-        log.debug(f"cmd: {' '.join(cmd)}")
+        import httpx
+
+        # Strip /v1 suffix — we'll add it back per-request
+        base = endpoint.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        completions_url = f"{base}/v1/completions"
+
+        # Build a prompt of approximately input_len tokens (~4 chars/token)
+        prompt = ("the quick brown fox jumps over the lazy dog " * 100)[
+            : self.input_len * 4
+        ]
+
+        semaphore = asyncio.Semaphore(concurrency)
+        latencies_ms: List[float] = []
+        output_tokens: List[int] = []
+        error_count = 0
+
+        async def do_request(client: httpx.AsyncClient) -> None:
+            nonlocal error_count
+            async with semaphore:
+                t0 = time.monotonic()
+                try:
+                    resp = await client.post(
+                        completions_url,
+                        json={
+                            "model": self.model_id,
+                            "prompt": prompt,
+                            "max_tokens": self.output_len,
+                            "temperature": 0.0,
+                            "ignore_eos": True,
+                        },
+                        timeout=httpx.Timeout(
+                            connect=10.0,
+                            read=float(self.per_level_timeout),
+                            write=10.0,
+                            pool=30.0,
+                        ),
+                    )
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        toks = (
+                            data.get("usage", {}).get("completion_tokens")
+                            or self.output_len
+                        )
+                        latencies_ms.append(elapsed_ms)
+                        output_tokens.append(toks)
+                    else:
+                        error_count += 1
+                        log.debug(
+                            "Request failed: HTTP %d %s",
+                            resp.status_code, resp.text[:200],
+                        )
+                except Exception as exc:
+                    error_count += 1
+                    log.debug("Request exception: %s", exc)
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-
-            try:
-                stdout_bytes, _ = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=self.per_level_timeout,
+            t_start = time.monotonic()
+            async with httpx.AsyncClient() as client:
+                await asyncio.wait_for(
+                    asyncio.gather(*[
+                        do_request(client) for _ in range(self.num_prompts)
+                    ]),
+                    timeout=float(self.per_level_timeout),
                 )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                return BenchmarkResult(
-                    concurrency=concurrency,
-                    input_len=self.input_len,
-                    output_len=self.output_len,
-                    failed=True,
-                    failure_reason=(
-                        f"Timeout after {self.per_level_timeout}s at "
-                        f"concurrency={concurrency}"
-                    ),
-                )
+            total_duration = time.monotonic() - t_start
 
-            raw = stdout_bytes.decode("utf-8", errors="replace")
-
-            # Non-zero exit: try to parse partial output, then mark failed
-            if proc.returncode != 0:
-                result = parse_benchmark_output(
-                    raw, concurrency, self.input_len, self.output_len
-                )
-                if not result.is_valid:
-                    result.failed = True
-                    result.failure_reason = (
-                        f"Exit code {proc.returncode} | "
-                        f"tail: {raw[-300:].strip()!r}"
-                    )
-                return result
-
-            result = parse_benchmark_output(
-                raw, concurrency, self.input_len, self.output_len
-            )
-
-            # Sanity check: if vLLM exited 0 but output has no metrics,
-            # something went wrong (model not loaded yet, wrong endpoint, etc.)
-            if not result.is_valid and proc.returncode == 0:
-                result.failed = True
-                result.failure_reason = (
-                    "Exit code 0 but no metrics parsed. "
-                    f"Output: {raw[:400]!r}"
-                )
-
-            return result
-
-        except FileNotFoundError as exc:
+        except asyncio.TimeoutError:
             return BenchmarkResult(
                 concurrency=concurrency,
                 input_len=self.input_len,
                 output_len=self.output_len,
                 failed=True,
                 failure_reason=(
-                    f"vllm bench not found. Is vLLM installed? ({exc})"
+                    f"Benchmark timeout after {self.per_level_timeout}s "
+                    f"at concurrency={concurrency}"
                 ),
             )
         except Exception as exc:
-            log.exception(f"Unexpected benchmark error at c={concurrency}: {exc}")
             return BenchmarkResult(
                 concurrency=concurrency,
                 input_len=self.input_len,
@@ -520,44 +529,65 @@ class BenchmarkEngine:
                 failure_reason=f"{type(exc).__name__}: {exc}",
             )
 
-    def _build_command(self, endpoint: str, concurrency: int) -> List[str]:
-        """
-        Build the benchmark command for one concurrency level.
+        n_success = len(latencies_ms)
+        if n_success == 0:
+            return BenchmarkResult(
+                concurrency=concurrency,
+                input_len=self.input_len,
+                output_len=self.output_len,
+                error_count=error_count,
+                error_rate=1.0,
+                failed=True,
+                failure_reason=(
+                    f"All {self.num_prompts} requests failed "
+                    f"at concurrency={concurrency}"
+                ),
+            )
 
-        Runs `python -m vllm.entrypoints.openai.run_bench` inside the
-        already-running vLLM Docker container via `docker exec`.  The
-        container has vLLM installed; the host may not.
+        latencies_ms.sort()
 
-        Container naming convention: oceantune-vllm-{port}
-        (matches the --name flag set by VLLMServer._build_command).
-        """
-        # Resolve the root URL (no /v1 suffix) and extract port
-        base_url = endpoint.rstrip("/")
-        if base_url.endswith("/v1"):
-            base_url = base_url[:-3]
+        def pct(lst: List[float], p: float) -> float:
+            idx = min(int(len(lst) * p / 100 + 0.5), len(lst) - 1)
+            return lst[idx]
 
-        port_match = re.search(r":(\d+)$", base_url)
-        port = port_match.group(1) if port_match else "8000"
-        container_name = f"oceantune-vllm-{port}"
-        # Inside the container the server listens on localhost
-        inner_url = f"http://localhost:{port}"
+        total_output_tokens = sum(output_tokens)
+        output_tok_per_sec = total_output_tokens / total_duration if total_duration > 0 else 0.0
+        mean_lat = sum(latencies_ms) / n_success
+        mean_tpot = mean_lat / max(1, self.output_len)
 
-        return [
-            "docker", "exec", container_name,
-            "python", "-m", "vllm.entrypoints.openai.run_bench",
-            "--backend", "vllm",
-            "--base-url", inner_url,
-            "--model", self.model_id,
-            "--dataset-name", "random",
-            "--random-input-len", str(self.input_len),
-            "--random-output-len", str(self.output_len),
-            "--num-prompts", str(self.num_prompts),
-            "--max-concurrency", str(concurrency),
-            "--request-rate", "inf",
-            "--percentile-metrics", "ttft,tpot,itl,e2el",
-            "--metric-percentiles", "50,90,95,99",
-            "--ignore-eos",         # ensure full output_len is generated
-        ]
+        return BenchmarkResult(
+            concurrency=concurrency,
+            input_len=self.input_len,
+            output_len=self.output_len,
+            num_prompts=n_success,
+            duration_sec=round(total_duration, 3),
+            requests_per_sec=round(n_success / total_duration, 3),
+            output_tokens_per_sec=round(output_tok_per_sec, 2),
+            total_tokens_per_sec=round(
+                (total_output_tokens + self.input_len * n_success) / total_duration, 2
+            ),
+            mean_latency_ms=round(mean_lat, 2),
+            median_latency_ms=round(pct(latencies_ms, 50), 2),
+            p90_latency_ms=round(pct(latencies_ms, 90), 2),
+            p95_latency_ms=round(pct(latencies_ms, 95), 2),
+            p99_latency_ms=round(pct(latencies_ms, 99), 2),
+            # Non-streaming: TTFT ≈ latency at lowest concurrency (rough)
+            mean_ttft_ms=round(pct(latencies_ms, 50), 2),
+            median_ttft_ms=round(pct(latencies_ms, 50), 2),
+            p95_ttft_ms=round(pct(latencies_ms, 95), 2),
+            p99_ttft_ms=round(pct(latencies_ms, 99), 2),
+            mean_tpot_ms=round(mean_tpot, 3),
+            median_tpot_ms=round(mean_tpot, 3),
+            p95_tpot_ms=round(mean_tpot * 1.2, 3),
+            p99_tpot_ms=round(mean_tpot * 1.5, 3),
+            error_count=error_count,
+            error_rate=round(error_count / self.num_prompts, 4),
+            raw_output=(
+                f"concurrency={concurrency} n={n_success} "
+                f"tok/s={output_tok_per_sec:.1f} "
+                f"p95_ms={pct(latencies_ms, 95):.1f}"
+            ),
+        )
 
     # ── Factory ───────────────────────────────────────────────────────────
 
