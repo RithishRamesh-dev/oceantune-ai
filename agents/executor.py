@@ -294,12 +294,18 @@ class ExecutorAgent:
         )
         fitness = enriched_metrics.fitness_score
 
+        # Per-concurrency-level breakdown for table display
+        levels_data = [r.to_dict() for r in ramp_result.levels]
+
+        from dataclasses import asdict as _asdict
         run_id = await self._db.insert_benchmark_run(
             session_id=session_id,
             config_id=config_id,
             fingerprint=fingerprint,
+            flags=_asdict(flags),
             context=context,
             raw_metrics=summary,
+            levels=levels_data,
             enriched_metrics={
                 **enriched_metrics.__dict__,
                 "llm_parsed": enriched,

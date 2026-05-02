@@ -220,9 +220,12 @@ class ReportGenerator:
         for i, r in enumerate(top, 1):
             fp = r.get("fingerprint", "")[:12]
             fit = r.get("fitness_score", 0)
-            raw = r.get("raw_metrics", {})
-            thr = raw.get("throughput_tok_s", "—")
-            p95 = raw.get("p95_latency_ms", "—")
+            # enriched_metrics has canonical keys; fall back to raw_metrics
+            em = r.get("enriched_metrics") or r.get("raw_metrics") or {}
+            thr_raw = em.get("peak_throughput_tokens_per_sec", em.get("throughput_tok_s"))
+            p95_raw = em.get("p95_latency_at_peak_ms", em.get("p95_latency_ms"))
+            thr = f"{thr_raw:.1f}" if isinstance(thr_raw, (int, float)) else "—"
+            p95 = f"{p95_raw:.1f}" if isinstance(p95_raw, (int, float)) else "—"
             top_table += f"| {i} | `{fp}` | {fit:.4f} | {thr} | {p95} |\n"
 
         kernel_section = ""

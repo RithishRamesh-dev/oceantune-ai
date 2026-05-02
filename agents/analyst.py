@@ -183,9 +183,16 @@ class AnalystAgent:
                 "index": i,
                 "fingerprint": r.get("fingerprint", "")[:12],
                 "fitness_score": r.get("fitness_score"),
-                "raw_metrics": {
-                    k: r.get("raw_metrics", {}).get(k)
-                    for k in ["throughput_tok_s", "p95_latency_ms", "ttft_ms", "error_rate"]
+                "metrics": {
+                    k: (r.get("enriched_metrics") or r.get("raw_metrics") or {}).get(k)
+                    for k in [
+                        "peak_throughput_tokens_per_sec",
+                        "p95_latency_at_peak_ms",
+                        "mean_ttft_ms",
+                        "error_rate_max",
+                        "valid_levels",
+                        "best_concurrency",
+                    ]
                 },
             }
             for i, r in enumerate(top_runs)
