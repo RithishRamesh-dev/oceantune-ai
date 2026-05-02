@@ -47,9 +47,10 @@ from core.db import Database
 from core.gpu_allocator import GPUSlotAllocator
 from core.port_allocator import PortAllocator
 from core.search_space import VLLMFlags
-from core.vllm_server import VLLMServer
+from core.vllm_server import VLLMServer, _load_gpu_profile
 from core.benchmark_runner import BenchmarkEngine
 from core.metrics_collector import MetricsCollector
+from core.log_analyzer import LogAnalyzer
 
 log = logging.getLogger("agents.kernel_optimizer")
 
@@ -339,12 +340,15 @@ class KernelOptimizerAgent:
                 output_len=output_len,
             )
             ramp = await engine.run()
-            collector = MetricsCollector(
-                ramp_result=ramp,
-                gpu_type=self._gpu_type,
+            analysis = LogAnalyzer.analyze(server.log_tail)
+            gpu_profile = _load_gpu_profile(self._gpu_type)
+            enriched = MetricsCollector.collect(
+                ramp=ramp,
+                analysis=analysis,
+                flags=flags,
+                gpu_profile=gpu_profile,
                 primary_metric="throughput",
             )
-            enriched = collector.collect()
             fitness = enriched.fitness_score
 
         except Exception as exc:
