@@ -223,17 +223,23 @@ class ControllerAgent:
             # Read result back from DB
             config_doc = await self._db.get_config_by_id(config_id)
             fitness = config_doc.get("fitness_score", 0.0) if config_doc else 0.0
+            error_text = config_doc.get("error", "") if config_doc else ""
             log.info("Iteration %d — fitness=%.4f", iteration, fitness)
+            if error_text:
+                log.warning("Iteration %d — server error: %s", iteration, error_text[:200])
 
-            # Record in history for agent context
+            # Record in history for agent context (include error so planner can avoid repeats)
             top_runs = await self._db.get_top_configs(session_id, n=1)
-            search_history.append({
+            history_entry: dict = {
                 "iteration": iteration,
                 "flags": {k: v for k, v in asdict(flags).items() if k != "run_id"},
                 "fitness": fitness,
                 "metrics": top_runs[0].get("metrics", {}) if top_runs else {},
                 "rationale": rationale,
-            })
+            }
+            if error_text:
+                history_entry["error"] = error_text
+            search_history.append(history_entry)
 
             if fitness > best_fitness:
                 best_fitness = fitness

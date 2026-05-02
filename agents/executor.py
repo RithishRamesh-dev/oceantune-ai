@@ -222,7 +222,13 @@ class ExecutorAgent:
             await self._db.mark_config_done(config_id, best_fitness)
 
         except (OOMError, StartupTimeout, PortConflict, CUDAError, Exception) as exc:
-            total_error = str(exc)
+            # Include log tail in the stored error so the planner can read it
+            from core.vllm_server import ServerFailure
+            if isinstance(exc, ServerFailure) and exc.log_tail:
+                tail = exc.formatted_tail(30)
+                total_error = f"{exc}\n--- vLLM log tail ---\n{tail}"
+            else:
+                total_error = str(exc)
             log.error("Executor fatal error for config %s: %s", fingerprint[:8], exc)
             await self._db.mark_config_failed(config_id, total_error)
 

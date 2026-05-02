@@ -79,12 +79,14 @@ Your goal: maximize throughput (tokens/second) on a single-GPU vLLM server.
 You will receive:
 - The model and GPU details
 - The current best configuration and its benchmark metrics
-- History of all configurations tried so far and their results
+- History of all configurations tried so far and their results (including any server errors)
 
 Your task:
 1. Diagnose the bottleneck from the metrics (compute-bound, memory-bound, or scheduling-bound)
-2. Propose the single most impactful configuration change to try next
-3. Return a JSON object with the full new configuration and a rationale
+2. If any prior iteration has an "error" field, read it carefully — it contains the vLLM startup
+   error and log tail. You MUST NOT propose a configuration that would trigger the same error.
+3. Propose the single most impactful configuration change to try next
+4. Return a JSON object with the full new configuration and a rationale
 
 Output format (strict JSON):
 {
@@ -100,6 +102,11 @@ Hard constraints (never violate these):
 - cpu_offload_gb: always 0 (GPU has enough VRAM)
 - speculative_model: always null (not applicable here)
 - num_speculative_tokens: always null
+
+If history shows "No module named 'ray'" → distributed_executor_backend must be "mp", never "ray".
+If history shows "World size.*larger than.*GPUs" → tensor_parallel_size must be 1, always.
+If history shows "CUDA out of memory" → reduce gpu_memory_utilization by at least 0.05.
+If history shows "GatedRepoError" or "401" → this is an auth issue, not a config issue; keep flags.
 
 Tunable single-GPU parameters (choose ONE to change from current best):
 - gpu_memory_utilization: [0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
@@ -324,19 +331,19 @@ class PlannerAgent:
 
         # Build history summary (limit to last 5 to stay within token budget)
         recent_history = history[-5:] if len(history) > 5 else history
-        history_summary = [
-            {
-                "iteration": i,
-                "changed_from_baseline": {
-                    k: v for k, v in h.get("flags", {}).items()
-                    if v != h.get("flags", {}).get(k)
-                },
+        history_summary = []
+        for i, h in enumerate(recent_history):
+            entry = {
+                "iteration": h.get("iteration", i),
+                "flags": h.get("flags", {}),
                 "fitness": h.get("fitness"),
                 "throughput_tok_s": h.get("metrics", {}).get("throughput_tok_s"),
                 "p95_latency_ms": h.get("metrics", {}).get("p95_latency_ms"),
             }
-            for i, h in enumerate(recent_history)
-        ]
+            if h.get("error"):
+                # Truncate to first 500 chars to stay within token budget
+                entry["error"] = h["error"][:500]
+            history_summary.append(entry)
 
         user_msg = (
             f"Model: {model_id}\n"
@@ -382,9 +389,25 @@ class PlannerAgent:
 
         except DOClientError as exc:
             log.warning("LLM proposal failed (%s); using fallback variation", exc)
-            # Cycle through fallback variations
+            # Collect all errors from history to skip unsafe variations
+            all_errors = " ".join(h.get("error", "") for h in history if h.get("error"))
+
+            # Cycle through fallback variations, skipping unsafe ones
+            tried = 0
             idx = iteration % len(self._FALLBACK_VARIATIONS)
-            overrides = self._FALLBACK_VARIATIONS[idx]
+            while tried < len(self._FALLBACK_VARIATIONS):
+                overrides = self._FALLBACK_VARIATIONS[idx]
+                # Skip variations that would trigger known errors
+                skip = False
+                if "ray" in all_errors.lower() and overrides.get("distributed_executor_backend") == "ray":
+                    skip = True
+                if "out of memory" in all_errors.lower() and overrides.get("gpu_memory_utilization", 0) > 0.90:
+                    skip = True
+                if not skip:
+                    break
+                idx = (idx + 1) % len(self._FALLBACK_VARIATIONS)
+                tried += 1
+
             proposed = copy.deepcopy(current_best)
             for k, v in overrides.items():
                 setattr(proposed, k, v)
