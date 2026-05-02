@@ -123,7 +123,7 @@ class DOClient:
             model
             or os.getenv("AGENT_MODEL")
             or os.getenv("DO_INFERENCE_MODEL", "")
-            or "deepseek-ai/DeepSeek-R1"
+            or "anthropic-claude-4.5-sonnet"
         )
         return cls(
             api_key=api_key,
