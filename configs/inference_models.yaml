@@ -26,6 +26,39 @@
 
 inference_models:
 
+  # ── Anthropic Claude (use AGENT_API_KEY + AGENT_ENDPOINT) ────────────────
+
+  claude_sonnet_4_5:
+    model_id: "claude-sonnet-4-5"
+    display_name: "Claude Sonnet 4.5"
+    provider: "anthropic"
+    context_window: 200000
+    supports_function_calling: true
+    suitability_score: 0.98
+    strengths:
+      - "Excellent structured JSON output"
+      - "Strong reasoning about system performance"
+      - "Reliable instruction following"
+      - "Deep ML infrastructure knowledge"
+    recommended_for: "primary agent — highest quality analysis"
+    notes: >
+      Set AGENT_API_KEY=sk-ant-... and AGENT_ENDPOINT=https://api.anthropic.com/v1
+      and AGENT_MODEL=claude-sonnet-4-5 to use this model.
+
+  claude_sonnet_4_6:
+    model_id: "claude-sonnet-4-6"
+    display_name: "Claude Sonnet 4.6"
+    provider: "anthropic"
+    context_window: 200000
+    supports_function_calling: true
+    suitability_score: 0.99
+    strengths:
+      - "Latest Anthropic model"
+      - "Best reasoning + structured output"
+    recommended_for: "primary agent — cutting edge"
+    notes: >
+      Set AGENT_MODEL=claude-sonnet-4-6 with Anthropic credentials.
+
   # ── Recommended: best reasoning + tool use ────────────────────────────────
 
   deepseek_r1:

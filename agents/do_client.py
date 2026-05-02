@@ -98,11 +98,30 @@ class DOClient:
         temperature: float = 0.3,
         timeout_sec: float = 120.0,
     ) -> "DOClient":
-        """Build a DOClient from environment variables."""
-        api_key = os.getenv("DO_INFERENCE_KEY", "")
-        endpoint = os.getenv("DO_INFERENCE_ENDPOINT", _DEFAULT_ENDPOINT)
+        """
+        Build a DOClient from environment variables.
+
+        Supported env vars (in priority order):
+          AGENT_API_KEY / DO_INFERENCE_KEY   — API key
+          AGENT_ENDPOINT / DO_INFERENCE_ENDPOINT — base URL
+          AGENT_MODEL / DO_INFERENCE_MODEL   — model ID override
+
+        To use Anthropic Claude:
+          AGENT_API_KEY=sk-ant-...
+          AGENT_ENDPOINT=https://api.anthropic.com/v1
+          AGENT_MODEL=claude-sonnet-4-5
+        """
+        api_key = (
+            os.getenv("AGENT_API_KEY")
+            or os.getenv("DO_INFERENCE_KEY", "")
+        )
+        endpoint = (
+            os.getenv("AGENT_ENDPOINT")
+            or os.getenv("DO_INFERENCE_ENDPOINT", _DEFAULT_ENDPOINT)
+        )
         resolved_model = (
             model
+            or os.getenv("AGENT_MODEL")
             or os.getenv("DO_INFERENCE_MODEL", "")
             or "deepseek-ai/DeepSeek-R1"
         )
@@ -119,13 +138,21 @@ class DOClient:
     # HTTP lifecycle
     # ------------------------------------------------------------------
 
+    def _is_anthropic(self) -> bool:
+        return "anthropic.com" in self.endpoint
+
     async def _get_http(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
+            headers: Dict[str, str] = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+            # Anthropic's OpenAI-compatible endpoint requires this header
+            if self._is_anthropic():
+                headers["anthropic-version"] = "2023-06-01"
+                headers["x-api-key"] = self.api_key
             self._http = httpx.AsyncClient(
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 timeout=self.timeout_sec,
             )
         return self._http
