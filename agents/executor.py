@@ -272,8 +272,10 @@ class ExecutorAgent:
         summary = ramp_result.summary
 
         # Use LLM to verify/enrich the parsed metrics (best-effort)
+        best_result = ramp_result.best_throughput_result()
+        raw_stdout = best_result.raw_output if best_result else ""
         enriched = await self._llm_parse_metrics(
-            raw_stdout=ramp_result.raw_output or "",
+            raw_stdout=raw_stdout,
             summary=summary,
             context=context,
         )

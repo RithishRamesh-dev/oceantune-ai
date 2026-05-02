@@ -48,7 +48,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from core.config import OceanTuneConfig, BenchmarkConfig
+from core.config import OceanTuneConfig
 from core.logger import get_logger, log_dict
 
 log = get_logger("core.benchmark_runner")
@@ -310,27 +310,45 @@ class BenchmarkEngine:
 
     Parameters
     ----------
-    cfg : OceanTuneConfig
-        Loaded config — provides concurrency_levels, num_prompts, etc.
-    context : tuple[int, int]
-        (input_len, output_len) token counts for this benchmark run.
+    base_url : str
+        Root URL of the vLLM OpenAI-compatible API, e.g. "http://localhost:8000".
+    model_id : str
+        HuggingFace model ID passed to vllm bench serve.
+    concurrency_levels : list[int]
+        Concurrency ramp to benchmark.
+    num_prompts : int
+        Total prompts per concurrency level.
+    input_len : int
+        Input token length for random dataset.
+    output_len : int
+        Output token length for random dataset.
     per_level_timeout : int
         Seconds before a single concurrency-level run is killed.
-        Default 180s is generous for large MoE models.
     """
 
     def __init__(
         self,
-        cfg: OceanTuneConfig,
-        context: Tuple[int, int] = (1024, 1024),
+        base_url: str,
+        model_id: str,
+        concurrency_levels: List[int],
+        num_prompts: int,
+        input_len: int,
+        output_len: int,
         per_level_timeout: int = 180,
     ):
-        self.cfg = cfg
-        self.input_len, self.output_len = context
+        self.base_url = base_url
+        self.model_id = model_id
+        self.concurrency_levels = concurrency_levels
+        self.num_prompts = num_prompts
+        self.input_len = input_len
+        self.output_len = output_len
         self.per_level_timeout = per_level_timeout
-        self.bench_cfg: BenchmarkConfig = cfg.benchmark
 
     # ── Public API ────────────────────────────────────────────────────────
+
+    async def run(self) -> RampResult:
+        """Convenience wrapper — runs the full ramp against self.base_url."""
+        return await self.run_full_ramp(self.base_url)
 
     async def run_full_ramp(self, endpoint: str) -> RampResult:
         """
@@ -354,11 +372,11 @@ class BenchmarkEngine:
             endpoint=endpoint,
             input_len=self.input_len,
             output_len=self.output_len,
-            concurrency_levels=self.bench_cfg.concurrency_levels,
-            num_prompts=self.bench_cfg.num_prompts,
+            concurrency_levels=self.concurrency_levels,
+            num_prompts=self.num_prompts,
         )
 
-        for concurrency in self.bench_cfg.concurrency_levels:
+        for concurrency in self.concurrency_levels:
             log_dict(log, "info", "Running concurrency level",
                      concurrency=concurrency)
 
@@ -504,26 +522,36 @@ class BenchmarkEngine:
 
     def _build_command(self, endpoint: str, concurrency: int) -> List[str]:
         """
-        Build the vllm bench serve command for one concurrency level.
+        Build the benchmark command for one concurrency level.
 
-        Uses `python -m vllm.entrypoints.openai.run_bench` (stable across
-        vLLM versions). The benchmark.sh shell wrapper can also be used for
-        manual runs — see scripts/benchmark.sh.
+        Runs `python -m vllm.entrypoints.openai.run_bench` inside the
+        already-running vLLM Docker container via `docker exec`.  The
+        container has vLLM installed; the host may not.
+
+        Container naming convention: oceantune-vllm-{port}
+        (matches the --name flag set by VLLMServer._build_command).
         """
-        # bench serve expects the root URL (no /v1 suffix)
+        # Resolve the root URL (no /v1 suffix) and extract port
         base_url = endpoint.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
 
+        port_match = re.search(r":(\d+)$", base_url)
+        port = port_match.group(1) if port_match else "8000"
+        container_name = f"oceantune-vllm-{port}"
+        # Inside the container the server listens on localhost
+        inner_url = f"http://localhost:{port}"
+
         return [
+            "docker", "exec", container_name,
             "python", "-m", "vllm.entrypoints.openai.run_bench",
             "--backend", "vllm",
-            "--base-url", base_url,
-            "--model", self.cfg.model_id,
+            "--base-url", inner_url,
+            "--model", self.model_id,
             "--dataset-name", "random",
             "--random-input-len", str(self.input_len),
             "--random-output-len", str(self.output_len),
-            "--num-prompts", str(self.bench_cfg.num_prompts),
+            "--num-prompts", str(self.num_prompts),
             "--max-concurrency", str(concurrency),
             "--request-rate", "inf",
             "--percentile-metrics", "ttft,tpot,itl,e2el",
@@ -539,24 +567,24 @@ class BenchmarkEngine:
         cfg: OceanTuneConfig,
         context_index: int = 0,
         per_level_timeout: int = 180,
+        base_url: str = "",
     ) -> "BenchmarkEngine":
-        """
-        Build a BenchmarkEngine from a config and a context_index.
-
-        Parameters
-        ----------
-        context_index : int
-            Index into cfg.context_configs.
-            0 = (1024, 1024)  1 = (1024, 4096) etc.
-        """
+        """Build a BenchmarkEngine from an OceanTuneConfig + context index."""
         if context_index >= len(cfg.context_configs):
             raise ValueError(
                 f"context_index={context_index} out of range — "
                 f"cfg has {len(cfg.context_configs)} context configs"
             )
-        context = tuple(cfg.context_configs[context_index])
-        return cls(cfg=cfg, context=context,
-                   per_level_timeout=per_level_timeout)
+        input_len, output_len = cfg.context_configs[context_index]
+        return cls(
+            base_url=base_url,
+            model_id=cfg.model_id,
+            concurrency_levels=cfg.benchmark.concurrency_levels,
+            num_prompts=cfg.benchmark.num_prompts,
+            input_len=input_len,
+            output_len=output_len,
+            per_level_timeout=per_level_timeout,
+        )
 
 
 # ===========================================================================
@@ -574,8 +602,12 @@ async def run_benchmark(
     Primary entry point called by the experiment runner (Step 7).
     """
     engine = BenchmarkEngine(
-        cfg=cfg,
-        context=context,
+        base_url=endpoint,
+        model_id=cfg.model_id,
+        concurrency_levels=cfg.benchmark.concurrency_levels,
+        num_prompts=cfg.benchmark.num_prompts,
+        input_len=context[0],
+        output_len=context[1],
         per_level_timeout=per_level_timeout,
     )
     return await engine.run_full_ramp(endpoint)
