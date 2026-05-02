@@ -246,13 +246,9 @@ class VLLMFlags:
             "--max-model-len", str(self.max_model_len),
         ]
 
-        # Only emit parallelism flags when non-trivial
-        if self.pipeline_parallel_size > 1:
-            args += ["--pipeline-parallel-size", str(self.pipeline_parallel_size)]
-        if self.data_parallel_size > 1:
-            args += ["--data-parallel-size", str(self.data_parallel_size)]
-        if self.distributed_executor_backend != "mp":
-            args += ["--distributed-executor-backend", self.distributed_executor_backend]
+        # Pipeline / data parallel and Ray backend require multi-GPU + Ray install.
+        # Never emit these — the agent will only tune single-GPU parameters.
+        # tp > 1 is handled by the GPU slot allocator; pp/dp are not safe to sample.
 
         # KV cache dtype — only when not default
         if self.kv_cache_dtype != "auto":

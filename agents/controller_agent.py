@@ -38,7 +38,7 @@ from core.gpu_allocator import GPUSlotAllocator
 from core.port_allocator import PortAllocator
 from core.logger import get_logger
 from core.report_generator import ReportGenerator
-from core.search_space import SearchSpace
+from core.search_space import SearchSpace, VLLMFlags
 
 log = get_logger("agents.controller_agent")
 
@@ -146,87 +146,154 @@ class ControllerAgent:
         self, session_id: str
     ) -> Tuple[dict, str]:
         """
-        Run Stage 1: Plan → Queue → Coordinate → Analyse.
+        Run Stage 1: Iterative agent-guided hyperparameter search.
+
+        Iteration 0: bare minimum vLLM flags (establishes baseline).
+        Iteration N: PlannerAgent.propose_next() observes all prior results
+                     and proposes a single targeted change.
 
         Returns (winner_flags_dict, winner_fingerprint).
         """
-        log.info("=== Stage 1: vLLM Config Search ===")
+        log.info("=== Stage 1: Agent-guided vLLM Config Search ===")
 
-        # 1. Sample candidates, keeping only those runnable on available GPUs
         n_gpus = len(self.cfg.nodes[0].gpu_indices)
-        n_candidates = self.cfg.optimiser.population_size * self.cfg.optimiser.generations
-        all_candidates = [
-            self._search_space.sample_random()
-            for _ in range(n_candidates * 4)   # oversample to ensure enough valid ones
-        ]
-        candidates = [
-            c for c in all_candidates
-            if (c.tensor_parallel_size or 1) <= n_gpus
-        ][:n_candidates]
-        log.info(
-            "Sampled %d runnable configs (tp≤%d) from %d total candidates",
-            len(candidates), n_gpus, len(all_candidates),
-        )
-        if not candidates:
-            log.error("No runnable configs found for %d GPU(s) — check search space", n_gpus)
-            return {}, ""
+        n_iterations = self.cfg.optimiser.generations
+        context_configs = list(self.cfg.context_configs)
 
-        # 2. Planner: validate + LLM-rank
         planner = PlannerAgent(
             do_client=self._do_client,
             db=self._db,
             search_space=self._search_space,
         )
-        ordered = await planner.plan(
-            session_id=session_id,
-            model_id=self.cfg.model_id,
-            gpu_type=self.cfg.gpu_type,
-            candidates=candidates,
-            max_configs=n_candidates,
+
+        # Iteration 0: bare minimum — let vLLM choose all defaults
+        current_best = VLLMFlags(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            distributed_executor_backend="mp",
+            cpu_offload_gb=0,
         )
-        log.info("Planner returned %d ordered configs", len(ordered))
+        current_best.run_id = current_best.fingerprint()
 
-        if not ordered:
-            log.error("Planner returned no valid configs — aborting Stage 1")
-            return {}, ""
+        best_fitness = 0.0
+        best_flags = current_best
+        search_history: list = []
 
-        # 3. Insert configs into MongoDB
-        inserted = 0
-        for priority, config_info in enumerate(reversed(ordered)):
+        for iteration in range(n_iterations):
+            flags = current_best if iteration == 0 else None
+
+            if iteration > 0:
+                # Gather best metrics from DB for the agent to reason about
+                top = await self._db.get_top_configs(session_id, n=1)
+                best_metrics = top[0].get("metrics", {}) if top else {}
+
+                flags, rationale = await planner.propose_next(
+                    model_id=self.cfg.model_id,
+                    gpu_type=self.cfg.gpu_type,
+                    n_gpus=n_gpus,
+                    current_best=best_flags,
+                    current_best_metrics=best_metrics,
+                    history=search_history,
+                    iteration=iteration,
+                )
+                log.info("Iteration %d — agent proposal: %s", iteration, rationale[:120])
+            else:
+                log.info("Iteration 0 — baseline: bare minimum vLLM flags")
+                rationale = "Baseline: vLLM defaults, no extra flags"
+
+            from dataclasses import asdict
             config_id = await self._db.insert_config(
                 session_id=session_id,
-                fingerprint=config_info["fingerprint"],
-                flags=config_info["flags"],
-                priority=priority,
+                fingerprint=flags.fingerprint(),
+                flags={k: v for k, v in asdict(flags).items() if k != "run_id"},
+                generation=iteration,
+                priority=iteration,
             )
-            if config_id:
-                inserted += 1
-        log.info("Inserted %d configs into MongoDB", inserted)
+            if config_id is None:
+                log.info("Iteration %d — config already seen, skipping", iteration)
+                continue
 
-        # 4. Run configs in-process (no node server required)
-        await self._run_local(
-            session_id=session_id,
-            total_configs=inserted,
-            context_configs=list(self.cfg.context_configs),
-        )
-        log.info("Local execution finished all configs")
+            await self._run_single(
+                session_id=session_id,
+                config_id=config_id,
+                context_configs=context_configs,
+            )
 
-        # 5. Analyst: pick winner + explain
-        analyst = AnalystAgent(do_client=self._do_client, db=self._db)
-        analysis = await analyst.analyse(
-            session_id=session_id,
-            model_id=self.cfg.model_id,
-            gpu_type=self.cfg.gpu_type,
-        )
+            # Read result back from DB
+            config_doc = await self._db.get_config_by_id(config_id)
+            fitness = config_doc.get("fitness_score", 0.0) if config_doc else 0.0
+            log.info("Iteration %d — fitness=%.4f", iteration, fitness)
 
-        log.info(
-            "Stage 1 winner: fingerprint=%s fitness=%.4f",
-            analysis.winner_fingerprint[:8], analysis.winner_fitness,
-        )
-        return analysis.winner_flags, analysis.winner_fingerprint
+            # Record in history for agent context
+            top_runs = await self._db.get_top_configs(session_id, n=1)
+            search_history.append({
+                "iteration": iteration,
+                "flags": {k: v for k, v in asdict(flags).items() if k != "run_id"},
+                "fitness": fitness,
+                "metrics": top_runs[0].get("metrics", {}) if top_runs else {},
+                "rationale": rationale,
+            })
+
+            if fitness > best_fitness:
+                best_fitness = fitness
+                best_flags = flags
+
+        if best_fitness == 0.0:
+            log.warning("Stage 1: no successful benchmark runs")
+            return {}, ""
+
+        from dataclasses import asdict as _asdict
+        log.info("Stage 1 complete: best_fitness=%.4f fingerprint=%s",
+                 best_fitness, best_flags.fingerprint()[:8])
+        return {k: v for k, v in _asdict(best_flags).items() if k != "run_id"}, best_flags.fingerprint()
 
     # ------------------------------------------------------------------
-    # Local in-process execution (single-droplet, no node server)
+    # Single config execution
+    # ------------------------------------------------------------------
+
+    async def _run_single(
+        self,
+        session_id: str,
+        config_id: str,
+        context_configs: list,
+    ) -> None:
+        """Run one config doc in-process. Used by the iterative _stage1 loop."""
+        config_doc = await self._db.get_config_by_id(config_id)
+        if config_doc is None:
+            log.error("Config %s not found in DB", config_id)
+            return
+
+        node_cfg = self.cfg.nodes[0]
+        gpu_alloc = GPUSlotAllocator(
+            gpu_indices=node_cfg.gpu_indices,
+            gpu_type=node_cfg.gpu_type,
+        )
+        port_alloc = PortAllocator(
+            start=self.cfg.coordinator.port_pool_start,
+            end=self.cfg.coordinator.port_pool_end,
+        )
+        executor = ExecutorAgent(
+            do_client=self._do_client,
+            db=self._db,
+            gpu_alloc=gpu_alloc,
+            port_alloc=port_alloc,
+            gpu_type=self.cfg.gpu_type,
+            model_id=self.cfg.model_id,
+            concurrency_levels=self.cfg.benchmark.concurrency_levels,
+            num_prompts=self.cfg.benchmark.num_prompts,
+            startup_timeout_sec=self.cfg.vllm.startup_timeout_sec,
+            primary_metric=self.cfg.optimiser.primary_metric,
+            docker_image=self.cfg.vllm.docker_image,
+        )
+        await executor.run(
+            session_id=session_id,
+            config_doc=config_doc,
+            context_configs=context_configs,
+        )
+
+    # ------------------------------------------------------------------
+    # Legacy batch execution (kept for multi-node coordinator path)
     # ------------------------------------------------------------------
 
     async def _run_local(

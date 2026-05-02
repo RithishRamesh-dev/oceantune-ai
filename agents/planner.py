@@ -28,9 +28,11 @@ Usage
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from dataclasses import asdict
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 from pathlib import Path
@@ -68,6 +70,50 @@ Output format (strict JSON):
 ]
 
 Do not include any text outside the JSON array.
+"""
+
+_PROPOSE_SYSTEM_PROMPT = """\
+You are an expert vLLM performance engineer doing iterative hyperparameter optimization.
+Your goal: maximize throughput (tokens/second) on a single-GPU vLLM server.
+
+You will receive:
+- The model and GPU details
+- The current best configuration and its benchmark metrics
+- History of all configurations tried so far and their results
+
+Your task:
+1. Diagnose the bottleneck from the metrics (compute-bound, memory-bound, or scheduling-bound)
+2. Propose the single most impactful configuration change to try next
+3. Return a JSON object with the full new configuration and a rationale
+
+Output format (strict JSON):
+{
+  "flags": {<complete VLLMFlags — all fields must be present>},
+  "rationale": "<2-3 sentences: what you changed, why, what bottleneck you're targeting>"
+}
+
+Hard constraints (never violate these):
+- tensor_parallel_size: always 1 (single GPU)
+- pipeline_parallel_size: always 1
+- data_parallel_size: always 1
+- distributed_executor_backend: always "mp" (Ray is not installed)
+- cpu_offload_gb: always 0 (GPU has enough VRAM)
+- speculative_model: always null (not applicable here)
+- num_speculative_tokens: always null
+
+Tunable single-GPU parameters (choose ONE to change from current best):
+- gpu_memory_utilization: [0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+- block_size: [8, 16, 32] — use 16 for most models
+- kv_cache_dtype: ["auto", "fp8"] — fp8 reduces KV memory on H100/H200
+- enable_prefix_caching: [true, false]
+- max_num_seqs: [32, 64, 128, 256, 512]
+- max_num_batched_tokens: [2048, 4096, 8192, 16384, 32768, 65536]
+- dtype: ["auto", "bfloat16", "float16"]
+- max_model_len: [4096, 8192, 16384, 32768]
+- enforce_eager: [true, false]
+- enable_chunked_prefill: [true, false]
+
+Do not include any text outside the JSON object.
 """
 
 
@@ -235,6 +281,116 @@ class PlannerAgent:
                 }
                 for c in candidates
             ]
+
+    # ------------------------------------------------------------------
+    # Iterative proposal (agent-driven search)
+    # ------------------------------------------------------------------
+
+    # Fallback variations tried in order when the LLM is unavailable.
+    # Each entry is a dict of field overrides applied to the current best.
+    _FALLBACK_VARIATIONS: List[Dict[str, Any]] = [
+        {"gpu_memory_utilization": 0.95},
+        {"enable_prefix_caching": True},
+        {"max_num_batched_tokens": 16384},
+        {"kv_cache_dtype": "fp8"},
+        {"enable_chunked_prefill": True},
+        {"max_num_seqs": 512},
+        {"block_size": 32},
+        {"dtype": "bfloat16"},
+        {"max_num_batched_tokens": 32768},
+        {"gpu_memory_utilization": 0.85},
+    ]
+
+    async def propose_next(
+        self,
+        *,
+        model_id: str,
+        gpu_type: str,
+        n_gpus: int,
+        current_best: VLLMFlags,
+        current_best_metrics: Dict[str, Any],
+        history: List[Dict[str, Any]],
+        iteration: int = 0,
+    ) -> Tuple[VLLMFlags, str]:
+        """
+        Ask the LLM to propose the next configuration to benchmark.
+
+        Returns (VLLMFlags, rationale_string).
+        Falls back to a curated list of single-parameter variations when
+        the LLM is unavailable.
+        """
+        gpu_profile = self._gpu_profiles.get("gpu_profiles", {}).get(gpu_type, {})
+        current_dict = asdict(current_best)
+
+        # Build history summary (limit to last 5 to stay within token budget)
+        recent_history = history[-5:] if len(history) > 5 else history
+        history_summary = [
+            {
+                "iteration": i,
+                "changed_from_baseline": {
+                    k: v for k, v in h.get("flags", {}).items()
+                    if v != h.get("flags", {}).get(k)
+                },
+                "fitness": h.get("fitness"),
+                "throughput_tok_s": h.get("metrics", {}).get("throughput_tok_s"),
+                "p95_latency_ms": h.get("metrics", {}).get("p95_latency_ms"),
+            }
+            for i, h in enumerate(recent_history)
+        ]
+
+        user_msg = (
+            f"Model: {model_id}\n"
+            f"GPU: {gpu_type} ({gpu_profile.get('vram_gb', '?')}GB VRAM)\n"
+            f"Available GPUs: {n_gpus}\n\n"
+            f"Current best configuration:\n{json.dumps(current_dict, indent=2)}\n\n"
+            f"Current best metrics:\n{json.dumps(current_best_metrics, indent=2)}\n\n"
+            f"History (last {len(recent_history)} iterations):\n"
+            f"{json.dumps(history_summary, indent=2)}\n\n"
+            f"Propose the next configuration to try."
+        )
+
+        try:
+            result = await self._client.chat_json(
+                messages=[{"role": "user", "content": user_msg}],
+                system=_PROPOSE_SYSTEM_PROMPT,
+            )
+            if not isinstance(result, dict) or "flags" not in result:
+                raise DOClientError("Invalid response format")
+
+            # Build VLLMFlags from LLM response, enforce single-GPU constraints
+            flags_dict = result["flags"]
+            flags_dict.update({
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "data_parallel_size": 1,
+                "distributed_executor_backend": "mp",
+                "cpu_offload_gb": 0,
+                "speculative_model": None,
+                "num_speculative_tokens": None,
+            })
+            # Build VLLMFlags, ignoring any unknown keys
+            known_fields = set(VLLMFlags.__dataclass_fields__.keys())
+            safe_dict = {k: v for k, v in flags_dict.items() if k in known_fields}
+            proposed = copy.deepcopy(current_best)
+            for k, v in safe_dict.items():
+                setattr(proposed, k, v)
+            proposed.run_id = proposed.fingerprint()
+
+            rationale = result.get("rationale", "LLM proposal")
+            log.info("LLM proposed config: %s", rationale[:100])
+            return proposed, rationale
+
+        except DOClientError as exc:
+            log.warning("LLM proposal failed (%s); using fallback variation", exc)
+            # Cycle through fallback variations
+            idx = iteration % len(self._FALLBACK_VARIATIONS)
+            overrides = self._FALLBACK_VARIATIONS[idx]
+            proposed = copy.deepcopy(current_best)
+            for k, v in overrides.items():
+                setattr(proposed, k, v)
+            proposed.run_id = proposed.fingerprint()
+            rationale = f"Fallback variation {idx+1}: {overrides}"
+            return proposed, rationale
 
     # ------------------------------------------------------------------
     # Helpers

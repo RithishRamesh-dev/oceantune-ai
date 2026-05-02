@@ -245,6 +245,11 @@ class Database:
             return_document=True,
         )
 
+    async def get_config_by_id(self, config_id: str) -> Optional[Dict]:
+        """Return a config document by its string ID, or None if not found."""
+        from bson import ObjectId
+        return await self.db["configs"].find_one({"_id": ObjectId(config_id)})
+
     async def mark_config_done(self, config_id: str, fitness_score: float) -> None:
         from bson import ObjectId
         await self.db["configs"].update_one(
