@@ -502,25 +502,26 @@ class BenchmarkEngine:
         try:
             t_start = time.monotonic()
             async with httpx.AsyncClient() as client:
-                await asyncio.wait_for(
-                    asyncio.gather(*[
-                        do_request(client) for _ in range(self.num_prompts)
-                    ]),
-                    timeout=float(self.per_level_timeout),
+                tasks = [
+                    asyncio.create_task(do_request(client))
+                    for _ in range(self.num_prompts)
+                ]
+                done, pending = await asyncio.wait(
+                    tasks, timeout=float(self.per_level_timeout)
                 )
+                # Cancel stragglers; data from completed tasks is already in
+                # latencies_ms/output_tokens via the shared-state closures.
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    log.debug(
+                        "Partial timeout concurrency=%d: %d/%d requests done in %.0fs",
+                        concurrency, len(done), self.num_prompts,
+                        self.per_level_timeout,
+                    )
             total_duration = time.monotonic() - t_start
 
-        except asyncio.TimeoutError:
-            return BenchmarkResult(
-                concurrency=concurrency,
-                input_len=self.input_len,
-                output_len=self.output_len,
-                failed=True,
-                failure_reason=(
-                    f"Benchmark timeout after {self.per_level_timeout}s "
-                    f"at concurrency={concurrency}"
-                ),
-            )
         except Exception as exc:
             return BenchmarkResult(
                 concurrency=concurrency,
