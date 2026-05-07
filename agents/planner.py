@@ -78,15 +78,20 @@ Your goal: maximize throughput (tokens/second) on a single-GPU vLLM server.
 
 You will receive:
 - The model and GPU details
-- The current best configuration and its benchmark metrics
+- The current best configuration and its benchmark metrics (including the full concurrency curve)
 - History of all configurations tried so far and their results (including any server errors)
+- The analyst's evaluation of the most recent run: bottleneck diagnosis + recommendation
 
 Your task:
-1. Diagnose the bottleneck from the metrics (compute-bound, memory-bound, or scheduling-bound)
-2. If any prior iteration has an "error" field, read it carefully — it contains the vLLM startup
-   error and log tail. You MUST NOT propose a configuration that would trigger the same error.
-3. Propose the single most impactful configuration change to try next
-4. Return a JSON object with the full new configuration and a rationale
+1. Read the analyst's evaluation first — it contains a bottleneck diagnosis and a specific
+   recommendation. Use it as your primary signal for what to change.
+2. Cross-check with the concurrency curve: if throughput is still scaling at the highest
+   concurrency tested, the model is NOT saturated and increasing max_num_seqs or
+   max_num_batched_tokens may help. If it plateaus, the GPU is compute-bound.
+3. If any prior iteration has an "error" field, read it carefully — you MUST NOT propose
+   a configuration that would trigger the same error.
+4. Propose the single most impactful configuration change to try next.
+5. Return a JSON object with the full new configuration and a rationale.
 
 Output format (strict JSON):
 {
@@ -318,9 +323,17 @@ class PlannerAgent:
         current_best_metrics: Dict[str, Any],
         history: List[Dict[str, Any]],
         iteration: int = 0,
+        analyst_eval: Optional[Dict[str, Any]] = None,
     ) -> Tuple[VLLMFlags, str]:
         """
         Ask the LLM to propose the next configuration to benchmark.
+
+        Parameters
+        ----------
+        analyst_eval : optional dict from AnalystAgent.evaluate_iteration()
+            Contains: bottleneck, diagnosis, flag_insights, recommendation.
+            When provided, the LLM uses this as the primary signal for what
+            to change next.
 
         Returns (VLLMFlags, rationale_string).
         Falls back to a curated list of single-parameter variations when
@@ -337,20 +350,40 @@ class PlannerAgent:
                 "iteration": h.get("iteration", i),
                 "flags": h.get("flags", {}),
                 "fitness": h.get("fitness"),
-                "throughput_tok_s": h.get("metrics", {}).get("throughput_tok_s"),
-                "p95_latency_ms": h.get("metrics", {}).get("p95_latency_ms"),
+                # use canonical enriched_metrics field names
+                "peak_tok_s": h.get("enriched_metrics", {}).get(
+                    "peak_throughput_tokens_per_sec"
+                ),
+                "p95_latency_ms": h.get("enriched_metrics", {}).get(
+                    "p95_latency_at_peak_ms"
+                ),
+                "best_concurrency": h.get("enriched_metrics", {}).get(
+                    "best_concurrency"
+                ),
+                "analyst_recommendation": h.get("analyst_recommendation", ""),
             }
             if h.get("error"):
-                # Truncate to first 500 chars to stay within token budget
                 entry["error"] = h["error"][:500]
             history_summary.append(entry)
+
+        # Analyst evaluation of the most recent run
+        eval_section = ""
+        if analyst_eval:
+            eval_section = (
+                f"\nAnalyst evaluation of most recent run:\n"
+                f"  Bottleneck: {analyst_eval.get('bottleneck', '?')}\n"
+                f"  Diagnosis:  {analyst_eval.get('diagnosis', '')}\n"
+                f"  Flag insights: {analyst_eval.get('flag_insights', '')}\n"
+                f"  Recommendation: {analyst_eval.get('recommendation', '')}\n"
+            )
 
         user_msg = (
             f"Model: {model_id}\n"
             f"GPU: {gpu_type} ({gpu_profile.get('vram_gb', '?')}GB VRAM)\n"
             f"Available GPUs: {n_gpus}\n\n"
             f"Current best configuration:\n{json.dumps(current_dict, indent=2)}\n\n"
-            f"Current best metrics:\n{json.dumps(current_best_metrics, indent=2)}\n\n"
+            f"Current best metrics:\n{json.dumps(current_best_metrics, indent=2)}\n"
+            f"{eval_section}\n"
             f"History (last {len(recent_history)} iterations):\n"
             f"{json.dumps(history_summary, indent=2)}\n\n"
             f"Propose the next configuration to try."

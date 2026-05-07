@@ -356,6 +356,17 @@ class Database:
         runs = await self.get_top_configs(session_id, n=1)
         return runs[0] if runs else None
 
+    async def get_best_run_for_config(self, config_id: str) -> Optional[Dict]:
+        """Return the highest-fitness benchmark run for a specific config_id."""
+        cursor = (
+            self.db["benchmark_runs"]
+            .find({"config_id": config_id, "error": None})
+            .sort("fitness_score", DESCENDING)
+            .limit(1)
+        )
+        docs = await cursor.to_list(length=1)
+        return docs[0] if docs else None
+
     async def list_benchmark_runs(
         self,
         session_id: str,

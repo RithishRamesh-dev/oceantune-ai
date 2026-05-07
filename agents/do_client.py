@@ -46,6 +46,20 @@ class DOClientError(Exception):
     """Raised when the DO Inference API returns an error after all retries."""
 
 
+def _strip_json_fences(text: str) -> str:
+    """
+    Strip markdown code fences that some models wrap JSON in.
+    e.g.  ```json\\n{...}\\n```  →  {... }
+    Also strips leading/trailing whitespace.
+    """
+    import re
+    text = text.strip()
+    # Remove ```json ... ``` or ``` ... ```
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
 class DOClient:
     """
     Async HTTP client for DigitalOcean Serverless Inference (OpenAI-compatible).
@@ -269,6 +283,8 @@ class DOClient:
         """
         Like ``chat()`` but sets json_mode=True and parses the response.
         Returns a Python object (dict or list).
+
+        Handles models that wrap JSON in markdown fences (e.g. ```json ... ```).
         """
         text = await self.chat(
             messages,
@@ -276,10 +292,11 @@ class DOClient:
             json_mode=True,
             extra_kwargs=extra_kwargs,
         )
+        cleaned = _strip_json_fences(text)
         try:
-            return json.loads(text)
+            return json.loads(cleaned)
         except json.JSONDecodeError as exc:
-            raise DOClientError(f"Response was not valid JSON: {text[:500]}") from exc
+            raise DOClientError(f"Response was not valid JSON: {cleaned[:500]}") from exc
 
     # ------------------------------------------------------------------
     # Context manager support

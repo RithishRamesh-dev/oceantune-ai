@@ -165,6 +165,7 @@ class ControllerAgent:
             db=self._db,
             search_space=self._search_space,
         )
+        analyst = AnalystAgent(do_client=self._do_client, db=self._db)
 
         # Iteration 0: bare minimum — let vLLM choose all defaults
         current_best = VLLMFlags(
@@ -179,14 +180,16 @@ class ControllerAgent:
         best_fitness = 0.0
         best_flags = current_best
         search_history: list = []
+        last_analyst_eval: dict = {}
 
         for iteration in range(n_iterations):
             flags = current_best if iteration == 0 else None
 
             if iteration > 0:
-                # Gather best metrics from DB for the agent to reason about
+                # Best run so far — pull enriched_metrics (correct key)
                 top = await self._db.get_top_configs(session_id, n=1)
-                best_metrics = top[0].get("metrics", {}) if top else {}
+                best_run = top[0] if top else {}
+                best_metrics = best_run.get("enriched_metrics") or best_run.get("raw_metrics") or {}
 
                 flags, rationale = await planner.propose_next(
                     model_id=self.cfg.model_id,
@@ -196,6 +199,7 @@ class ControllerAgent:
                     current_best_metrics=best_metrics,
                     history=search_history,
                     iteration=iteration,
+                    analyst_eval=last_analyst_eval,
                 )
                 log.info("Iteration %d — agent proposal: %s", iteration, rationale[:120])
             else:
@@ -228,14 +232,35 @@ class ControllerAgent:
             if error_text:
                 log.warning("Iteration %d — server error: %s", iteration, error_text[:200])
 
-            # Record in history for agent context (include error so planner can avoid repeats)
-            top_runs = await self._db.get_top_configs(session_id, n=1)
+            # Analyst evaluates this iteration — feeds into next proposal
+            best_run_for_iter = await self._db.get_best_run_for_config(config_id)
+            if best_run_for_iter and not error_text:
+                last_analyst_eval = await analyst.evaluate_iteration(
+                    iteration=iteration,
+                    flags={k: v for k, v in asdict(flags).items() if k != "run_id"},
+                    benchmark_run=best_run_for_iter,
+                    history=search_history,
+                    model_id=self.cfg.model_id,
+                    gpu_type=self.cfg.gpu_type,
+                )
+                log.info(
+                    "Iteration %d — analyst: bottleneck=%s rec=%s",
+                    iteration,
+                    last_analyst_eval.get("bottleneck", "?"),
+                    last_analyst_eval.get("recommendation", "")[:80],
+                )
+            else:
+                last_analyst_eval = {}
+
+            # Record in history — use enriched_metrics with canonical field names
+            em = (best_run_for_iter or {}).get("enriched_metrics") or {}
             history_entry: dict = {
                 "iteration": iteration,
                 "flags": {k: v for k, v in asdict(flags).items() if k != "run_id"},
                 "fitness": fitness,
-                "metrics": top_runs[0].get("metrics", {}) if top_runs else {},
+                "enriched_metrics": em,
                 "rationale": rationale,
+                "analyst_recommendation": last_analyst_eval.get("recommendation", ""),
             }
             if error_text:
                 history_entry["error"] = error_text

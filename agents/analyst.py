@@ -31,11 +31,33 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from agents.do_client import DOClient, DOClientError
+from agents.do_client import DOClient, DOClientError, _strip_json_fences
 from core.db import Database
 
 log = logging.getLogger("agents.analyst")
 
+
+_ITERATION_EVAL_PROMPT = """\
+You are an expert vLLM performance engineer evaluating a single benchmark run.
+You will receive the vLLM flags used, the benchmark metrics across all concurrency
+levels, and the history of prior iterations.
+
+Your task:
+1. Diagnose what bottleneck this config hit (compute-bound, memory-bound, or
+   scheduling-bound) based on how throughput scales with concurrency.
+2. Identify which specific flags are helping vs. hurting.
+3. Give ONE concrete recommendation for what to change next and why.
+
+Respond with a JSON object:
+{
+  "bottleneck": "compute|memory|scheduling|unknown",
+  "diagnosis": "<2-3 sentences: what the concurrency curve shows>",
+  "flag_insights": "<1-2 sentences: which flags mattered and why>",
+  "recommendation": "<one specific parameter change to try next and the expected effect>"
+}
+
+Do not include any text outside the JSON object.
+"""
 
 _ANALYSIS_SYSTEM_PROMPT = """\
 You are an expert vLLM performance analyst.
@@ -222,11 +244,97 @@ class AnalystAgent:
                 json_mode=True,
             )
             import json as _json
-            parsed = _json.loads(raw_text)
+            parsed = _json.loads(_strip_json_fences(raw_text))
             parsed["_raw"] = raw_text
             return parsed
         except (DOClientError, Exception) as exc:
             log.warning("Analyst LLM call failed: %s", exc)
+            return {}
+
+    # ------------------------------------------------------------------
+    # Per-iteration lightweight evaluation (called after every benchmark)
+    # ------------------------------------------------------------------
+
+    async def evaluate_iteration(
+        self,
+        *,
+        iteration: int,
+        flags: Dict[str, Any],
+        benchmark_run: Dict[str, Any],
+        history: List[Dict[str, Any]],
+        model_id: str,
+        gpu_type: str,
+    ) -> Dict[str, Any]:
+        """
+        Lightweight evaluation of a single benchmark run.
+
+        Called by the controller after every iteration so the planner can
+        use the analyst's diagnosis when proposing the next config.
+
+        Returns a dict with keys:
+            bottleneck, diagnosis, flag_insights, recommendation
+        Falls back to an empty dict on LLM failure (non-fatal).
+        """
+        em = benchmark_run.get("enriched_metrics") or benchmark_run.get("raw_metrics") or {}
+        levels = benchmark_run.get("levels", [])
+
+        # Compact concurrency curve: concurrency → tok/s
+        curve = [
+            {
+                "concurrency": lv.get("concurrency"),
+                "tok_per_sec": lv.get("output_tokens_per_sec"),
+                "p95_latency_ms": lv.get("p95_latency_ms"),
+                "failed": lv.get("failed", False),
+            }
+            for lv in levels
+            if not lv.get("failed", False)
+        ]
+
+        # Summary of prior iterations (compact)
+        prior = [
+            {
+                "iteration": h.get("iteration"),
+                "fitness": h.get("fitness"),
+                "peak_tok_s": h.get("enriched_metrics", {}).get(
+                    "peak_throughput_tokens_per_sec"
+                ),
+                "recommendation_taken": h.get("analyst_recommendation", ""),
+            }
+            for h in history[-4:]
+        ]
+
+        user_msg = (
+            f"Model: {model_id}  GPU: {gpu_type}  Iteration: {iteration}\n\n"
+            f"Flags used:\n{json.dumps(flags, indent=2)}\n\n"
+            f"Concurrency curve (throughput vs concurrency):\n"
+            f"{json.dumps(curve, indent=2)}\n\n"
+            f"Summary metrics:\n"
+            f"  peak_tok/s:   {em.get('peak_throughput_tokens_per_sec', '?')}\n"
+            f"  p95_lat_ms:   {em.get('p95_latency_at_peak_ms', '?')}\n"
+            f"  best_concurrency: {em.get('best_concurrency', '?')}\n"
+            f"  valid_levels: {em.get('valid_levels', '?')}\n"
+            f"  fitness:      {benchmark_run.get('fitness_score', '?')}\n\n"
+            f"Prior iterations:\n{json.dumps(prior, indent=2)}\n\n"
+            "Evaluate this run and recommend what to try next."
+        )
+
+        try:
+            raw_text = await self._client.chat(
+                messages=[{"role": "user", "content": user_msg}],
+                system=_ITERATION_EVAL_PROMPT,
+                json_mode=True,
+            )
+            import json as _json
+            result = _json.loads(_strip_json_fences(raw_text))
+            log.info(
+                "Iteration %d eval — bottleneck=%s recommendation=%s",
+                iteration,
+                result.get("bottleneck", "?"),
+                result.get("recommendation", "")[:80],
+            )
+            return result
+        except (DOClientError, Exception) as exc:
+            log.warning("Iteration eval LLM call failed: %s", exc)
             return {}
 
     # ------------------------------------------------------------------
