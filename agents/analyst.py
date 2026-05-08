@@ -82,6 +82,16 @@ Respond with a JSON object:
   "convergence_note": "<1 sentence about convergence>",
   "recommendation": "<one actionable next step>"
 }
+
+IMPORTANT: key_flags MUST only contain actual vLLM flag names from this list:
+gpu_memory_utilization, block_size, kv_cache_dtype, enable_prefix_caching,
+max_num_seqs, max_num_batched_tokens, dtype, max_model_len, enforce_eager,
+enable_chunked_prefill, tensor_parallel_size, pipeline_parallel_size,
+data_parallel_size, distributed_executor_backend, cpu_offload_gb,
+speculative_model, num_speculative_tokens, quantization, load_format,
+scheduler_delay_factor, enable_expert_parallel, trust_remote_code.
+Do NOT include metric names, fingerprints, concurrency values, or any other
+non-flag string in key_flags.
 """
 
 
@@ -166,6 +176,17 @@ class AnalystAgent:
             gpu_type=gpu_type,
         )
 
+        # Filter key_flags to only include actual VLLMFlags field names
+        from core.search_space import VLLMFlags
+        _valid_flag_names = set(VLLMFlags.__dataclass_fields__.keys())
+        raw_key_flags = llm_result.get("key_flags", [])
+        key_flags = [f for f in raw_key_flags if f in _valid_flag_names]
+        if len(key_flags) < len(raw_key_flags):
+            log.debug(
+                "Analyst: filtered key_flags from %s → %s (removed non-flag values)",
+                raw_key_flags, key_flags,
+            )
+
         log.info(
             "Analyst: winner fingerprint=%s fitness=%.4f",
             winner_fingerprint[:8], winner_fitness,
@@ -176,7 +197,7 @@ class AnalystAgent:
             winner_flags=winner_flags,
             winner_fingerprint=winner_fingerprint,
             winner_fitness=winner_fitness,
-            key_flags=llm_result.get("key_flags", []),
+            key_flags=key_flags,
             explanation=llm_result.get("explanation", ""),
             oom_insight=llm_result.get("oom_insight"),
             convergence_note=llm_result.get("convergence_note", ""),

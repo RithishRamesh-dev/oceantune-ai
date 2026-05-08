@@ -377,13 +377,28 @@ class PlannerAgent:
                 f"  Recommendation: {analyst_eval.get('recommendation', '')}\n"
             )
 
+        # Detect fitness plateau: if last 3 iterations have fitness within 0.5%
+        # of each other, signal the LLM to try a more aggressive change
+        plateau_note = ""
+        if len(history) >= 3:
+            recent_fitness = [h.get("fitness", 0.0) for h in history[-3:] if h.get("fitness", 0.0) > 0]
+            if recent_fitness and (max(recent_fitness) - min(recent_fitness)) < 0.005:
+                plateau_note = (
+                    "\n⚠️  PLATEAU DETECTED: The last 3 iterations have nearly identical "
+                    "fitness scores (within 0.5%). The current approach is not improving. "
+                    "You MUST try a significantly different configuration — change a parameter "
+                    "you have NOT yet changed, or try a combination of two parameters. "
+                    "Do NOT propose a config similar to any in the history.\n"
+                )
+
         user_msg = (
             f"Model: {model_id}\n"
             f"GPU: {gpu_type} ({gpu_profile.get('vram_gb', '?')}GB VRAM)\n"
             f"Available GPUs: {n_gpus}\n\n"
             f"Current best configuration:\n{json.dumps(current_dict, indent=2)}\n\n"
             f"Current best metrics:\n{json.dumps(current_best_metrics, indent=2)}\n"
-            f"{eval_section}\n"
+            f"{eval_section}"
+            f"{plateau_note}\n"
             f"History (last {len(recent_history)} iterations):\n"
             f"{json.dumps(history_summary, indent=2)}\n\n"
             f"Propose the next configuration to try."

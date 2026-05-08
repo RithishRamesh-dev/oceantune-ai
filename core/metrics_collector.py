@@ -69,11 +69,13 @@ log = get_logger("core.metrics_collector")
 # Throughput baseline: 100 output tokens/sec is achievable on a single GPU
 _THROUGHPUT_BASELINE = 100.0       # tok/s
 
-# Latency baseline: 2000ms p95 E2E is the "barely acceptable" ceiling
-_LATENCY_BASELINE_MS = 2000.0      # ms
+# Latency baseline: reflects realistic high-concurrency LLM serving on H100/H200.
+# At concurrency 64+, p95 E2E latencies of 5-15s are normal.
+# Setting this to 30000ms so the score differentiates within the 1000-30000ms range.
+_LATENCY_BASELINE_MS = 30000.0     # ms  (was 2000 — caused latency score to always be 0)
 
-# TTFT baseline: 500ms mean TTFT
-_TTFT_BASELINE_MS = 500.0          # ms
+# TTFT baseline: at high concurrency, TTFT of 5-10s is common for large batches.
+_TTFT_BASELINE_MS = 10000.0        # ms  (was 500 — caused TTFT score to always be 0)
 
 # TPOT baseline: 50ms per output token
 _TPOT_BASELINE_MS = 50.0           # ms

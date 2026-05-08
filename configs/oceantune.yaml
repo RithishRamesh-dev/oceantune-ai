@@ -145,7 +145,7 @@ benchmark:
 optimiser:
   strategy: "evolutionary"      # config-compat label; v4 uses LLM-guided search
   population_size: 10           # candidates sampled per generation
-  generations: 5                # number of search rounds
+  generations: 10               # number of search rounds
   mutation_rate: 0.2            # used by search_space crossover helpers
   elite_fraction: 0.2           # used by search_space crossover helpers
   # Primary metric drives fitness scoring in MetricsCollector and Analyst ranking
