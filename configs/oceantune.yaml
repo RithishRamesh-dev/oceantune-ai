@@ -151,6 +151,22 @@ optimiser:
   # Primary metric drives fitness scoring in MetricsCollector and Analyst ranking
   primary_metric: "throughput"  # throughput | p95_latency | ttft | tpot
 
+# ── Stage 4 — Autonomous Kernel Engineering ──────────────────────────────────
+# Stage 4 runs after Stage 3 profiling. It autonomously:
+#   1. Generates Triton kernels targeting the identified bottleneck
+#   2. Validates correctness against PyTorch reference (CorrectnessFirewall)
+#   3. Benchmarks speedup via isolated microbenchmark
+#   4. Keeps kernels that pass correctness + show >1% speedup (keep/revert loop)
+#
+# Prerequisites:
+#   - PyTorch + Triton must be installed in the OceanTune Python environment
+#     (not required for Stage 1-3 which only need Docker for vLLM)
+#   - For ncu hardware counters: NVIDIA Nsight Compute must be in PATH
+#   - For rocprof/omniperf counters: ROCm tools must be in PATH
+#
+stage4_enabled: false        # set to true to enable kernel generation
+stage4_iterations: 3         # number of evolution rounds (generate→validate→keep/revert)
+
 # ── Context-Length Evaluation Matrix ─────────────────────────────────────────
 # Each [input_tokens, output_tokens] pair → separate optimisation recipe.
 context_configs:

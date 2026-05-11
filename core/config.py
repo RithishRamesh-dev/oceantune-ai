@@ -185,6 +185,10 @@ class OceanTuneConfig:
         (8192, 32768),
     ])
 
+    # Stage 4 — Autonomous Kernel Engineering
+    stage4_enabled: bool = False
+    stage4_iterations: int = 3
+
 
 # ---------------------------------------------------------------------------
 # Loader
@@ -338,6 +342,11 @@ def load_config(override_path: Optional[Path] = None) -> OceanTuneConfig:
 
     if "context_configs" in raw:
         cfg.context_configs = [tuple(pair) for pair in raw["context_configs"]]
+
+    if "stage4_enabled" in raw:
+        cfg.stage4_enabled = bool(raw["stage4_enabled"])
+    if "stage4_iterations" in raw:
+        cfg.stage4_iterations = int(raw["stage4_iterations"])
 
     # Env vars always win
     _apply_env_overrides(cfg)

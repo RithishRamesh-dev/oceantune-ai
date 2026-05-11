@@ -1,7 +1,7 @@
 """
 agents/controller_agent.py
 --------------------------
-Controller Agent — v4 top-level orchestrator.
+Controller Agent — v5 top-level orchestrator.
 
 Wires together the full OceanTune AI pipeline:
   Stage 1 — vLLM Config Search
@@ -13,10 +13,19 @@ Wires together the full OceanTune AI pipeline:
     4. StrategyOptimizerAgent : KV cache, speculative decoding, attention backend,
                                 prefill strategies, vendor-specific kernels
 
-  Stage 3 — Profiling + Research
+  Stage 3 — Deep Profiling + Bottleneck Reasoning
     5. ProfilerAgent        : Torch profiler trace at optimal concurrency
-    6. ResearchAgent        : kernel timing analysis + ranked optimization recommendations
-    7. ReportGenerator      : YAML recipe + shell script + Markdown report
+    6. NcuProfiler / RocprofProfiler : Hardware counters (Tensor Core util, DRAM BW,
+                                        occupancy, warp stall reasons)
+    7. BottleneckReasoningAgent : Multi-source bottleneck classification
+    8. ResearchAgent        : ranked optimization recommendations
+
+  Stage 4 — Autonomous Kernel Engineering
+    9. KernelResearchAgent  : Research best kernel implementations for the bottleneck
+   10. KernelGenerationAgent: Generate Triton/CUDA kernels
+   11. CorrectnessFirewallAgent: Validate kernels against PyTorch reference
+   12. KernelEvolutionAgent : keep/revert loop with experiment tree tracking
+   13. ReportGenerator      : YAML recipe + shell script + Markdown report
 
 Entry point:
     from agents.controller_agent import ControllerAgent
@@ -128,16 +137,37 @@ class ControllerAgent:
             else:
                 log.warning("Stage 1 produced no winner — skipping Stage 2 and Stage 3")
 
-            # ── Stage 3: Profiling + Research ─────────────────────────────
+            # ── Stage 3: Deep Profiling + Bottleneck Reasoning ───────────
             from agents.research_agent import ResearchReport
             research_report: Optional[ResearchReport] = None
+            bottleneck_analysis = None
+            kernel_research = None
+            evolution_result = None
             if winner_flags:
-                research_report = await self._stage3(
+                research_report, bottleneck_analysis, kernel_research = await self._stage3(
                     session_id, winner_flags, winner_metrics
                 )
 
+            # ── Stage 4: Autonomous Kernel Engineering ────────────────────
+            stage4_enabled = getattr(self.cfg, "stage4_enabled", False)
+            if (
+                stage4_enabled
+                and winner_flags
+                and bottleneck_analysis is not None
+                and kernel_research is not None
+            ):
+                evolution_result = await self._stage4(
+                    session_id=session_id,
+                    winner_flags=winner_flags,
+                    bottleneck=bottleneck_analysis,
+                    research=kernel_research,
+                )
+
             # ── Report generation ─────────────────────────────────────────
-            await self._generate_report(session_id, best_strategy, research_report)
+            await self._generate_report(
+                session_id, best_strategy, research_report,
+                evolution_result=evolution_result,
+            )
             await self._db.update_session_status(session_id, "done")
             log.info("Pipeline complete: session=%s", session_id)
 
@@ -464,7 +494,7 @@ class ControllerAgent:
         return best_strategy, winner_metrics
 
     # ------------------------------------------------------------------
-    # Stage 3 — Profiling + Research
+    # Stage 3 — Deep Profiling + Bottleneck Reasoning
     # ------------------------------------------------------------------
 
     async def _stage3(
@@ -474,18 +504,24 @@ class ControllerAgent:
         winner_metrics: dict,
     ):
         """
-        Run Stage 3: Torch profiler trace + Research Agent analysis.
+        Run Stage 3: multi-source profiling + deep bottleneck reasoning.
 
-        Profiles the winner config at its optimal concurrency level, then calls
-        the Research Agent to analyse the kernel timing breakdown and produce
-        ranked optimization recommendations.
+        Pipeline:
+          1. Torch profiler trace (category breakdown: attention/GEMM/MoE/comm)
+          2. Hardware counters (Nsight Compute or rocprof — if tools available)
+          3. BottleneckReasoningAgent (LLM synthesises all signals into a
+             precise bottleneck class + evidence chain)
+          4. ResearchAgent (LLM-ranked optimization recommendations)
+          5. KernelResearchAgent (deep research on best kernel implementations)
 
-        Returns a ResearchReport (or None on error).
+        Returns (research_report, bottleneck_analysis, kernel_research).
         """
-        log.info("=== Stage 3: Profiling + Research ===")
+        log.info("=== Stage 3: Deep Profiling + Bottleneck Reasoning ===")
 
         from agents.profiler_agent import ProfilerAgent
         from agents.research_agent import ResearchAgent
+        from agents.bottleneck_reasoning_agent import BottleneckReasoningAgent
+        from agents.kernel_research_agent import KernelResearchAgent
 
         optimal_concurrency = int(winner_metrics.get("best_concurrency", 64))
         context_configs = list(self.cfg.context_configs)
@@ -502,6 +538,7 @@ class ControllerAgent:
             end=self.cfg.coordinator.port_pool_end,
         )
 
+        # ── 3a. Torch profiler trace ──────────────────────────────────────
         profiler = ProfilerAgent(
             do_client=self._do_client,
             db=self._db,
@@ -521,10 +558,42 @@ class ControllerAgent:
             output_len=output_len,
         )
         log.info(
-            "Stage 3 profile: bottleneck=%s attention=%.1f%% gemm=%.1f%%",
+            "Stage 3a profile: bottleneck=%s attention=%.1f%% gemm=%.1f%%",
             trace.bottleneck_type, trace.attention_pct, trace.gemm_pct,
         )
 
+        # ── 3b. Hardware counters (ncu / rocprof) ─────────────────────────
+        hw_counters = None
+        top_kernel_name = trace.bottleneck_kernel or ""
+        if top_kernel_name:
+            hw_counters = await self._collect_hardware_counters(
+                session_id=session_id,
+                kernel_name=top_kernel_name,
+                input_len=input_len,
+                output_len=output_len,
+                concurrency=optimal_concurrency,
+            )
+            if hw_counters:
+                log.info("Stage 3b hardware counters: %s", hw_counters.summary())
+
+        # ── 3c. Deep bottleneck reasoning ────────────────────────────────
+        bottleneck_reasoner = BottleneckReasoningAgent(do_client=self._do_client)
+        bottleneck_analysis = await bottleneck_reasoner.analyse(
+            trace=trace,
+            hw_counters=hw_counters,
+            winner_flags=winner_flags,
+            model_id=self.cfg.model_id,
+            gpu_type=self.cfg.gpu_type,
+            session_id=session_id,
+        )
+        log.info(
+            "Stage 3c bottleneck: primary=%s component=%s action=%s",
+            bottleneck_analysis.primary_bottleneck,
+            bottleneck_analysis.primary_component,
+            bottleneck_analysis.recommended_action,
+        )
+
+        # ── 3d. Research Agent (vLLM-level recommendations) ───────────────
         researcher = ResearchAgent(do_client=self._do_client)
         research_report = await researcher.analyse(
             trace=trace,
@@ -533,11 +602,133 @@ class ControllerAgent:
             gpu_type=self.cfg.gpu_type,
         )
         log.info(
-            "Stage 3 research: %d recommendations, custom_kernel_warranted=%s",
+            "Stage 3d research: %d recommendations, custom_kernel_warranted=%s",
             len(research_report.recommendations),
             research_report.custom_kernel_warranted,
         )
-        return research_report
+
+        # ── 3e. Kernel Research (deep kernel-level research) ──────────────
+        kernel_research = None
+        if research_report.custom_kernel_warranted or (
+            bottleneck_analysis.recommended_action.startswith("kernel_generation")
+        ):
+            log.info("Stage 3e: running deep kernel research...")
+            kernel_researcher = KernelResearchAgent(do_client=self._do_client)
+            kernel_research = await kernel_researcher.research(
+                bottleneck=bottleneck_analysis,
+                trace=trace,
+                model_id=self.cfg.model_id,
+                gpu_type=self.cfg.gpu_type,
+                winner_flags=winner_flags,
+            )
+            log.info(
+                "Stage 3e kernel research: %d approaches, proceed_to_generation=%s",
+                len(kernel_research.approaches),
+                kernel_research.proceed_to_generation,
+            )
+
+        return research_report, bottleneck_analysis, kernel_research
+
+    async def _collect_hardware_counters(
+        self,
+        *,
+        session_id: str,
+        kernel_name: str,
+        input_len: int,
+        output_len: int,
+        concurrency: int,
+    ):
+        """
+        Attempt to collect hardware counters using ncu (NVIDIA) or rocprof (AMD).
+        Returns HardwareCounters or None if tools are unavailable.
+        Never raises.
+        """
+        try:
+            vendor = "amd" if self.cfg.gpu_type in {"MI300X", "MI325X", "MI350X"} else "nvidia"
+            # Build a microbenchmark launch command for the top kernel
+            launch_cmd = (
+                f"python microbench/operator_bench.py "
+                f"--op attention "
+                f"--input-len {input_len} "
+                f"--output-len {output_len} "
+                f"--concurrency {concurrency}"
+            )
+
+            if vendor == "nvidia":
+                from profiling.ncu_profiler import NcuProfiler
+                ncu = NcuProfiler(gpu_type=self.cfg.gpu_type)
+                if not ncu.available:
+                    return None
+                return await ncu.profile_kernel(
+                    kernel_name=kernel_name,
+                    launch_cmd=launch_cmd,
+                    session_id=session_id,
+                )
+            else:
+                from profiling.rocprof_profiler import RocprofProfiler
+                rp = RocprofProfiler(gpu_type=self.cfg.gpu_type)
+                if not rp.available:
+                    return None
+                return await rp.profile_kernel(
+                    kernel_name=kernel_name,
+                    launch_cmd=launch_cmd,
+                    session_id=session_id,
+                )
+        except Exception as exc:
+            log.warning("Hardware counter collection failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # Stage 4 — Autonomous Kernel Engineering
+    # ------------------------------------------------------------------
+
+    async def _stage4(
+        self,
+        *,
+        session_id: str,
+        winner_flags: dict,
+        bottleneck,
+        research,
+    ):
+        """
+        Run Stage 4: autonomous kernel generation, validation, and evolution.
+
+        Pipeline:
+          1. KernelGenerationAgent   : Generate Triton kernel targeting bottleneck
+          2. CorrectnessFirewallAgent : Validate against PyTorch reference
+          3. KernelEvolutionAgent    : keep/revert loop for iterative improvement
+
+        Returns EvolutionResult (or None on error).
+        """
+        log.info("=== Stage 4: Autonomous Kernel Engineering ===")
+
+        try:
+            from agents.kernel_evolution_agent import KernelEvolutionAgent
+
+            node_cfg = self.cfg.nodes[0]
+            device = f"cuda:{node_cfg.gpu_indices[0]}" if node_cfg.gpu_indices else "cuda:0"
+
+            evolver = KernelEvolutionAgent(
+                do_client=self._do_client,
+                device=device,
+                bench_timeout_sec=120,
+            )
+
+            evolution_result = await evolver.evolve(
+                bottleneck=bottleneck,
+                research=research,
+                model_id=self.cfg.model_id,
+                gpu_type=self.cfg.gpu_type,
+                session_id=session_id,
+                max_iterations=getattr(self.cfg, "stage4_iterations", 3),
+            )
+
+            log.info("Stage 4 complete: %s", evolution_result.summary())
+            return evolution_result
+
+        except Exception as exc:
+            log.warning("Stage 4 error: %s", exc, exc_info=True)
+            return None
 
     # ------------------------------------------------------------------
     # Report
@@ -548,6 +739,7 @@ class ControllerAgent:
         session_id: str,
         best_strategy: dict,
         research_report=None,
+        evolution_result=None,
     ) -> None:
         analyst = AnalystAgent(do_client=self._do_client, db=self._db)
         analysis = await analyst.analyse(
@@ -566,5 +758,6 @@ class ControllerAgent:
             gpu_type=self.cfg.gpu_type,
             session_id=session_id,
             research_report=research_report,
+            evolution_result=evolution_result,
         )
         log.info("Reports written: %s", {k: str(v) for k, v in paths.items()})
