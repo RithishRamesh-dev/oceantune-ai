@@ -344,12 +344,22 @@ class PlannerAgent:
 
         # Build history summary (limit to last 5 to stay within token budget)
         recent_history = history[-5:] if len(history) > 5 else history
+
+        # Track best fitness seen so far to tag regressions explicitly
+        best_fitness_seen = max((h.get("fitness", 0.0) for h in history), default=0.0)
+
         history_summary = []
         for i, h in enumerate(recent_history):
+            fit = h.get("fitness", 0.0)
+            # Tag entries that were significantly worse than the best (regressions)
+            is_regression = (
+                fit > 0 and best_fitness_seen > 0
+                and fit < best_fitness_seen * 0.95
+            )
             entry = {
                 "iteration": h.get("iteration", i),
                 "flags": h.get("flags", {}),
-                "fitness": h.get("fitness"),
+                "fitness": fit,
                 # use canonical enriched_metrics field names
                 "peak_tok_s": h.get("enriched_metrics", {}).get(
                     "peak_throughput_tokens_per_sec"
@@ -362,6 +372,11 @@ class PlannerAgent:
                 ),
                 "analyst_recommendation": h.get("analyst_recommendation", ""),
             }
+            if is_regression:
+                entry["⚠️_regression"] = (
+                    f"This config was {(best_fitness_seen - fit)/best_fitness_seen*100:.1f}% "
+                    "WORSE than the best seen. Do not revert to these flag values."
+                )
             if h.get("error"):
                 entry["error"] = h["error"][:500]
             history_summary.append(entry)

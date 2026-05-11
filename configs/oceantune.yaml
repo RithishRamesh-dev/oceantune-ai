@@ -128,7 +128,7 @@ vllm:
 # ── Benchmark Engine ──────────────────────────────────────────────────────────
 benchmark:
   # Concurrency ramp — number of concurrent requests per run
-  concurrency_levels: [1, 2, 4, 8, 16, 32, 64]
+  concurrency_levels: [1, 2, 4, 8, 16, 32, 64, 128]
   # Total prompts sent per concurrency level
   num_prompts: 30
   # Default token lengths (overridden per context_config entry)
