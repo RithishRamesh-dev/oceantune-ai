@@ -1,0 +1,261 @@
+# OceanTune AI — Stage 2 Strategy Search Space
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 explores higher-level inference algorithm strategies on top of the
+# Stage 1 winner configuration. These are independent strategy dimensions:
+#
+#   1. KV Cache Strategies     — dtype quantisation, prefix caching, eviction
+#   2. Speculative Decoding    — draft model, token count, acceptance threshold
+#   3. Prefill Strategies      — chunked prefill, disaggregated prefill
+#   4. Kernel/Backend          — attention backend, MoE dispatch
+#   5. Quantisation            — AWQ, GPTQ, weight dtype
+#   6. Scheduler Tuning        — multi-step, delay factor
+#
+# Each parameter specifies:
+#   category  : strategy group (for reporting + LLM context)
+#   type      : choice | bool | range_int | range_float
+#   vllm_flag : CLI flag passed to vllm serve (if applicable)
+#   env_var   : environment variable (if applicable)
+#   vendor    : all | nvidia | amd
+#   requires  : list of model properties that must be true (e.g. moe: true)
+#   note      : human-readable description
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. KV Cache Strategies
+# ══════════════════════════════════════════════════════════════════════════════
+
+kv_cache_dtype:
+  category: kv_cache
+  type: choice
+  vllm_flag: "--kv-cache-dtype"
+  values:
+    - auto
+    - fp8
+    - fp8_e5m2
+    - fp8_e4m3
+  vendor: all
+  note: >
+    FP8 KV cache halves KV memory footprint at ~0.2% quality loss.
+    Allows fitting 2x more sequences → major throughput gain when memory-bound.
+    e5m2 = NVIDIA default for fp8. e4m3 = AMD preferred.
+    Recommended: try fp8 when gpu_memory_utilization > 0.85 and p95_latency is high.
+
+enable_prefix_caching:
+  category: kv_cache
+  type: bool
+  vllm_flag: "--enable-prefix-caching"
+  values: [true, false]
+  vendor: all
+  note: >
+    Cache KV states for repeated prompt prefixes (system prompts, few-shot examples).
+    High impact for chat workloads with shared system prompts.
+    Low impact for single-turn completions with random prompts.
+
+prefix_caching_hash_algo:
+  category: kv_cache
+  type: choice
+  vllm_flag: "--prefix-caching-hash-algo"
+  values:
+    - builtin
+    - sha256
+  vendor: all
+  note: >
+    sha256 is collision-resistant (recommended for production).
+    builtin is faster but has rare collision risk.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. Speculative Decoding
+# ══════════════════════════════════════════════════════════════════════════════
+
+num_speculative_tokens:
+  category: speculative_decoding
+  type: range_int
+  vllm_flag: "--num-speculative-tokens"
+  min: 1
+  max: 10
+  vendor: all
+  note: >
+    Number of tokens the draft model speculatively generates per step.
+    Higher = more aggressive speculation, more benefit on easy/repetitive text.
+    Lower = safer, less overhead on diverse outputs.
+    Typical sweet spot: 3-5 tokens for chat models.
+    Only active when speculative_model is also set.
+
+speculative_draft_tensor_parallel_size:
+  category: speculative_decoding
+  type: choice
+  vllm_flag: "--speculative-draft-tensor-parallel-size"
+  values: [1, 2, 4]
+  vendor: all
+  note: >
+    TP size for the draft model. Usually 1 (small draft models don't need TP).
+    Set to match the draft model's minimum GPU requirement.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. Prefill Strategies
+# ══════════════════════════════════════════════════════════════════════════════
+
+enable_chunked_prefill:
+  category: prefill
+  type: bool
+  vllm_flag: "--enable-chunked-prefill"
+  values: [true, false]
+  vendor: all
+  note: >
+    Splits long prefill sequences into chunks, interleaved with decode steps.
+    Dramatically reduces TTFT for long-context requests at high concurrency.
+    May reduce overall throughput slightly due to context-switching overhead.
+    Recommended: enable when mean_ttft_ms > 2000ms at target concurrency.
+
+max_num_chunked_tokens:
+  category: prefill
+  type: choice
+  vllm_flag: "--max-num-chunked-tokens"
+  values: [512, 1024, 2048, 4096, 8192]
+  vendor: all
+  note: >
+    Maximum tokens per prefill chunk when chunked_prefill is enabled.
+    Smaller chunks = lower TTFT but more scheduling overhead.
+    Larger chunks = higher throughput but worse TTFT.
+
+num_scheduler_steps:
+  category: prefill
+  type: choice
+  vllm_flag: "--num-scheduler-steps"
+  values: [1, 2, 4, 8]
+  vendor: all
+  note: >
+    Multi-step scheduling: execute N decode steps before returning to the
+    scheduler. Reduces Python scheduling overhead at the cost of flexibility.
+    Value of 8 recommended when throughput > latency is the goal.
+    Incompatible with chunked prefill.
+
+scheduler_delay_factor:
+  category: prefill
+  type: choice
+  vllm_flag: "--scheduler-delay-factor"
+  values: [0.0, 0.1, 0.2, 0.5]
+  vendor: all
+  note: >
+    Fraction of token budget reserved before launching a new decode step.
+    Higher = more tokens batched per step = better throughput, worse TTFT.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. Attention Backend & Kernel Selection
+# ══════════════════════════════════════════════════════════════════════════════
+
+attention_backend:
+  category: kernel
+  type: choice
+  vllm_flag: "--attention-backend"
+  values:
+    - FLASH_ATTN
+    - FLASHINFER
+    - XFORMERS
+    - ROCM_FLASH
+    - TORCH_SDPA
+  vendor: all
+  note: >
+    FLASH_ATTN: default for NVIDIA Hopper+. Optimal for most models.
+    FLASHINFER: often faster for MoE models with GQA and variable-length batches.
+               Supports paged KV cache natively (fewer memory copies).
+    XFORMERS: legacy, rarely faster than FLASH_ATTN on modern hardware.
+    ROCM_FLASH: required for AMD CDNA3+ (MI300X/MI325X/MI350X).
+    TORCH_SDPA: PyTorch native, useful for debugging — never optimal.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. MoE-Specific Strategies (NVIDIA only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+all2all_backend:
+  category: moe
+  type: choice
+  vllm_flag: "--moe-all2all-backend"
+  values:
+    - deepep_normal
+    - deepep_low_latency
+    - vllm
+  vendor: nvidia
+  note: >
+    Controls expert dispatch (all-to-all) kernel for MoE models.
+    deepep_normal: maximises throughput, requires enable_expert_parallel.
+    deepep_low_latency: optimises for small-batch latency.
+    vllm: default, most compatible.
+
+enable_dbo:
+  category: moe
+  type: bool
+  vllm_flag: "--enable-dbo"
+  values: [true, false]
+  vendor: nvidia
+  note: >
+    Dynamic Batch Optimiser: adjusts batch composition dynamically to reduce
+    GPU stalls. Most impactful on MoE models with uneven expert utilisation.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. AMD AITER Kernels
+# ══════════════════════════════════════════════════════════════════════════════
+
+vllm_rocm_use_aiter:
+  category: amd_kernel
+  type: bool
+  env_var: VLLM_ROCM_USE_AITER
+  values: [true, false]
+  vendor: amd
+  note: AMD AIter fused-attention kernel (CDNA3+). Usually a net win — enable first.
+
+vllm_rocm_use_aiter_mla:
+  category: amd_kernel
+  type: bool
+  env_var: VLLM_ROCM_USE_AITER_MLA
+  values: [true, false]
+  vendor: amd
+  note: AIter MLA (Multi-head Latent Attention) kernel for DeepSeek-series models.
+
+vllm_rocm_use_aiter_moe:
+  category: amd_kernel
+  type: bool
+  env_var: VLLM_ROCM_USE_AITER_MOE
+  values: [true, false]
+  vendor: amd
+  note: AIter MoE fused-GEMM. High impact for MoE models on AMD.
+
+vllm_rocm_use_aiter_rmsnorm:
+  category: amd_kernel
+  type: bool
+  env_var: VLLM_ROCM_USE_AITER_RMSNORM
+  values: [true, false]
+  vendor: amd
+  note: AIter fused RMSNorm. Modest gain, safe to enable.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. NCCL/RCCL Communication (multi-GPU)
+# ══════════════════════════════════════════════════════════════════════════════
+
+nccl_min_nchannels:
+  category: communication
+  type: range_int
+  env_var: NCCL_MIN_NCHANNELS
+  min: 4
+  max: 112
+  vendor: nvidia
+  note: >
+    Minimum NCCL all-reduce channels. Higher = more bandwidth for large TP.
+    Default (NCCL auto) is usually 32. 112 is optimal for NVSwitch fabrics.
+    Only relevant for tensor_parallel_size > 1.
+
+rccl_enable_intranode:
+  category: communication
+  type: bool
+  env_var: RCCL_ENABLE_INTRANODE_COMM
+  values: [true, false]
+  vendor: amd
+  note: Enable RCCL optimised intra-node path. Default off; enable for TP > 1.
+
+hsa_no_scratch_reclaim:
+  category: communication
+  type: bool
+  env_var: HSA_NO_SCRATCH_RECLAIM
+  values: [true, false]
+  vendor: amd
+  note: Disables HSA scratch buffer reclamation. Reduces driver overhead on AMD.

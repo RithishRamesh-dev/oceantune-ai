@@ -3,21 +3,25 @@ agents/controller_agent.py
 --------------------------
 Controller Agent — v4 top-level orchestrator.
 
-Wires together the full OceanTune AI v4 pipeline:
+Wires together the full OceanTune AI pipeline:
   Stage 1 — vLLM Config Search
-    1. PlannerAgent   : validate + LLM-rank candidate configs
-    2. MongoDB         : insert ranked configs as "pending" documents
-    3. Coordinator    : parallel dispatch to GPU Droplet Node Servers
-    4. AnalystAgent   : pick winner, explain why
+    1. PlannerAgent         : LLM-guided iterative flag search
+    2. ExecutorAgent        : vLLM Docker + benchmark + fitness scoring
+    3. AnalystAgent         : per-iteration bottleneck diagnosis + session winner
 
-  Stage 2 — Kernel-Level Search
-    5. KernelOptimizerAgent : iterative LLM-guided kernel search
-    6. ReportGenerator      : YAML recipe + shell script + Markdown report
+  Stage 2 — Inference Strategy Search
+    4. StrategyOptimizerAgent : KV cache, speculative decoding, attention backend,
+                                prefill strategies, vendor-specific kernels
+
+  Stage 3 — Profiling + Research
+    5. ProfilerAgent        : Torch profiler trace at optimal concurrency
+    6. ResearchAgent        : kernel timing analysis + ranked optimization recommendations
+    7. ReportGenerator      : YAML recipe + shell script + Markdown report
 
 Entry point:
     from agents.controller_agent import ControllerAgent
     agent = ControllerAgent()
-    await agent.run()       # full async pipeline
+    await agent.run()
 """
 
 from __future__ import annotations
@@ -30,7 +34,9 @@ from typing import Optional, Tuple
 from agents.analyst import AnalystAgent
 from agents.do_client import DOClient
 from agents.executor import ExecutorAgent
-from agents.kernel_optimizer import KernelOptimizerAgent
+from agents.strategy_optimizer import StrategyOptimizerAgent
+from agents.profiler_agent import ProfilerAgent
+from agents.research_agent import ResearchAgent
 from agents.planner import PlannerAgent
 from core.config import OceanTuneConfig, load_config
 from core.db import Database
@@ -114,15 +120,24 @@ class ControllerAgent:
             # ── Stage 1: vLLM Config Search ───────────────────────────────
             winner_flags, _ = await self._stage1(session_id)
 
-            # ── Stage 2: Kernel Search ────────────────────────────────────
-            best_kernel = {}
+            # ── Stage 2: Inference Strategy Search ───────────────────────
+            best_strategy = {}
+            winner_metrics: dict = {}
             if winner_flags:
-                best_kernel = await self._stage2(session_id, winner_flags)
+                best_strategy, winner_metrics = await self._stage2(session_id, winner_flags)
             else:
-                log.warning("Stage 1 produced no winner — skipping Stage 2")
+                log.warning("Stage 1 produced no winner — skipping Stage 2 and Stage 3")
+
+            # ── Stage 3: Profiling + Research ─────────────────────────────
+            from agents.research_agent import ResearchReport
+            research_report: Optional[ResearchReport] = None
+            if winner_flags:
+                research_report = await self._stage3(
+                    session_id, winner_flags, winner_metrics
+                )
 
             # ── Report generation ─────────────────────────────────────────
-            await self._generate_report(session_id, best_kernel)
+            await self._generate_report(session_id, best_strategy, research_report)
             await self._db.update_session_status(session_id, "done")
             log.info("Pipeline complete: session=%s", session_id)
 
@@ -391,20 +406,29 @@ class ControllerAgent:
             )
 
     # ------------------------------------------------------------------
-    # Stage 2
+    # Stage 2 — Inference Strategy Search
     # ------------------------------------------------------------------
 
     async def _stage2(
         self, session_id: str, winner_flags: dict
-    ) -> dict:
+    ) -> tuple:
         """
-        Run Stage 2: LLM-guided kernel search.
+        Run Stage 2: LLM-guided inference strategy search.
 
-        Returns the best kernel override dict to merge with winner_flags.
+        Explores KV cache strategies, speculative decoding, prefill strategies,
+        attention backend selection, and vendor-specific kernel flags on top of
+        the Stage 1 winner.
+
+        Returns (best_strategy_config, winner_enriched_metrics).
         """
-        log.info("=== Stage 2: Kernel-Level Search ===")
+        log.info("=== Stage 2: Inference Strategy Search ===")
 
-        # Build node-local GPU/port allocators (use first node config)
+        # Pull Stage 1 winner metrics for the LLM context
+        top = await self._db.get_top_configs(session_id, n=1)
+        winner_metrics = {}
+        if top:
+            winner_metrics = top[0].get("enriched_metrics") or top[0].get("raw_metrics") or {}
+
         node_cfg = self.cfg.nodes[0]
         gpu_alloc = GPUSlotAllocator(
             gpu_indices=node_cfg.gpu_indices,
@@ -415,7 +439,7 @@ class ControllerAgent:
             end=self.cfg.coordinator.port_pool_end,
         )
 
-        ko = KernelOptimizerAgent(
+        so = StrategyOptimizerAgent(
             do_client=self._do_client,
             db=self._db,
             gpu_alloc=gpu_alloc,
@@ -426,23 +450,104 @@ class ControllerAgent:
             num_prompts=self.cfg.benchmark.num_prompts,
             startup_timeout_sec=self.cfg.vllm.startup_timeout_sec,
             docker_image=self.cfg.vllm.docker_image,
+            primary_metric=self.cfg.optimiser.primary_metric,
         )
 
-        best_kernel = await ko.run(
+        best_strategy = await so.run(
             session_id=session_id,
             baseline_flags=winner_flags,
+            baseline_metrics=winner_metrics,
             context_configs=list(self.cfg.context_configs),
-            max_iterations=10,
+            max_iterations=12,
         )
-        log.info("Stage 2 done: best_kernel=%s", best_kernel)
-        return best_kernel
+        log.info("Stage 2 done: best_strategy=%s", best_strategy)
+        return best_strategy, winner_metrics
+
+    # ------------------------------------------------------------------
+    # Stage 3 — Profiling + Research
+    # ------------------------------------------------------------------
+
+    async def _stage3(
+        self,
+        session_id: str,
+        winner_flags: dict,
+        winner_metrics: dict,
+    ):
+        """
+        Run Stage 3: Torch profiler trace + Research Agent analysis.
+
+        Profiles the winner config at its optimal concurrency level, then calls
+        the Research Agent to analyse the kernel timing breakdown and produce
+        ranked optimization recommendations.
+
+        Returns a ResearchReport (or None on error).
+        """
+        log.info("=== Stage 3: Profiling + Research ===")
+
+        from agents.profiler_agent import ProfilerAgent
+        from agents.research_agent import ResearchAgent
+
+        optimal_concurrency = int(winner_metrics.get("best_concurrency", 64))
+        context_configs = list(self.cfg.context_configs)
+        input_len = context_configs[0][0] if context_configs else 1024
+        output_len = context_configs[0][1] if context_configs else 1024
+
+        node_cfg = self.cfg.nodes[0]
+        gpu_alloc = GPUSlotAllocator(
+            gpu_indices=node_cfg.gpu_indices,
+            gpu_type=node_cfg.gpu_type,
+        )
+        port_alloc = PortAllocator(
+            start=self.cfg.coordinator.port_pool_start,
+            end=self.cfg.coordinator.port_pool_end,
+        )
+
+        profiler = ProfilerAgent(
+            do_client=self._do_client,
+            db=self._db,
+            gpu_alloc=gpu_alloc,
+            port_alloc=port_alloc,
+            model_id=self.cfg.model_id,
+            gpu_type=self.cfg.gpu_type,
+            startup_timeout_sec=self.cfg.vllm.startup_timeout_sec,
+            docker_image=self.cfg.vllm.docker_image,
+        )
+
+        trace = await profiler.run(
+            session_id=session_id,
+            winner_flags=winner_flags,
+            optimal_concurrency=optimal_concurrency,
+            input_len=input_len,
+            output_len=output_len,
+        )
+        log.info(
+            "Stage 3 profile: bottleneck=%s attention=%.1f%% gemm=%.1f%%",
+            trace.bottleneck_type, trace.attention_pct, trace.gemm_pct,
+        )
+
+        researcher = ResearchAgent(do_client=self._do_client)
+        research_report = await researcher.analyse(
+            trace=trace,
+            winner_flags=winner_flags,
+            model_id=self.cfg.model_id,
+            gpu_type=self.cfg.gpu_type,
+        )
+        log.info(
+            "Stage 3 research: %d recommendations, custom_kernel_warranted=%s",
+            len(research_report.recommendations),
+            research_report.custom_kernel_warranted,
+        )
+        return research_report
 
     # ------------------------------------------------------------------
     # Report
     # ------------------------------------------------------------------
 
     async def _generate_report(
-        self, session_id: str, best_kernel: dict
+        self,
+        session_id: str,
+        best_strategy: dict,
+        research_report=None,
     ) -> None:
         analyst = AnalystAgent(do_client=self._do_client, db=self._db)
         analysis = await analyst.analyse(
@@ -456,9 +561,10 @@ class ControllerAgent:
         )
         paths = gen.generate(
             analysis=analysis,
-            best_kernel_config=best_kernel,
+            best_kernel_config=best_strategy,
             model_id=self.cfg.model_id,
             gpu_type=self.cfg.gpu_type,
             session_id=session_id,
+            research_report=research_report,
         )
         log.info("Reports written: %s", {k: str(v) for k, v in paths.items()})

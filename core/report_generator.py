@@ -65,6 +65,7 @@ class ReportGenerator:
         gpu_type: str,
         session_id: str,
         docker_image: str = "vllm/vllm-openai:latest",
+        research_report=None,
     ) -> Dict[str, Path]:
         """
         Write all report artefacts and return a dict of {type: path}.
@@ -83,6 +84,7 @@ class ReportGenerator:
             model_id=model_id,
             gpu_type=gpu_type,
             session_id=session_id,
+            research_report=research_report,
         )
         shell_path = self._write_shell_script(
             slug=slug,
@@ -99,6 +101,7 @@ class ReportGenerator:
             model_id=model_id,
             gpu_type=gpu_type,
             session_id=session_id,
+            research_report=research_report,
         )
 
         return {"yaml": yaml_path, "shell": shell_path, "markdown": md_path}
@@ -116,9 +119,10 @@ class ReportGenerator:
         model_id: str,
         gpu_type: str,
         session_id: str,
+        research_report=None,
     ) -> Path:
         merged_flags = {**analysis.winner_flags, **best_kernel_config}
-        recipe = {
+        recipe: Dict[str, Any] = {
             "# OceanTune AI — Optimised Recipe": None,
             "session_id": session_id,
             "model_id": model_id,
@@ -127,10 +131,29 @@ class ReportGenerator:
             "fingerprint": analysis.winner_fingerprint,
             "key_flags": analysis.key_flags,
             "vllm_flags": merged_flags,
-            "kernel_config": best_kernel_config,
+            "stage2_strategy": best_kernel_config,
             "analyst_explanation": analysis.explanation,
             "recommendation": analysis.recommendation,
         }
+        if research_report is not None:
+            recipe["stage3_research"] = {
+                "bottleneck_type": research_report.bottleneck_type,
+                "bottleneck_explanation": research_report.bottleneck_explanation,
+                "custom_kernel_warranted": research_report.custom_kernel_warranted,
+                "custom_kernel_rationale": research_report.custom_kernel_rationale,
+                "recommendations": [
+                    {
+                        "rank": r.rank,
+                        "title": r.title,
+                        "category": r.category,
+                        "expected_improvement_pct": r.expected_improvement_pct,
+                        "confidence": r.confidence,
+                        "implementation": r.implementation,
+                        "stage": r.stage,
+                    }
+                    for r in research_report.recommendations
+                ],
+            }
         path = self._output_dir / f"recipe_{slug}.yaml"
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(recipe, f, default_flow_style=False, allow_unicode=True)
@@ -212,6 +235,7 @@ class ReportGenerator:
         model_id: str,
         gpu_type: str,
         session_id: str,
+        research_report=None,
     ) -> Path:
         top = analysis.top_configs[:5]
 
@@ -220,7 +244,6 @@ class ReportGenerator:
         for i, r in enumerate(top, 1):
             fp = r.get("fingerprint", "")[:12]
             fit = r.get("fitness_score", 0)
-            # enriched_metrics has canonical keys; fall back to raw_metrics
             em = r.get("enriched_metrics") or r.get("raw_metrics") or {}
             thr_raw = em.get("peak_throughput_tokens_per_sec", em.get("throughput_tok_s"))
             p95_raw = em.get("p95_latency_at_peak_ms", em.get("p95_latency_ms"))
@@ -228,16 +251,75 @@ class ReportGenerator:
             p95 = f"{p95_raw:.1f}" if isinstance(p95_raw, (int, float)) else "—"
             top_table += f"| {i} | `{fp}` | {fit:.4f} | {thr} | {p95} |\n"
 
-        kernel_section = ""
+        # Stage 2 section
+        stage2_section = ""
         if best_kernel_config:
-            kernel_section = (
-                "\n## Stage 2 — Kernel Optimisation\n\n"
+            rows = "".join(
+                f"| `{k}` | `{v}` |\n"
+                for k, v in best_kernel_config.items()
+                if not k.startswith("_")
+            )
+            stage2_section = (
+                "\n---\n\n## Stage 2 — Inference Strategy\n\n"
+                "Best strategy found on top of the Stage 1 winner:\n\n"
                 "| Parameter | Value |\n"
                 "|-----------|-------|\n"
-                + "".join(
-                    f"| `{k}` | `{v}` |\n"
-                    for k, v in best_kernel_config.items()
+                + (rows if rows else "| (no improvement over baseline) | — |\n")
+            )
+        else:
+            stage2_section = (
+                "\n---\n\n## Stage 2 — Inference Strategy\n\n"
+                "No strategy override improved on the Stage 1 baseline. "
+                "The winner configuration already uses near-optimal serving settings.\n"
+            )
+
+        # Stage 3 section
+        stage3_section = ""
+        if research_report is not None:
+            recs_table = (
+                "| Rank | Title | Category | Est. Gain | Confidence | Stage |\n"
+                "|------|-------|----------|-----------|------------|-------|\n"
+            )
+            for rec in research_report.recommendations:
+                recs_table += (
+                    f"| {rec.rank} | {rec.title} | `{rec.category}` | "
+                    f"+{rec.expected_improvement_pct:.0f}% | {rec.confidence} | `{rec.stage}` |\n"
                 )
+
+            impl_details = ""
+            for rec in research_report.recommendations[:5]:
+                impl_details += (
+                    f"\n### {rec.rank}. {rec.title}\n\n"
+                    f"**Category:** `{rec.category}` | "
+                    f"**Expected gain:** +{rec.expected_improvement_pct:.0f}% | "
+                    f"**Confidence:** {rec.confidence}\n\n"
+                    f"{rec.description}\n\n"
+                    f"**Implementation:** `{rec.implementation}`\n\n"
+                    f"**Evidence:** {rec.evidence}\n"
+                )
+
+            custom_kernel_note = ""
+            if research_report.custom_kernel_warranted:
+                custom_kernel_note = (
+                    f"\n> **Stage 4 Custom Kernel warranted:** "
+                    f"{research_report.custom_kernel_rationale}\n"
+                )
+
+            stage3_section = (
+                "\n---\n\n## Stage 3 — Profiling & Research\n\n"
+                f"**Bottleneck type:** `{research_report.bottleneck_type}`\n\n"
+                f"{research_report.bottleneck_explanation}\n\n"
+                + (f"**Architecture notes:** {research_report.architecture_notes}\n\n"
+                   if research_report.architecture_notes else "")
+                + "### Optimization Recommendations\n\n"
+                + recs_table
+                + impl_details
+                + custom_kernel_note
+            )
+        else:
+            stage3_section = (
+                "\n---\n\n## Stage 3 — Profiling & Research\n\n"
+                "Profiling not run in this session.\n"
             )
 
         md = (
@@ -247,32 +329,28 @@ class ReportGenerator:
             f"**GPU:** `{gpu_type}`  \n"
             f"**Generated:** {datetime.now(timezone.utc).isoformat()}\n\n"
             "---\n\n"
-            "## Winner Configuration\n\n"
+            "## Stage 1 Winner Configuration\n\n"
             f"**Fingerprint:** `{analysis.winner_fingerprint[:16]}`  \n"
             f"**Fitness Score:** `{analysis.winner_fitness:.4f}`\n\n"
             "### Key Flags\n\n"
-            + (
-                "| Flag | Value |\n|------|-------|\n"
-                + "".join(
-                    f"| `{k}` | `{v}` |\n"
-                    for k, v in analysis.winner_flags.items()
-                    if k in analysis.key_flags or not analysis.key_flags
-                )
+            "| Flag | Value |\n|------|-------|\n"
+            + "".join(
+                f"| `{k}` | `{v}` |\n"
+                for k, v in analysis.winner_flags.items()
+                if k in analysis.key_flags or not analysis.key_flags
             )
             + "\n\n"
             "---\n\n"
             "## LLM Analysis\n\n"
             f"**Explanation:**\n{analysis.explanation}\n\n"
-            + (
-                f"**OOM Insight:**\n{analysis.oom_insight}\n\n"
-                if analysis.oom_insight else ""
-            )
+            + (f"**OOM Insight:**\n{analysis.oom_insight}\n\n" if analysis.oom_insight else "")
             + f"**Convergence:**\n{analysis.convergence_note}\n\n"
             f"**Recommendation:**\n{analysis.recommendation}\n\n"
             "---\n\n"
             "## Top 5 Configurations\n\n"
             + top_table
-            + kernel_section
+            + stage2_section
+            + stage3_section
             + "\n\n---\n\n"
             "*Generated by [OceanTune AI](https://github.com/RithishRamesh-dev/oceantune-ai)*\n"
         )
