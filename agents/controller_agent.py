@@ -38,7 +38,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from agents.analyst import AnalystAgent
 from agents.do_client import DOClient
@@ -140,15 +140,27 @@ class ControllerAgent:
             else:
                 log.warning("Stage 1 produced no winner — skipping Stage 2 and Stage 3")
 
-            # ── Stage 3: Deep Profiling + Bottleneck Reasoning ───────────
+            # ── Stage 3: Deep Profiling + Bottleneck Reasoning + Flag Trials ──
             from agents.research_agent import ResearchReport
             research_report: Optional[ResearchReport] = None
             bottleneck_analysis = None
             kernel_research = None
             evolution_result = None
+            stage3_fitness: float = stage2_fitness
+            applied_recs: list = []
+            stage3_flags = winner_flags  # may be updated by Stage 3 flag trials
             if winner_flags:
-                research_report, bottleneck_analysis, kernel_research = await self._stage3(
-                    session_id, winner_flags, winner_metrics
+                (
+                    research_report,
+                    bottleneck_analysis,
+                    kernel_research,
+                    stage3_fitness,
+                    applied_recs,
+                    stage3_flags,
+                ) = await self._stage3(
+                    session_id, winner_flags, winner_metrics,
+                    stage2_fitness=stage2_fitness,
+                    stage2_strategy=best_strategy,
                 )
 
             # ── Stage 4: Autonomous Kernel Engineering ────────────────────
@@ -161,7 +173,7 @@ class ControllerAgent:
             ):
                 evolution_result = await self._stage4(
                     session_id=session_id,
-                    winner_flags=winner_flags,
+                    winner_flags=stage3_flags,   # use improved flags from Stage 3
                     bottleneck=bottleneck_analysis,
                     research=kernel_research,
                 )
@@ -172,6 +184,8 @@ class ControllerAgent:
                 evolution_result=evolution_result,
                 stage1_fitness=stage1_fitness,
                 stage2_fitness=stage2_fitness,
+                stage3_fitness=stage3_fitness,
+                stage3_applied_recs=applied_recs,
             )
             await self._db.update_session_status(session_id, "done")
             log.info("Pipeline complete: session=%s", session_id)
@@ -511,19 +525,23 @@ class ControllerAgent:
         session_id: str,
         winner_flags: dict,
         winner_metrics: dict,
+        stage2_fitness: float = 0.0,
+        stage2_strategy: Optional[Dict[str, Any]] = None,
     ):
         """
-        Run Stage 3: multi-source profiling + deep bottleneck reasoning.
+        Run Stage 3: profiling → bottleneck reasoning → try flag recommendations → kernel research.
 
         Pipeline:
           1. Torch profiler trace (category breakdown: attention/GEMM/MoE/comm)
           2. Hardware counters (Nsight Compute or rocprof — if tools available)
-          3. BottleneckReasoningAgent (LLM synthesises all signals into a
-             precise bottleneck class + evidence chain)
-          4. ResearchAgent (LLM-ranked optimization recommendations)
-          5. KernelResearchAgent (deep research on best kernel implementations)
+          3. BottleneckReasoningAgent (LLM synthesises all signals into a bottleneck class)
+          4. ResearchAgent (LLM-ranked optimization recommendations with vllm_flags dicts)
+          5. Try each stage3_flag recommendation — keep if fitness improves
+          6. KernelResearchAgent (deep research on best kernel implementations for
+             bottlenecks not solved by flag changes)
 
-        Returns (research_report, bottleneck_analysis, kernel_research).
+        Returns (research_report, bottleneck_analysis, kernel_research, stage3_fitness,
+                 applied_recommendations, updated_winner_flags).
         """
         log.info("=== Stage 3: Deep Profiling + Bottleneck Reasoning ===")
 
@@ -603,10 +621,13 @@ class ControllerAgent:
         )
 
         # ── 3d. Research Agent (vLLM-level recommendations) ───────────────
+        # Pass the full winner_flags (Stage1+2 merged) AND the Stage 2 delta
+        # separately so the LLM knows exactly what's already been applied.
         researcher = ResearchAgent(do_client=self._do_client)
         research_report = await researcher.analyse(
             trace=trace,
             winner_flags=winner_flags,
+            stage2_strategy=stage2_strategy or {},
             model_id=self.cfg.model_id,
             gpu_type=self.cfg.gpu_type,
         )
@@ -616,27 +637,57 @@ class ControllerAgent:
             research_report.custom_kernel_warranted,
         )
 
-        # ── 3e. Kernel Research (deep kernel-level research) ──────────────
+        # ── 3e. Try flag recommendations immediately ───────────────────────
+        # Validate each stage3_flag recommendation by benchmarking it now,
+        # rather than deferring to a later stage.  Only recommendations that
+        # actually improve fitness are kept; winner_flags is updated in-place
+        # so subsequent steps (kernel research, Stage 4) see the best config.
+        updated_flags, stage3_fitness, applied_recs = await self._try_flag_recommendations(
+            session_id=session_id,
+            winner_flags=winner_flags,
+            research_report=research_report,
+            current_fitness=stage2_fitness,
+        )
+        if applied_recs:
+            log.info(
+                "Stage 3e: %d flag change(s) accepted, fitness %.4f → %.4f",
+                len(applied_recs), stage2_fitness, stage3_fitness,
+            )
+        else:
+            log.info("Stage 3e: no flag recommendations improved fitness")
+
+        # ── 3f. Kernel Research (deep kernel-level research) ──────────────
+        # Only run if flag changes didn't already fully address the bottleneck,
+        # or the research agent flagged that custom kernel work is warranted.
         kernel_research = None
-        if research_report.custom_kernel_warranted or (
-            bottleneck_analysis.recommended_action.startswith("kernel_generation")
-        ):
-            log.info("Stage 3e: running deep kernel research...")
+        need_kernel_work = (
+            research_report.custom_kernel_warranted
+            or bottleneck_analysis.recommended_action.startswith("kernel_generation")
+        )
+        if need_kernel_work:
+            log.info("Stage 3f: running deep kernel research...")
             kernel_researcher = KernelResearchAgent(do_client=self._do_client)
             kernel_research = await kernel_researcher.research(
                 bottleneck=bottleneck_analysis,
                 trace=trace,
                 model_id=self.cfg.model_id,
                 gpu_type=self.cfg.gpu_type,
-                winner_flags=winner_flags,
+                winner_flags=updated_flags,   # use the improved flags
             )
             log.info(
-                "Stage 3e kernel research: %d approaches, proceed_to_generation=%s",
+                "Stage 3f kernel research: %d approaches, proceed_to_generation=%s",
                 len(kernel_research.approaches),
                 kernel_research.proceed_to_generation,
             )
 
-        return research_report, bottleneck_analysis, kernel_research
+        return (
+            research_report,
+            bottleneck_analysis,
+            kernel_research,
+            stage3_fitness,
+            applied_recs,
+            updated_flags,
+        )
 
     async def _collect_hardware_counters(
         self,
@@ -686,6 +737,103 @@ class ControllerAgent:
         except Exception as exc:
             log.warning("Hardware counter collection failed: %s", exc)
             return None
+
+    # ------------------------------------------------------------------
+    # Stage 3 helper: try vLLM flag recommendations in-place
+    # ------------------------------------------------------------------
+
+    async def _try_flag_recommendations(
+        self,
+        session_id: str,
+        winner_flags: Dict[str, Any],
+        research_report,
+        current_fitness: float,
+    ) -> Tuple[Dict[str, Any], float, List[Dict[str, Any]]]:
+        """
+        For each stage3_flag recommendation with a non-empty vllm_flags dict,
+        benchmark the flag change on its own and keep it if fitness improves.
+
+        Returns
+        -------
+        (updated_flags, final_fitness, applied_list)
+        applied_list: list of dicts with keys title, flags, fitness_before, fitness_after, delta
+        """
+        from dataclasses import asdict
+
+        applied: List[Dict[str, Any]] = []
+        current_flags: Dict[str, Any] = dict(winner_flags)
+
+        # Only try recommendations that are flag-based (not custom code) and
+        # whose vllm_flags values differ from what is already in winner_flags
+        # (avoids re-benchmarking flags Stage 2 already applied).
+        flag_recs = [
+            r for r in research_report.recommendations
+            if r.stage in ("stage3_flag", "stage2")
+            and not r.requires_custom_code
+            and r.vllm_flags
+            and any(
+                winner_flags.get(k) != v
+                for k, v in r.vllm_flags.items()
+            )
+        ]
+        if not flag_recs:
+            log.info("Stage 3: no actionable flag recommendations to try")
+            return current_flags, current_fitness, applied
+
+        log.info("Stage 3: trying %d flag recommendation(s)...", len(flag_recs))
+
+        known_fields = set(VLLMFlags.__dataclass_fields__)
+        context_configs = list(self.cfg.context_configs)
+
+        for rec in flag_recs:
+            # Merge recommended flags into current best
+            trial_raw = {**current_flags, **rec.vllm_flags}
+            trial_clean = {k: v for k, v in trial_raw.items() if k in known_fields}
+            trial_flags = VLLMFlags(**trial_clean)
+
+            config_id = await self._db.insert_config(
+                session_id=session_id,
+                fingerprint=trial_flags.fingerprint(),
+                flags={k: v for k, v in asdict(trial_flags).items() if k != "run_id"},
+                generation=-1,   # Stage 3 trials are generation -1
+                priority=-1,
+            )
+            if config_id is None:
+                log.info("Stage 3: rec '%s' already benchmarked, skipping", rec.title)
+                continue
+
+            await self._run_single(
+                session_id=session_id,
+                config_id=config_id,
+                context_configs=context_configs,
+            )
+
+            config_doc = await self._db.get_config_by_id(config_id)
+            fitness = config_doc.get("fitness_score", 0.0) if config_doc else 0.0
+
+            if fitness > current_fitness:
+                delta = fitness - current_fitness
+                log.info(
+                    "Stage 3 rec '%s' ACCEPTED: %.4f → %.4f (+%.4f, +%.1f%%)",
+                    rec.title, current_fitness, fitness,
+                    delta, (delta / current_fitness * 100) if current_fitness else 0.0,
+                )
+                applied.append({
+                    "title": rec.title,
+                    "flags": rec.vllm_flags,
+                    "fitness_before": current_fitness,
+                    "fitness_after": fitness,
+                    "delta": delta,
+                })
+                current_flags = {k: v for k, v in asdict(trial_flags).items() if k != "run_id"}
+                current_fitness = fitness
+            else:
+                log.info(
+                    "Stage 3 rec '%s' rejected: %.4f → %.4f",
+                    rec.title, current_fitness, fitness,
+                )
+
+        return current_flags, current_fitness, applied
 
     # ------------------------------------------------------------------
     # Stage 4 — Autonomous Kernel Engineering
@@ -751,6 +899,8 @@ class ControllerAgent:
         evolution_result=None,
         stage1_fitness: float = 0.0,
         stage2_fitness: float = 0.0,
+        stage3_fitness: float = 0.0,
+        stage3_applied_recs: Optional[List] = None,
     ) -> None:
         analyst = AnalystAgent(do_client=self._do_client, db=self._db)
         analysis = await analyst.analyse(
@@ -772,5 +922,7 @@ class ControllerAgent:
             evolution_result=evolution_result,
             stage1_fitness=stage1_fitness,
             stage2_fitness=stage2_fitness,
+            stage3_fitness=stage3_fitness,
+            stage3_applied_recs=stage3_applied_recs or [],
         )
         log.info("Reports written: %s", {k: str(v) for k, v in paths.items()})

@@ -6,8 +6,8 @@ Profiler Agent — Stage 3, Part 1.
 Runs a vLLM instance under PyTorch profiler, collects kernel timing traces,
 and returns a structured ProfileTrace with per-operation timing breakdowns.
 
-The profiler uses vLLM's built-in --collect-detailed-traces flag combined with
-a synthetic workload at the optimal concurrency level found in Stage 1/2.
+The profiler uses vLLM's --profiler-config flag (vLLM v0.13+) to enable the
+PyTorch profiler and write Chrome trace JSON to a mounted volume directory.
 
 Trace output:
   - Top kernels by GPU time (attention, GEMM, RoPE, RMSNorm, MoE routing)
@@ -207,34 +207,39 @@ class ProfilerAgent:
 
         device_env = self._gpu_alloc.build_device_env(slot)
 
-        # vLLM trace output directory
+        # vLLM trace output directory (on the host)
         trace_dir = _REPO_ROOT / "storage" / "profiles" / session_id
         trace_dir.mkdir(parents=True, exist_ok=True)
 
-        # Enable vLLM's detailed trace collection.
-        # VLLM_TORCH_PROFILER_DIR tells vLLM where to write Chrome trace JSON.
-        # --collect-detailed-traces activates the PyTorch profiler inside vLLM
-        # (required for newer vLLM versions; older versions use the env var alone).
+        # Container-internal path where vLLM writes trace files.
+        # We volume-mount trace_dir → _CONTAINER_TRACE_DIR so files appear on the host.
+        _CONTAINER_TRACE_DIR = "/tmp/vllm_profile"
+
+        # vLLM v0.13+ profiler config — uses --profiler-config JSON flag.
+        # VLLM_RPC_TIMEOUT must be large: flushing traces for large models can take
+        # 10+ minutes (vLLM docs recommendation: 1800000 ms = 30 min).
+        import json as _json
+        profiler_config_json = _json.dumps({
+            "profiler": "torch",
+            "torch_profiler_dir": _CONTAINER_TRACE_DIR,
+            "torch_profiler_with_stack": True,
+        })
+
         profile_env = {
             **device_env,
-            "VLLM_TORCH_PROFILER_DIR": str(trace_dir),
+            "VLLM_RPC_TIMEOUT": "1800000",
         }
-
-        # Add --collect-detailed-traces to the flags so vLLM starts the profiler
-        from dataclasses import asdict
-        flags_dict = asdict(flags)
-        flags_dict["collect_detailed_traces"] = "worker"  # vLLM >= 0.5: enables torch profiler
-        known_fields = set(VLLMFlags.__dataclass_fields__.keys())
-        profile_flags = VLLMFlags(**{k: v for k, v in flags_dict.items() if k in known_fields})
 
         server = VLLMServer(
             model_id=self._model_id,
-            flags=profile_flags,
+            flags=flags,
             gpu_type=self._gpu_type,
             port=port,
             startup_timeout=self._startup_timeout_sec,
             extra_env=profile_env,
             docker_image=self._docker_image,
+            extra_docker_args=["-v", f"{trace_dir}:{_CONTAINER_TRACE_DIR}"],
+            extra_vllm_args=["--profiler-config", profiler_config_json],
         )
 
         try:
@@ -285,8 +290,8 @@ class ProfilerAgent:
         trace_dir: Path,
     ) -> Optional[Dict[str, Any]]:
         """
-        Send requests to trigger profiling.
-        vLLM with VLLM_TORCH_PROFILER_DIR set writes trace JSON automatically.
+        Send requests to trigger profiling via vLLM's /start_profile + /stop_profile API.
+        vLLM writes Chrome trace JSON to torch_profiler_dir (container path, volume-mounted).
         Returns parsed trace dict or None.
         """
         import httpx

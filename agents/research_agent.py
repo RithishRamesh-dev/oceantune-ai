@@ -64,6 +64,10 @@ class OptimizationRecommendation:
     implementation: str       # concrete what-to-do: flag to set, code to change
     stage: str                # stage2 (flag change) | stage3_flag | stage4_custom_kernel
     requires_custom_code: bool = False
+    # Machine-readable VLLMFlags field changes to apply when stage != "stage4_custom_kernel".
+    # Keys must match VLLMFlags dataclass field names (snake_case).
+    # Empty dict means the change cannot be expressed as a simple flag (requires code).
+    vllm_flags: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -137,8 +141,13 @@ Respond with a JSON object:
       "evidence": "<citation or reasoning>",
       "implementation": "<exact flag, env var, or code change>",
       "stage": "stage2|stage3_flag|stage4_custom_kernel",
-      "requires_custom_code": false
+      "requires_custom_code": false,
+      "vllm_flags": {"<vllm_flag_field_name>": <value>}
     }
+
+  For "vllm_flags": use VLLMFlags Python field names (snake_case, e.g. "enable_chunked_prefill", "kv_cache_dtype",
+  "enable_prefix_caching", "attention_backend", "gpu_memory_utilization", "max_num_seqs", etc.).
+  Only include vllm_flags for stage2/stage3_flag recommendations. For stage4_custom_kernel, set vllm_flags to {}.
   ],
   "custom_kernel_warranted": false,
   "custom_kernel_rationale": "<if true, explain what custom kernel to write and expected gain>"
@@ -168,8 +177,14 @@ Kernel timing breakdown:
 Top 10 kernels by GPU time:
 {top_kernels_table}
 
-=== CURRENT VLLM CONFIGURATION ===
+=== CURRENT VLLM CONFIGURATION (already applied — Stage 1 + Stage 2) ===
 {winner_flags_json}
+
+=== STAGE 2 STRATEGY CHANGES (these were already benchmarked and applied) ===
+{stage2_strategy_json}
+Do NOT re-recommend anything already listed above. Focus only on optimizations
+not yet tried. Assign stage="stage3_flag" to any flag-based recommendation so
+that Stage 3 can immediately benchmark it.
 
 === MODEL ARCHITECTURE ===
 {architecture_json}
@@ -177,7 +192,7 @@ Top 10 kernels by GPU time:
 === HARDWARE PROFILE ===
 {gpu_profile_json}
 
-Based on this profile, provide your optimization recommendations.
+Based on this profile, provide optimization recommendations for flags NOT yet applied.
 """
 
 
@@ -197,6 +212,7 @@ class ResearchAgent:
         winner_flags: Dict[str, Any],
         model_id: str,
         gpu_type: str,
+        stage2_strategy: Optional[Dict[str, Any]] = None,
         model_meta: Optional[Dict[str, Any]] = None,
         gpu_profile: Optional[Dict[str, Any]] = None,
     ) -> ResearchReport:
@@ -251,6 +267,7 @@ class ResearchAgent:
             other_pct=trace.other_pct,
             top_kernels_table=top_kernels_table,
             winner_flags_json=json.dumps(winner_flags, indent=2),
+            stage2_strategy_json=json.dumps(stage2_strategy or {}, indent=2),
             architecture_json=json.dumps(model_meta or {}, indent=2),
             gpu_profile_json=json.dumps(gpu_profile or {}, indent=2),
         )
@@ -288,6 +305,10 @@ class ResearchAgent:
                     implementation=raw_rec.get("implementation", ""),
                     stage=raw_rec.get("stage", "stage3_flag"),
                     requires_custom_code=raw_rec.get("requires_custom_code", False),
+                    vllm_flags=(
+                        raw_rec.get("vllm_flags")
+                        or _parse_vllm_flags_from_impl(raw_rec.get("implementation", ""))
+                    ),
                 )
                 report.recommendations.append(rec)
 
@@ -326,7 +347,8 @@ class ResearchAgent:
                 confidence="high",
                 evidence="Published vLLM benchmarks show 10-25% throughput gain.",
                 implementation="--kv-cache-dtype fp8",
-                stage="stage2",
+                stage="stage3_flag",
+                vllm_flags={"kv_cache_dtype": "fp8"},
             ))
             rank += 1
 
@@ -340,7 +362,8 @@ class ResearchAgent:
                 confidence="medium",
                 evidence="FlashInfer benchmarks show 5-15% gain for GQA models.",
                 implementation="--attention-backend FLASHINFER",
-                stage="stage2",
+                stage="stage3_flag",
+                vllm_flags={"attention_backend": "FLASHINFER"},
             ))
             rank += 1
 
@@ -353,8 +376,9 @@ class ResearchAgent:
                 confidence="medium",
                 evidence="Profile shows attention at {:.0f}% of GPU time.".format(trace.attention_pct),
                 implementation="Profile with nvprof/rocprof to identify specific attention variant.",
-                stage="stage3_flag",
-                requires_custom_code=False,
+                stage="stage4_custom_kernel",
+                requires_custom_code=True,
+                vllm_flags={},
             ))
 
         report.recommendations = recs
@@ -363,3 +387,71 @@ class ResearchAgent:
             f"with attention={trace.attention_pct:.1f}% GEMM={trace.gemm_pct:.1f}%."
         )
         return report
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Mapping of CLI flag strings → (VLLMFlags field name, value)
+# Used as fallback when the LLM returns vllm_flags: {} but the implementation
+# string contains parseable flag names.
+_CLI_TO_FIELD: Dict[str, tuple] = {
+    "--kv-cache-dtype":           ("kv_cache_dtype",          str),
+    "--attention-backend":        ("attention_backend",        str),
+    "--enable-chunked-prefill":   ("enable_chunked_prefill",   lambda _: True),
+    "--enable-prefix-caching":    ("enable_prefix_caching",    lambda _: True),
+    "--prefix-caching-hash-algo": ("prefix_caching_hash_algo", str),
+    "--gpu-memory-utilization":   ("gpu_memory_utilization",   float),
+    "--max-num-batched-tokens":   ("max_num_batched_tokens",   int),
+    "--max-num-seqs":             ("max_num_seqs",             int),
+    "--block-size":               ("block_size",               int),
+    "--quantization":             ("quantization",             str),
+    "--dtype":                    ("dtype",                    str),
+    "--scheduler-delay-factor":   ("scheduler_delay_factor",   float),
+    "--enable-dbo":               ("enable_dbo",               lambda _: True),
+    "--enforce-eager":            ("enforce_eager",            lambda _: True),
+}
+
+
+def _parse_vllm_flags_from_impl(implementation: str) -> Dict[str, Any]:
+    """
+    Best-effort parse of vllm_flags from a CLI implementation string such as
+    "--kv-cache-dtype fp8 --attention-backend FLASHINFER".
+
+    Only extracts tokens that match known VLLMFlags field names. Returns {} when
+    nothing useful is found or when the string is too complex (e.g. contains
+    parentheses indicating conditional/explanatory text).
+    """
+    impl = implementation.strip()
+    # Skip complex or explanatory strings
+    if any(c in impl for c in ("(", ")", "|", "nsys", "profile", "python -m")):
+        return {}
+
+    tokens = impl.split()
+    result: Dict[str, Any] = {}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _CLI_TO_FIELD:
+            field_name, coerce = _CLI_TO_FIELD[tok]
+            # Value-less bool flags
+            if coerce.__name__ == "<lambda>" or coerce is bool:
+                try:
+                    result[field_name] = coerce("")
+                except Exception:
+                    result[field_name] = True
+                i += 1
+            else:
+                # Expect next token to be the value
+                if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                    try:
+                        result[field_name] = coerce(tokens[i + 1])
+                    except (ValueError, TypeError):
+                        pass
+                    i += 2
+                else:
+                    i += 1
+        else:
+            i += 1
+    return result

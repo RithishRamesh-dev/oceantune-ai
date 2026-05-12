@@ -212,6 +212,10 @@ class VLLMServer:
     # Docker image override — empty means use gpu_profiles.yaml default.
     # Can also be set via VLLM_IMAGE env var.
     docker_image: str = ""
+    # Extra docker run flags inserted before the image name (e.g. ["-v", "/host:/container"]).
+    extra_docker_args: List[str] = field(default_factory=list)
+    # Extra vLLM CLI args appended after the standard vllm_args (e.g. ["--profiler-config", "{...}"]).
+    extra_vllm_args: List[str] = field(default_factory=list)
 
     # Internal state — not part of __init__ signature
     _process: Optional[asyncio.subprocess.Process] = field(
@@ -559,19 +563,23 @@ class VLLMServer:
             if key not in skip:
                 cmd += ["-e", f"{key}={val}"]
 
+        # Extra docker args (e.g. volume mounts for profiler trace output)
+        cmd += self.extra_docker_args
+
         # Docker image
         cmd.append(docker_image)
 
         # vLLM server args (passed as container CMD to `vllm serve`)
         # model_id is a positional arg that MUST come first
         vllm_args = self.flags.to_vllm_args(model_id=self.model_id, gpu_type=self.gpu_type)
-        extra_vllm_args: List[str] = profile.get("vllm_extra_args", [])
+        profile_extra_vllm_args: List[str] = profile.get("vllm_extra_args", [])
         cmd += [
             self.model_id,          # positional: vllm serve <model>
             "--host", "0.0.0.0",
             "--port", str(self.port),
             *vllm_args,
-            *extra_vllm_args,
+            *profile_extra_vllm_args,
+            *self.extra_vllm_args,
         ]
 
         return cmd

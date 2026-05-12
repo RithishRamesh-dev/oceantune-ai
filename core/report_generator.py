@@ -69,6 +69,8 @@ class ReportGenerator:
         evolution_result=None,
         stage1_fitness: float = 0.0,
         stage2_fitness: float = 0.0,
+        stage3_fitness: float = 0.0,
+        stage3_applied_recs: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Path]:
         """
         Write all report artefacts and return a dict of {type: path}.
@@ -109,6 +111,8 @@ class ReportGenerator:
             evolution_result=evolution_result,
             stage1_fitness=stage1_fitness,
             stage2_fitness=stage2_fitness,
+            stage3_fitness=stage3_fitness,
+            stage3_applied_recs=stage3_applied_recs or [],
         )
 
         return {"yaml": yaml_path, "shell": shell_path, "markdown": md_path}
@@ -193,7 +197,14 @@ class ReportGenerator:
         gpu_type: str,
         docker_image: str,
     ) -> Path:
-        flags = analysis.winner_flags
+        # Merge Stage 1 winner flags with Stage 2/3 strategy overrides.
+        # best_kernel_config contains the additional flags set by Stage 2 (e.g.
+        # attention_backend, kv_cache_dtype) on top of the Stage 1 baseline.
+        known_vllm_fields = set(VLLMFlags.__dataclass_fields__)
+        flags = {
+            **analysis.winner_flags,
+            **{k: v for k, v in best_kernel_config.items() if k in known_vllm_fields},
+        }
 
         # Rebuild a VLLMFlags object to get the canonical CLI args
         try:
@@ -259,6 +270,8 @@ class ReportGenerator:
         evolution_result=None,
         stage1_fitness: float = 0.0,
         stage2_fitness: float = 0.0,
+        stage3_fitness: float = 0.0,
+        stage3_applied_recs: Optional[List[Dict[str, Any]]] = None,
     ) -> Path:
         top = analysis.top_configs[:5]
 
@@ -266,30 +279,52 @@ class ReportGenerator:
         winner_em = {}
         if top:
             winner_em = top[0].get("enriched_metrics") or top[0].get("raw_metrics") or {}
-        baseline_fitness = analysis.top_configs[-1].get("fitness_score", 0.0) if top else 0.0
         # Use the actual stage1 fitness passed in; fall back to winner fitness if not provided
         s1 = stage1_fitness or analysis.winner_fitness
         s2 = stage2_fitness or 0.0
-        s2_delta = s2 - s1 if s2 > 0 else 0.0
-        s2_delta_str = f"+{s2_delta:.4f} (+{s2_delta/s1*100:.1f}%)" if s1 > 0 and s2_delta > 0 else (
-            f"{s2_delta:.4f} ({s2_delta/s1*100:.1f}%)" if s1 > 0 and s2_delta < 0 else "—"
-        )
+        s3 = stage3_fitness or 0.0
+
+        def _delta_str(new: float, prev: float) -> str:
+            if prev <= 0 or new <= 0:
+                return "—"
+            delta = new - prev
+            pct = delta / prev * 100
+            sign = "+" if delta >= 0 else ""
+            return f"`{sign}{delta:.4f} ({sign}{pct:.1f}%)`"
+
+        s2_delta_str = _delta_str(s2, s1)
+        s3_prev = s2 if s2 > 0 else s1
+        s3_delta_str = _delta_str(s3, s3_prev)
         s4_speedup = evolution_result.best_speedup_pct if evolution_result else 0.0
+
+        throughput_str = (
+            str(winner_em.get("peak_throughput_tokens_per_sec", "—"))
+            if top else "—"
+        )
 
         stage_summary = (
             "## Pipeline Performance Summary\n\n"
             "| Stage | Fitness | Throughput (tok/s) | vs Previous |\n"
             "|-------|---------|---------------------|-------------|\n"
-            f"| Stage 1 — vLLM Config Search | `{s1:.4f}` | "
-            f"{winner_em.get('peak_throughput_tokens_per_sec', '—') if top else '—'} | baseline |\n"
+            f"| Stage 1 — vLLM Config Search | `{s1:.4f}` | {throughput_str} | baseline |\n"
         )
         if s2 > 0:
             stage_summary += (
-                f"| Stage 2 — Inference Strategy | `{s2:.4f}` | "
-                f"{'—'} | `{s2_delta_str}` |\n"
+                f"| Stage 2 — Inference Strategy | `{s2:.4f}` | — | {s2_delta_str} |\n"
             )
         else:
             stage_summary += "| Stage 2 — Inference Strategy | — | — | no improvement |\n"
+
+        # Stage 3: show per-flag-change detail if any were applied
+        if s3 > 0 and s3 != s3_prev:
+            n_recs = len(stage3_applied_recs) if stage3_applied_recs else 0
+            rec_note = f"{n_recs} flag change(s) accepted" if n_recs else "profiling only"
+            stage_summary += (
+                f"| Stage 3 — Profiling + Flag Trials | `{s3:.4f}` | — | {s3_delta_str} ({rec_note}) |\n"
+            )
+        else:
+            stage_summary += "| Stage 3 — Profiling + Flag Trials | — | — | no improvement |\n"
+
         if s4_speedup > 0:
             stage_summary += (
                 f"| Stage 4 — Kernel Engineering | — | — | `+{s4_speedup:.1f}%` kernel speedup |\n"
@@ -369,13 +404,39 @@ class ReportGenerator:
                     f"{research_report.custom_kernel_rationale}\n"
                 )
 
+            # Flag trials that were actually benchmarked and accepted
+            applied_section = ""
+            if stage3_applied_recs:
+                applied_rows = "".join(
+                    f"| {r['title']} | "
+                    f"`{', '.join(f'{k}={v}' for k, v in r['flags'].items())}` | "
+                    f"`{r['fitness_before']:.4f}` | "
+                    f"`{r['fitness_after']:.4f}` | "
+                    f"`+{r['delta']:.4f} (+{r['delta']/r['fitness_before']*100:.1f}%)` |\n"
+                    for r in stage3_applied_recs
+                )
+                applied_section = (
+                    "\n### Applied Flag Changes (Validated in Stage 3)\n\n"
+                    "The following recommendations were benchmarked and accepted "
+                    "because they improved fitness:\n\n"
+                    "| Recommendation | Flags Applied | Before | After | Δ |\n"
+                    "|----------------|---------------|--------|-------|---|\n"
+                    + applied_rows
+                )
+            elif s3 > 0:
+                applied_section = (
+                    "\n> **Stage 3 flag trials:** No recommendation improved "
+                    "fitness beyond the Stage 2 baseline.\n"
+                )
+
             stage3_section = (
                 "\n---\n\n## Stage 3 — Profiling & Research\n\n"
                 f"**Bottleneck type:** `{research_report.bottleneck_type}`\n\n"
                 f"{research_report.bottleneck_explanation}\n\n"
                 + (f"**Architecture notes:** {research_report.architecture_notes}\n\n"
                    if research_report.architecture_notes else "")
-                + "### Optimization Recommendations\n\n"
+                + applied_section
+                + "\n\n### All Optimization Recommendations\n\n"
                 + recs_table
                 + impl_details
                 + custom_kernel_note
