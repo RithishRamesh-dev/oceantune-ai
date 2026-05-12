@@ -127,13 +127,16 @@ class ControllerAgent:
             log.info("MongoDB session: %s", session_id)
 
             # ── Stage 1: vLLM Config Search ───────────────────────────────
-            winner_flags, _ = await self._stage1(session_id)
+            winner_flags, _, stage1_fitness = await self._stage1(session_id)
 
             # ── Stage 2: Inference Strategy Search ───────────────────────
             best_strategy = {}
             winner_metrics: dict = {}
+            stage2_fitness: float = 0.0
             if winner_flags:
-                best_strategy, winner_metrics = await self._stage2(session_id, winner_flags)
+                best_strategy, winner_metrics, stage2_fitness = await self._stage2(
+                    session_id, winner_flags
+                )
             else:
                 log.warning("Stage 1 produced no winner — skipping Stage 2 and Stage 3")
 
@@ -167,6 +170,8 @@ class ControllerAgent:
             await self._generate_report(
                 session_id, best_strategy, research_report,
                 evolution_result=evolution_result,
+                stage1_fitness=stage1_fitness,
+                stage2_fitness=stage2_fitness,
             )
             await self._db.update_session_status(session_id, "done")
             log.info("Pipeline complete: session=%s", session_id)
@@ -317,12 +322,16 @@ class ControllerAgent:
 
         if best_fitness == 0.0:
             log.warning("Stage 1: no successful benchmark runs")
-            return {}, ""
+            return {}, "", 0.0
 
         from dataclasses import asdict as _asdict
         log.info("Stage 1 complete: best_fitness=%.4f fingerprint=%s",
                  best_fitness, best_flags.fingerprint()[:8])
-        return {k: v for k, v in _asdict(best_flags).items() if k != "run_id"}, best_flags.fingerprint()
+        return (
+            {k: v for k, v in _asdict(best_flags).items() if k != "run_id"},
+            best_flags.fingerprint(),
+            best_fitness,
+        )
 
     # ------------------------------------------------------------------
     # Single config execution
@@ -483,15 +492,15 @@ class ControllerAgent:
             primary_metric=self.cfg.optimiser.primary_metric,
         )
 
-        best_strategy = await so.run(
+        best_strategy, stage2_fitness = await so.run(
             session_id=session_id,
             baseline_flags=winner_flags,
             baseline_metrics=winner_metrics,
             context_configs=list(self.cfg.context_configs),
             max_iterations=12,
         )
-        log.info("Stage 2 done: best_strategy=%s", best_strategy)
-        return best_strategy, winner_metrics
+        log.info("Stage 2 done: best_strategy=%s best_fitness=%.4f", best_strategy, stage2_fitness)
+        return best_strategy, winner_metrics, stage2_fitness
 
     # ------------------------------------------------------------------
     # Stage 3 — Deep Profiling + Bottleneck Reasoning
@@ -740,6 +749,8 @@ class ControllerAgent:
         best_strategy: dict,
         research_report=None,
         evolution_result=None,
+        stage1_fitness: float = 0.0,
+        stage2_fitness: float = 0.0,
     ) -> None:
         analyst = AnalystAgent(do_client=self._do_client, db=self._db)
         analysis = await analyst.analyse(
@@ -759,5 +770,7 @@ class ControllerAgent:
             session_id=session_id,
             research_report=research_report,
             evolution_result=evolution_result,
+            stage1_fitness=stage1_fitness,
+            stage2_fitness=stage2_fitness,
         )
         log.info("Reports written: %s", {k: str(v) for k, v in paths.items()})

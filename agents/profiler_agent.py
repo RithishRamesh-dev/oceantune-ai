@@ -211,15 +211,25 @@ class ProfilerAgent:
         trace_dir = _REPO_ROOT / "storage" / "profiles" / session_id
         trace_dir.mkdir(parents=True, exist_ok=True)
 
-        # Enable vLLM's detailed trace collection
+        # Enable vLLM's detailed trace collection.
+        # VLLM_TORCH_PROFILER_DIR tells vLLM where to write Chrome trace JSON.
+        # --collect-detailed-traces activates the PyTorch profiler inside vLLM
+        # (required for newer vLLM versions; older versions use the env var alone).
         profile_env = {
             **device_env,
             "VLLM_TORCH_PROFILER_DIR": str(trace_dir),
         }
 
+        # Add --collect-detailed-traces to the flags so vLLM starts the profiler
+        from dataclasses import asdict
+        flags_dict = asdict(flags)
+        flags_dict["collect_detailed_traces"] = "worker"  # vLLM >= 0.5: enables torch profiler
+        known_fields = set(VLLMFlags.__dataclass_fields__.keys())
+        profile_flags = VLLMFlags(**{k: v for k, v in flags_dict.items() if k in known_fields})
+
         server = VLLMServer(
             model_id=self._model_id,
-            flags=flags,
+            flags=profile_flags,
             gpu_type=self._gpu_type,
             port=port,
             startup_timeout=self._startup_timeout_sec,
@@ -316,21 +326,38 @@ class ProfilerAgent:
         )
         await engine.run()
 
-        # Stop profiler
+        # Stop profiler — vLLM >= 0.4 supports /stop_profile; older versions don't.
+        # A 404 is normal for older vLLM — ignore it.
         async with httpx.AsyncClient(timeout=30.0) as client:
             try:
-                await client.post(f"{base_url}/stop_profile")
-                log.info("ProfilerAgent: profiler stopped")
+                resp = await client.post(f"{base_url}/stop_profile")
+                if resp.status_code == 200:
+                    log.info("ProfilerAgent: profiler stopped via /stop_profile")
+                else:
+                    log.info(
+                        "ProfilerAgent: /stop_profile returned %d — "
+                        "using VLLM_TORCH_PROFILER_DIR env-based profiling",
+                        resp.status_code,
+                    )
             except Exception:
-                pass
+                log.info("ProfilerAgent: /stop_profile not available — env-based profiling")
 
-        # Wait for trace file to be written
-        await asyncio.sleep(5.0)
+        # Wait for vLLM to flush the trace file to disk.
+        # The flush can take several seconds after stop_profile returns.
+        for wait_s in [3, 5, 10]:
+            await asyncio.sleep(wait_s)
+            trace_files = (
+                list(trace_dir.glob("*.json"))
+                + list(trace_dir.glob("*.pt.trace.json"))
+                + list(trace_dir.rglob("*.json"))   # vLLM may write into a subdirectory
+            )
+            # Exclude empty files
+            trace_files = [p for p in trace_files if p.stat().st_size > 100]
+            if trace_files:
+                break
 
-        # Find trace files
-        trace_files = list(trace_dir.glob("*.json")) + list(trace_dir.glob("*.pt.trace.json"))
         if not trace_files:
-            log.warning("ProfilerAgent: no trace files found in %s", trace_dir)
+            log.warning("ProfilerAgent: no trace files found in %s after waiting", trace_dir)
             return None
 
         # Parse the most recent trace file
@@ -430,13 +457,18 @@ class ProfilerAgent:
     def _fallback_trace_from_logs(
         self,
         trace: ProfileTrace,
-        log_tail: str,
+        log_tail,
     ) -> ProfileTrace:
         """
         Infer bottleneck from vLLM logs when profiler trace is unavailable.
         Uses heuristics from log patterns.
         """
-        log_lower = log_tail.lower()
+        # log_tail may be a List[str] or a str — normalise to str
+        if isinstance(log_tail, list):
+            log_str = "\n".join(log_tail)
+        else:
+            log_str = str(log_tail)
+        log_lower = log_str.lower()
         if "kv cache" in log_lower and "full" in log_lower:
             trace.bottleneck_type = "memory_capacity"
         elif "cuda out of memory" in log_lower:

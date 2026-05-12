@@ -67,6 +67,8 @@ class ReportGenerator:
         docker_image: str = "vllm/vllm-openai:latest",
         research_report=None,
         evolution_result=None,
+        stage1_fitness: float = 0.0,
+        stage2_fitness: float = 0.0,
     ) -> Dict[str, Path]:
         """
         Write all report artefacts and return a dict of {type: path}.
@@ -105,6 +107,8 @@ class ReportGenerator:
             session_id=session_id,
             research_report=research_report,
             evolution_result=evolution_result,
+            stage1_fitness=stage1_fitness,
+            stage2_fitness=stage2_fitness,
         )
 
         return {"yaml": yaml_path, "shell": shell_path, "markdown": md_path}
@@ -253,8 +257,44 @@ class ReportGenerator:
         session_id: str,
         research_report=None,
         evolution_result=None,
+        stage1_fitness: float = 0.0,
+        stage2_fitness: float = 0.0,
     ) -> Path:
         top = analysis.top_configs[:5]
+
+        # Per-stage improvement summary
+        winner_em = {}
+        if top:
+            winner_em = top[0].get("enriched_metrics") or top[0].get("raw_metrics") or {}
+        baseline_fitness = analysis.top_configs[-1].get("fitness_score", 0.0) if top else 0.0
+        # Use the actual stage1 fitness passed in; fall back to winner fitness if not provided
+        s1 = stage1_fitness or analysis.winner_fitness
+        s2 = stage2_fitness or 0.0
+        s2_delta = s2 - s1 if s2 > 0 else 0.0
+        s2_delta_str = f"+{s2_delta:.4f} (+{s2_delta/s1*100:.1f}%)" if s1 > 0 and s2_delta > 0 else (
+            f"{s2_delta:.4f} ({s2_delta/s1*100:.1f}%)" if s1 > 0 and s2_delta < 0 else "—"
+        )
+        s4_speedup = evolution_result.best_speedup_pct if evolution_result else 0.0
+
+        stage_summary = (
+            "## Pipeline Performance Summary\n\n"
+            "| Stage | Fitness | Throughput (tok/s) | vs Previous |\n"
+            "|-------|---------|---------------------|-------------|\n"
+            f"| Stage 1 — vLLM Config Search | `{s1:.4f}` | "
+            f"{winner_em.get('peak_throughput_tokens_per_sec', '—') if top else '—'} | baseline |\n"
+        )
+        if s2 > 0:
+            stage_summary += (
+                f"| Stage 2 — Inference Strategy | `{s2:.4f}` | "
+                f"{'—'} | `{s2_delta_str}` |\n"
+            )
+        else:
+            stage_summary += "| Stage 2 — Inference Strategy | — | — | no improvement |\n"
+        if s4_speedup > 0:
+            stage_summary += (
+                f"| Stage 4 — Kernel Engineering | — | — | `+{s4_speedup:.1f}%` kernel speedup |\n"
+            )
+        stage_summary += "\n"
 
         top_table = "| Rank | Fingerprint | Fitness | Throughput (tok/s) | P95 Latency (ms) |\n"
         top_table += "|------|-------------|---------|---------------------|------------------|\n"
@@ -276,9 +316,16 @@ class ReportGenerator:
                 for k, v in best_kernel_config.items()
                 if not k.startswith("_")
             )
+            s2_header = ""
+            if s2 > 0 and s1 > 0:
+                s2_header = (
+                    f"**Fitness:** `{s1:.4f}` → `{s2:.4f}` "
+                    f"(`{s2_delta_str}` improvement over Stage 1)\n\n"
+                )
             stage2_section = (
                 "\n---\n\n## Stage 2 — Inference Strategy\n\n"
-                "Best strategy found on top of the Stage 1 winner:\n\n"
+                + s2_header
+                + "Best strategy found on top of the Stage 1 winner:\n\n"
                 "| Parameter | Value |\n"
                 "|-----------|-------|\n"
                 + (rows if rows else "| (no improvement over baseline) | — |\n")
@@ -387,6 +434,8 @@ class ReportGenerator:
             f"**GPU:** `{gpu_type}`  \n"
             f"**Generated:** {datetime.now(timezone.utc).isoformat()}\n\n"
             "---\n\n"
+            + stage_summary
+            + "---\n\n"
             "## Stage 1 Winner Configuration\n\n"
             f"**Fingerprint:** `{analysis.winner_fingerprint[:16]}`  \n"
             f"**Fitness Score:** `{analysis.winner_fitness:.4f}`\n\n"

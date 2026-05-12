@@ -276,7 +276,7 @@ class StrategyOptimizerAgent:
             "Stage 2 done: best_fitness=%.4f improvement=%+.4f category=%s config=%s",
             best_fitness, improvement, best_category, best_config,
         )
-        return best_config
+        return best_config, best_fitness
 
     # ------------------------------------------------------------------
     # LLM proposal
