@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -142,16 +143,30 @@ Respond with a JSON object:
       "implementation": "<exact flag, env var, or code change>",
       "stage": "stage2|stage3_flag|stage4_custom_kernel",
       "requires_custom_code": false,
-      "vllm_flags": {"<vllm_flag_field_name>": <value>}
+      "vllm_flags": {"attention_backend": "FLASHINFER"}
     }
-
-  For "vllm_flags": use VLLMFlags Python field names (snake_case, e.g. "enable_chunked_prefill", "kv_cache_dtype",
-  "enable_prefix_caching", "attention_backend", "gpu_memory_utilization", "max_num_seqs", etc.).
-  Only include vllm_flags for stage2/stage3_flag recommendations. For stage4_custom_kernel, set vllm_flags to {}.
   ],
   "custom_kernel_warranted": false,
   "custom_kernel_rationale": "<if true, explain what custom kernel to write and expected gain>"
 }
+
+CRITICAL RULES FOR "vllm_flags":
+- For stage2 and stage3_flag recommendations you MUST populate vllm_flags with the
+  exact machine-readable dict needed to apply the change. An EMPTY vllm_flags ({})
+  means the recommendation will be SILENTLY SKIPPED and never benchmarked.
+- Use VLLMFlags Python field names (snake_case): "attention_backend", "kv_cache_dtype",
+  "enable_prefix_caching", "enable_chunked_prefill", "max_num_batched_tokens",
+  "max_num_seqs", "gpu_memory_utilization", "block_size", "scheduler_delay_factor",
+  "num_scheduler_steps", "quantization", "dtype", "enforce_eager", etc.
+- Examples:
+    FlashInfer backend:      {"attention_backend": "FLASHINFER"}
+    FP8 KV cache:            {"kv_cache_dtype": "fp8"}
+    Prefix caching:          {"enable_prefix_caching": true}
+    More sequences:          {"max_num_seqs": 512}
+    More batched tokens:     {"max_num_batched_tokens": 32768}
+    Smaller block size:      {"block_size": 16}
+    Multi-step scheduling:   {"num_scheduler_steps": 8, "scheduler_delay_factor": 0.1}
+- For stage4_custom_kernel set vllm_flags to {} (no flag change possible).
 
 Do not include any text outside the JSON object.
 """
@@ -162,17 +177,24 @@ GPU: {gpu_type} ({vendor})
 
 === PROFILER RESULTS ===
 
+NOTE: The profiling run used enforce_eager=True to disable CUDA graph capture.
+This makes individual kernels (attention, GEMM, norm, rope) visible in the trace.
+The production run uses CUDA graphs (enforce_eager=False) which are faster — the
+kernel timings below reflect eager-mode proportions; relative ratios still indicate
+the real bottleneck.
+
 Bottleneck type: {bottleneck_type}
 Top bottleneck kernel: {bottleneck_kernel}
 
 Kernel timing breakdown:
-  Attention:         {attention_pct:.1f}% of GPU time
+  Attention:          {attention_pct:.1f}% of GPU time
   GEMM (projections): {gemm_pct:.1f}%
   MoE routing:        {moe_pct:.1f}%
   RoPE:               {rope_pct:.1f}%
   Normalization:      {norm_pct:.1f}%
   Communication:      {comm_pct:.1f}%
   Other:              {other_pct:.1f}%
+  Python overhead:    {python_overhead_pct:.1f}% (est. CPU scheduling idle time)
 
 Top 10 kernels by GPU time:
 {top_kernels_table}
@@ -193,6 +215,7 @@ that Stage 3 can immediately benchmark it.
 {gpu_profile_json}
 
 Based on this profile, provide optimization recommendations for flags NOT yet applied.
+REMEMBER: vllm_flags MUST be populated for every stage2/stage3_flag recommendation.
 """
 
 
@@ -265,6 +288,7 @@ class ResearchAgent:
             norm_pct=trace.norm_pct,
             comm_pct=trace.comm_pct,
             other_pct=trace.other_pct,
+            python_overhead_pct=trace.python_overhead_pct,
             top_kernels_table=top_kernels_table,
             winner_flags_json=json.dumps(winner_flags, indent=2),
             stage2_strategy_json=json.dumps(stage2_strategy or {}, indent=2),
@@ -415,42 +439,126 @@ _CLI_TO_FIELD: Dict[str, tuple] = {
 
 def _parse_vllm_flags_from_impl(implementation: str) -> Dict[str, Any]:
     """
-    Best-effort parse of vllm_flags from a CLI implementation string such as
-    "--kv-cache-dtype fp8 --attention-backend FLASHINFER".
+    Best-effort parse of vllm_flags from an implementation string.
 
-    Only extracts tokens that match known VLLMFlags field names. Returns {} when
-    nothing useful is found or when the string is too complex (e.g. contains
-    parentheses indicating conditional/explanatory text).
+    Handles two formats that the LLM commonly produces:
+
+    1. CLI format:   "--kv-cache-dtype fp8 --attention-backend FLASHINFER"
+    2. Assignment:   "attention_backend='FLASHINFER'" / "kv_cache_dtype='fp8'"
+                     "max_num_seqs=512" / "enable_prefix_caching=True"
+
+    Returns {} when nothing useful is found or the string is too complex.
     """
-    impl = implementation.strip()
-    # Skip complex or explanatory strings
-    if any(c in impl for c in ("(", ")", "|", "nsys", "profile", "python -m")):
-        return {}
-
-    tokens = impl.split()
     result: Dict[str, Any] = {}
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok in _CLI_TO_FIELD:
-            field_name, coerce = _CLI_TO_FIELD[tok]
-            # Value-less bool flags
-            if coerce.__name__ == "<lambda>" or coerce is bool:
-                try:
-                    result[field_name] = coerce("")
-                except Exception:
+
+    # ------------------------------------------------------------------
+    # Pass 1: CLI format  (--flag-name value)
+    # ------------------------------------------------------------------
+    cli_skip = {"nsys", "profile", "python -m"}
+    if not any(s in implementation for s in cli_skip):
+        tokens = implementation.split()
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok in _CLI_TO_FIELD:
+                field_name, coerce = _CLI_TO_FIELD[tok]
+                if coerce.__name__ == "<lambda>":
                     result[field_name] = True
-                i += 1
-            else:
-                # Expect next token to be the value
-                if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
-                    try:
-                        result[field_name] = coerce(tokens[i + 1])
-                    except (ValueError, TypeError):
-                        pass
-                    i += 2
-                else:
                     i += 1
-        else:
-            i += 1
+                else:
+                    if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                        try:
+                            result[field_name] = coerce(tokens[i + 1])
+                        except (ValueError, TypeError):
+                            pass
+                        i += 2
+                    else:
+                        i += 1
+            else:
+                i += 1
+
+    # ------------------------------------------------------------------
+    # Pass 2: assignment / description format  (key=value or key='value')
+    # Only runs for fields not already found in pass 1.
+    # ------------------------------------------------------------------
+    for pattern, extractor in _ASSIGN_PATTERNS:
+        m = pattern.search(implementation)
+        if m:
+            try:
+                partial = extractor(m)
+                for k, v in partial.items():
+                    result.setdefault(k, v)   # don't override CLI-parsed values
+            except Exception:
+                pass
+
     return result
+
+
+# ---------------------------------------------------------------------------
+# Regex patterns for assignment-format implementation strings
+# ---------------------------------------------------------------------------
+
+def _first_int(m: re.Match) -> Dict[str, Any]:
+    """Return the first captured integer group."""
+    field_name = m.lastgroup or ""
+    # The named group is the field_name; group(1) is the value
+    return {field_name: int(m.group(1))}
+
+
+_ASSIGN_PATTERNS: List[tuple] = [
+    # attention_backend='flashinfer' / attention_backend=FLASHINFER / VLLM_ATTENTION_BACKEND=FLASHINFER
+    (
+        re.compile(r"(?:attention[_-]backend|VLLM_ATTENTION_BACKEND)\s*[=:]\s*['\"]?(FLASHINFER|flashinfer|AUTO|auto|FLASH_ATTN|flash_attn)['\"]?", re.I),
+        lambda m: {"attention_backend": m.group(1).upper()},
+    ),
+    # kv_cache_dtype='fp8' / kv_cache_dtype='fp8_e4m3'
+    (
+        re.compile(r"kv[_-]cache[_-]dtype\s*[=:]\s*['\"]?(fp8_e4m3|fp8_e5m2|fp8|auto)['\"]?", re.I),
+        lambda m: {"kv_cache_dtype": m.group(1).lower()},
+    ),
+    # enable_prefix_caching=True
+    (
+        re.compile(r"enable[_-]prefix[_-]caching\s*[=:]\s*(true|True|1|yes)", re.I),
+        lambda _: {"enable_prefix_caching": True},
+    ),
+    # enable_chunked_prefill=True
+    (
+        re.compile(r"enable[_-]chunked[_-]prefill\s*[=:]\s*(true|True|1|yes)", re.I),
+        lambda _: {"enable_chunked_prefill": True},
+    ),
+    # max_num_seqs=512  (take first number found)
+    (
+        re.compile(r"max[_-]num[_-]seqs\s*[=:]\s*(\d+)"),
+        lambda m: {"max_num_seqs": int(m.group(1))},
+    ),
+    # max_num_batched_tokens=16384
+    (
+        re.compile(r"max[_-]num[_-]batched[_-]tokens\s*[=:]\s*(\d+)"),
+        lambda m: {"max_num_batched_tokens": int(m.group(1))},
+    ),
+    # block_size=16
+    (
+        re.compile(r"block[_-]size\s*[=:]\s*(\d+)"),
+        lambda m: {"block_size": int(m.group(1))},
+    ),
+    # gpu_memory_utilization=0.95
+    (
+        re.compile(r"gpu[_-]memory[_-]util(?:ization)?\s*[=:]\s*(0?\.\d+|1\.0)"),
+        lambda m: {"gpu_memory_utilization": float(m.group(1))},
+    ),
+    # scheduler_delay_factor=0.1
+    (
+        re.compile(r"scheduler[_-]delay[_-]factor\s*[=:]\s*(0?\.\d+)"),
+        lambda m: {"scheduler_delay_factor": float(m.group(1))},
+    ),
+    # num_scheduler_steps=4
+    (
+        re.compile(r"num[_-]scheduler[_-]steps\s*[=:]\s*(\d+)"),
+        lambda m: {"num_scheduler_steps": int(m.group(1))},
+    ),
+    # enforce_eager=True
+    (
+        re.compile(r"enforce[_-]eager\s*[=:]\s*(true|True|1|yes)", re.I),
+        lambda _: {"enforce_eager": True},
+    ),
+]

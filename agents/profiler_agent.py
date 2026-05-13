@@ -190,8 +190,18 @@ class ProfilerAgent:
             output_len=output_len,
         )
 
+        import dataclasses as _dc
         known_fields = set(VLLMFlags.__dataclass_fields__.keys())
         flags = VLLMFlags(**{k: v for k, v in winner_flags.items() if k in known_fields})
+
+        # Disable CUDA graphs for the profiling run.
+        # When enforce_eager=False (the default), vLLM replays decode via a CUDA graph,
+        # which appears in the trace as a single monolithic "execute_context" node that
+        # hides all the real kernel names inside it.  enforce_eager=True forces eager
+        # execution so every kernel launch is individually visible in the trace, giving
+        # accurate attention/GEMM/norm/rope breakdowns.
+        flags = _dc.replace(flags, enforce_eager=True)
+
         tp_size = flags.tensor_parallel_size or 1
 
         slot = await self._gpu_alloc.acquire(tp_size)
