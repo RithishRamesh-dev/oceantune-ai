@@ -148,6 +148,7 @@ class ControllerAgent:
             evolution_result = None
             stage3_fitness: float = stage2_fitness
             applied_recs: list = []
+            all_tried_recs: list = []
             stage3_flags = winner_flags  # may be updated by Stage 3 flag trials
             if winner_flags:
                 (
@@ -156,6 +157,7 @@ class ControllerAgent:
                     kernel_research,
                     stage3_fitness,
                     applied_recs,
+                    all_tried_recs,
                     stage3_flags,
                 ) = await self._stage3(
                     session_id, winner_flags, winner_metrics,
@@ -186,6 +188,7 @@ class ControllerAgent:
                 stage2_fitness=stage2_fitness,
                 stage3_fitness=stage3_fitness,
                 stage3_applied_recs=applied_recs,
+                stage3_all_tried_recs=all_tried_recs,
             )
             await self._db.update_session_status(session_id, "done")
             log.info("Pipeline complete: session=%s", session_id)
@@ -642,7 +645,7 @@ class ControllerAgent:
         # rather than deferring to a later stage.  Only recommendations that
         # actually improve fitness are kept; winner_flags is updated in-place
         # so subsequent steps (kernel research, Stage 4) see the best config.
-        updated_flags, stage3_fitness, applied_recs = await self._try_flag_recommendations(
+        updated_flags, stage3_fitness, applied_recs, all_tried_recs = await self._try_flag_recommendations(
             session_id=session_id,
             winner_flags=winner_flags,
             research_report=research_report,
@@ -686,6 +689,7 @@ class ControllerAgent:
             kernel_research,
             stage3_fitness,
             applied_recs,
+            all_tried_recs,
             updated_flags,
         )
 
@@ -748,45 +752,75 @@ class ControllerAgent:
         winner_flags: Dict[str, Any],
         research_report,
         current_fitness: float,
-    ) -> Tuple[Dict[str, Any], float, List[Dict[str, Any]]]:
+    ) -> Tuple[Dict[str, Any], float, List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         For each stage3_flag recommendation with a non-empty vllm_flags dict,
         benchmark the flag change on its own and keep it if fitness improves.
 
         Returns
         -------
-        (updated_flags, final_fitness, applied_list)
-        applied_list: list of dicts with keys title, flags, fitness_before, fitness_after, delta
+        (updated_flags, final_fitness, accepted_list, all_tried_list)
+
+        accepted_list: recommendations that improved fitness
+          keys: title, flags, fitness_before, fitness_after, delta
+
+        all_tried_list: EVERY recommendation with its actual benchmark outcome
+          keys: title, flags, estimated_improvement_pct, confidence,
+                status ("accepted" | "rejected" | "skipped" | "not_tried"),
+                fitness_before, fitness_after, actual_delta, actual_delta_pct
         """
         from dataclasses import asdict
 
-        applied: List[Dict[str, Any]] = []
+        accepted: List[Dict[str, Any]] = []
+        all_tried: List[Dict[str, Any]] = []
         current_flags: Dict[str, Any] = dict(winner_flags)
-
-        # Only try recommendations that are flag-based (not custom code) and
-        # whose vllm_flags values differ from what is already in winner_flags
-        # (avoids re-benchmarking flags Stage 2 already applied).
-        flag_recs = [
-            r for r in research_report.recommendations
-            if r.stage in ("stage3_flag", "stage2")
-            and not r.requires_custom_code
-            and r.vllm_flags
-            and any(
-                winner_flags.get(k) != v
-                for k, v in r.vllm_flags.items()
-            )
-        ]
-        if not flag_recs:
-            log.info("Stage 3: no actionable flag recommendations to try")
-            return current_flags, current_fitness, applied
-
-        log.info("Stage 3: trying %d flag recommendation(s)...", len(flag_recs))
 
         known_fields = set(VLLMFlags.__dataclass_fields__)
         context_configs = list(self.cfg.context_configs)
 
-        for rec in flag_recs:
-            # Merge recommended flags into current best
+        for rec in research_report.recommendations:
+            base_record: Dict[str, Any] = {
+                "rank": rec.rank,
+                "title": rec.title,
+                "category": rec.category,
+                "stage": rec.stage,
+                "flags": rec.vllm_flags,
+                "estimated_improvement_pct": rec.expected_improvement_pct,
+                "confidence": rec.confidence,
+                "fitness_before": current_fitness,
+                "fitness_after": None,
+                "actual_delta": None,
+                "actual_delta_pct": None,
+                "status": "not_tried",
+                "skip_reason": "",
+            }
+
+            # Only try flag-based recs that have machine-readable flags and differ from current
+            if rec.stage not in ("stage3_flag", "stage2"):
+                base_record["skip_reason"] = f"stage={rec.stage} (requires kernel/custom code work)"
+                all_tried.append(base_record)
+                continue
+
+            if rec.requires_custom_code:
+                base_record["skip_reason"] = "requires_custom_code=True"
+                all_tried.append(base_record)
+                continue
+
+            if not rec.vllm_flags:
+                base_record["skip_reason"] = "vllm_flags empty — LLM did not provide machine-readable flags"
+                all_tried.append(base_record)
+                continue
+
+            already_applied = not any(
+                winner_flags.get(k) != v for k, v in rec.vllm_flags.items()
+            )
+            if already_applied:
+                base_record["status"] = "skipped"
+                base_record["skip_reason"] = "flags already applied in Stage 1/2"
+                all_tried.append(base_record)
+                continue
+
+            # --- Actually benchmark this recommendation ---
             trial_raw = {**current_flags, **rec.vllm_flags}
             trial_clean = {k: v for k, v in trial_raw.items() if k in known_fields}
             trial_flags = VLLMFlags(**trial_clean)
@@ -799,7 +833,11 @@ class ControllerAgent:
                 priority=-1,
             )
             if config_id is None:
-                log.info("Stage 3: rec '%s' already benchmarked, skipping", rec.title)
+                # Already benchmarked in a prior run — look up cached result
+                log.info("Stage 3: rec '%s' already benchmarked (cached)", rec.title)
+                base_record["status"] = "skipped"
+                base_record["skip_reason"] = "config fingerprint already benchmarked in this session"
+                all_tried.append(base_record)
                 continue
 
             await self._run_single(
@@ -810,15 +848,20 @@ class ControllerAgent:
 
             config_doc = await self._db.get_config_by_id(config_id)
             fitness = config_doc.get("fitness_score", 0.0) if config_doc else 0.0
+            delta = fitness - current_fitness
+            delta_pct = (delta / current_fitness * 100) if current_fitness else 0.0
+
+            base_record["fitness_after"] = fitness
+            base_record["actual_delta"] = delta
+            base_record["actual_delta_pct"] = delta_pct
 
             if fitness > current_fitness:
-                delta = fitness - current_fitness
+                base_record["status"] = "accepted"
                 log.info(
                     "Stage 3 rec '%s' ACCEPTED: %.4f → %.4f (+%.4f, +%.1f%%)",
-                    rec.title, current_fitness, fitness,
-                    delta, (delta / current_fitness * 100) if current_fitness else 0.0,
+                    rec.title, current_fitness, fitness, delta, delta_pct,
                 )
-                applied.append({
+                accepted.append({
                     "title": rec.title,
                     "flags": rec.vllm_flags,
                     "fitness_before": current_fitness,
@@ -828,12 +871,23 @@ class ControllerAgent:
                 current_flags = {k: v for k, v in asdict(trial_flags).items() if k != "run_id"}
                 current_fitness = fitness
             else:
+                base_record["status"] = "rejected"
                 log.info(
-                    "Stage 3 rec '%s' rejected: %.4f → %.4f",
-                    rec.title, current_fitness, fitness,
+                    "Stage 3 rec '%s' REJECTED: %.4f → %.4f (%.4f, %.1f%%)",
+                    rec.title, current_fitness, fitness, delta, delta_pct,
                 )
 
-        return current_flags, current_fitness, applied
+            all_tried.append(base_record)
+
+        n_tried = sum(1 for r in all_tried if r["status"] in ("accepted", "rejected"))
+        n_accepted = len(accepted)
+        log.info(
+            "Stage 3 flag trials: %d benchmarked, %d accepted, %d rejected, %d skipped/not-tried",
+            n_tried, n_accepted,
+            sum(1 for r in all_tried if r["status"] == "rejected"),
+            sum(1 for r in all_tried if r["status"] in ("skipped", "not_tried")),
+        )
+        return current_flags, current_fitness, accepted, all_tried
 
     # ------------------------------------------------------------------
     # Stage 4 — Autonomous Kernel Engineering
@@ -901,6 +955,7 @@ class ControllerAgent:
         stage2_fitness: float = 0.0,
         stage3_fitness: float = 0.0,
         stage3_applied_recs: Optional[List] = None,
+        stage3_all_tried_recs: Optional[List] = None,
     ) -> None:
         analyst = AnalystAgent(do_client=self._do_client, db=self._db)
         analysis = await analyst.analyse(
@@ -924,5 +979,6 @@ class ControllerAgent:
             stage2_fitness=stage2_fitness,
             stage3_fitness=stage3_fitness,
             stage3_applied_recs=stage3_applied_recs or [],
+            stage3_all_tried_recs=stage3_all_tried_recs or [],
         )
         log.info("Reports written: %s", {k: str(v) for k, v in paths.items()})

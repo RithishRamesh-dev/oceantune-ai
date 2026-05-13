@@ -164,8 +164,8 @@ optimiser:
 #   - For ncu hardware counters: NVIDIA Nsight Compute must be in PATH
 #   - For rocprof/omniperf counters: ROCm tools must be in PATH
 #
-stage4_enabled: false        # set to true to enable kernel generation
-stage4_iterations: 3         # number of evolution rounds (generate→validate→keep/revert)
+stage4_enabled: true         # set to false to skip kernel generation
+stage4_iterations: 5         # number of evolution rounds (generate→validate→keep/revert)
 
 # ── Context-Length Evaluation Matrix ─────────────────────────────────────────
 # Each [input_tokens, output_tokens] pair → separate optimisation recipe.

@@ -71,6 +71,7 @@ class ReportGenerator:
         stage2_fitness: float = 0.0,
         stage3_fitness: float = 0.0,
         stage3_applied_recs: Optional[List[Dict[str, Any]]] = None,
+        stage3_all_tried_recs: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Path]:
         """
         Write all report artefacts and return a dict of {type: path}.
@@ -113,6 +114,7 @@ class ReportGenerator:
             stage2_fitness=stage2_fitness,
             stage3_fitness=stage3_fitness,
             stage3_applied_recs=stage3_applied_recs or [],
+            stage3_all_tried_recs=stage3_all_tried_recs or [],
         )
 
         return {"yaml": yaml_path, "shell": shell_path, "markdown": md_path}
@@ -272,6 +274,7 @@ class ReportGenerator:
         stage2_fitness: float = 0.0,
         stage3_fitness: float = 0.0,
         stage3_applied_recs: Optional[List[Dict[str, Any]]] = None,
+        stage3_all_tried_recs: Optional[List[Dict[str, Any]]] = None,
     ) -> Path:
         top = analysis.top_configs[:5]
 
@@ -375,18 +378,87 @@ class ReportGenerator:
         # Stage 3 section
         stage3_section = ""
         if research_report is not None:
-            recs_table = (
-                "| Rank | Title | Category | Est. Gain | Confidence | Stage |\n"
-                "|------|-------|----------|-----------|------------|-------|\n"
-            )
-            for rec in research_report.recommendations:
-                recs_table += (
-                    f"| {rec.rank} | {rec.title} | `{rec.category}` | "
-                    f"+{rec.expected_improvement_pct:.0f}% | {rec.confidence} | `{rec.stage}` |\n"
+            custom_kernel_note = ""
+            if research_report.custom_kernel_warranted:
+                custom_kernel_note = (
+                    f"\n> **Stage 4 Custom Kernel warranted:** "
+                    f"{research_report.custom_kernel_rationale}\n"
                 )
 
+            # ------------------------------------------------------------------
+            # Build the main recommendations table with actual benchmark results.
+            # For recommendations that were benchmarked we show real numbers;
+            # for skipped/not-tried ones we explain why.
+            # ------------------------------------------------------------------
+            tried_by_rank: Dict[int, Dict[str, Any]] = {}
+            for t in (stage3_all_tried_recs or []):
+                tried_by_rank[t.get("rank", 0)] = t
+
+            recs_table = (
+                "| Rank | Title | Est. Gain | Confidence | Benchmarked | "
+                "Actual Δ Fitness | Actual Δ% | Result |\n"
+                "|------|-------|-----------|------------|-------------|"
+                "-----------------|-----------|--------|\n"
+            )
+            for rec in research_report.recommendations:
+                tried = tried_by_rank.get(rec.rank)
+                if tried and tried["status"] in ("accepted", "rejected"):
+                    f_before = tried.get("fitness_before", 0.0) or 0.0
+                    f_after = tried.get("fitness_after", 0.0) or 0.0
+                    delta = tried.get("actual_delta", 0.0) or 0.0
+                    delta_pct = tried.get("actual_delta_pct", 0.0) or 0.0
+                    sign = "+" if delta >= 0 else ""
+                    result_icon = "✅ accepted" if tried["status"] == "accepted" else "❌ rejected"
+                    recs_table += (
+                        f"| {rec.rank} | {rec.title} | "
+                        f"+{rec.expected_improvement_pct:.0f}% | {rec.confidence} | "
+                        f"Yes (`{f_before:.4f}`→`{f_after:.4f}`) | "
+                        f"`{sign}{delta:.4f}` | `{sign}{delta_pct:.1f}%` | {result_icon} |\n"
+                    )
+                elif tried and tried["status"] == "skipped":
+                    reason = tried.get("skip_reason", "")[:60]
+                    recs_table += (
+                        f"| {rec.rank} | {rec.title} | "
+                        f"+{rec.expected_improvement_pct:.0f}% | {rec.confidence} | "
+                        f"Skipped | — | — | ⏭ {reason} |\n"
+                    )
+                else:
+                    # not_tried (custom code / stage4 / no vllm_flags)
+                    reason = (tried or {}).get("skip_reason", rec.stage)[:60]
+                    recs_table += (
+                        f"| {rec.rank} | {rec.title} | "
+                        f"+{rec.expected_improvement_pct:.0f}% | {rec.confidence} | "
+                        f"No | — | — | 🔬 {reason} |\n"
+                    )
+
+            # Detailed implementation cards (top 5 benchmarked recs only)
             impl_details = ""
-            for rec in research_report.recommendations[:5]:
+            shown = 0
+            for rec in research_report.recommendations:
+                if shown >= 5:
+                    break
+                tried = tried_by_rank.get(rec.rank)
+                status = (tried or {}).get("status", "not_tried")
+
+                result_line = ""
+                if status in ("accepted", "rejected") and tried:
+                    f_before = tried.get("fitness_before", 0.0) or 0.0
+                    f_after = tried.get("fitness_after", 0.0) or 0.0
+                    delta = tried.get("actual_delta", 0.0) or 0.0
+                    delta_pct = tried.get("actual_delta_pct", 0.0) or 0.0
+                    sign = "+" if delta >= 0 else ""
+                    verdict = "**ACCEPTED** ✅" if status == "accepted" else "**REJECTED** ❌"
+                    result_line = (
+                        f"\n**Benchmark result:** {verdict} — "
+                        f"fitness `{f_before:.4f}` → `{f_after:.4f}` "
+                        f"(`{sign}{delta:.4f}`, `{sign}{delta_pct:.1f}%`)  \n"
+                        f"*Estimated gain was +{rec.expected_improvement_pct:.0f}% — "
+                        + (
+                            f"delivered {abs(delta_pct):.1f}% {'gain' if delta >= 0 else 'regression'}.*\n"
+                            if delta_pct != 0 else "no measurable change.*\n"
+                        )
+                    )
+
                 impl_details += (
                     f"\n### {rec.rank}. {rec.title}\n\n"
                     f"**Category:** `{rec.category}` | "
@@ -395,39 +467,9 @@ class ReportGenerator:
                     f"{rec.description}\n\n"
                     f"**Implementation:** `{rec.implementation}`\n\n"
                     f"**Evidence:** {rec.evidence}\n"
+                    + result_line
                 )
-
-            custom_kernel_note = ""
-            if research_report.custom_kernel_warranted:
-                custom_kernel_note = (
-                    f"\n> **Stage 4 Custom Kernel warranted:** "
-                    f"{research_report.custom_kernel_rationale}\n"
-                )
-
-            # Flag trials that were actually benchmarked and accepted
-            applied_section = ""
-            if stage3_applied_recs:
-                applied_rows = "".join(
-                    f"| {r['title']} | "
-                    f"`{', '.join(f'{k}={v}' for k, v in r['flags'].items())}` | "
-                    f"`{r['fitness_before']:.4f}` | "
-                    f"`{r['fitness_after']:.4f}` | "
-                    f"`+{r['delta']:.4f} (+{r['delta']/r['fitness_before']*100:.1f}%)` |\n"
-                    for r in stage3_applied_recs
-                )
-                applied_section = (
-                    "\n### Applied Flag Changes (Validated in Stage 3)\n\n"
-                    "The following recommendations were benchmarked and accepted "
-                    "because they improved fitness:\n\n"
-                    "| Recommendation | Flags Applied | Before | After | Δ |\n"
-                    "|----------------|---------------|--------|-------|---|\n"
-                    + applied_rows
-                )
-            elif s3 > 0:
-                applied_section = (
-                    "\n> **Stage 3 flag trials:** No recommendation improved "
-                    "fitness beyond the Stage 2 baseline.\n"
-                )
+                shown += 1
 
             stage3_section = (
                 "\n---\n\n## Stage 3 — Profiling & Research\n\n"
@@ -435,8 +477,10 @@ class ReportGenerator:
                 f"{research_report.bottleneck_explanation}\n\n"
                 + (f"**Architecture notes:** {research_report.architecture_notes}\n\n"
                    if research_report.architecture_notes else "")
-                + applied_section
-                + "\n\n### All Optimization Recommendations\n\n"
+                + "\n### Recommendation Benchmark Results\n\n"
+                "Every Stage 3 flag recommendation below was benchmarked. "
+                "Recommendations requiring custom code or already applied in earlier stages "
+                "are marked accordingly.\n\n"
                 + recs_table
                 + impl_details
                 + custom_kernel_note
