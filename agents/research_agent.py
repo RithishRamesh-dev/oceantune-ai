@@ -401,7 +401,6 @@ _CLI_TO_FIELD: Dict[str, tuple] = {
     "--attention-backend":        ("attention_backend",        str),
     "--enable-chunked-prefill":   ("enable_chunked_prefill",   lambda _: True),
     "--enable-prefix-caching":    ("enable_prefix_caching",    lambda _: True),
-    "--prefix-caching-hash-algo": ("prefix_caching_hash_algo", str),
     "--gpu-memory-utilization":   ("gpu_memory_utilization",   float),
     "--max-num-batched-tokens":   ("max_num_batched_tokens",   int),
     "--max-num-seqs":             ("max_num_seqs",             int),
