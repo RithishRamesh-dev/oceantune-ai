@@ -38,10 +38,10 @@ Usage
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import os
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -218,11 +218,20 @@ class ProfilerAgent:
         # vLLM v0.13+ profiler config — uses --profiler-config JSON flag.
         # VLLM_RPC_TIMEOUT must be large: flushing traces for large models can take
         # 10+ minutes (vLLM docs recommendation: 1800000 ms = 30 min).
+        #
+        # torch_profiler_use_gzip: False  — plain JSON; gzip (default=True) would
+        #   produce *.json.gz files that json.load() can't read directly.
+        # torch_profiler_with_stack: False — stack capture adds significant overhead
+        #   that distorts kernel timing ratios; disable for accurate measurements.
+        # torch_profiler_dump_cuda_time_total: True (default) — vLLM prints an
+        #   aggregated CUDA self-time table to stdout; useful as a log fallback.
         import json as _json
         profiler_config_json = _json.dumps({
             "profiler": "torch",
             "torch_profiler_dir": _CONTAINER_TRACE_DIR,
-            "torch_profiler_with_stack": True,
+            "torch_profiler_with_stack": False,
+            "torch_profiler_use_gzip": False,
+            "torch_profiler_dump_cuda_time_total": True,
         })
 
         profile_env = {
@@ -348,31 +357,30 @@ class ProfilerAgent:
                 log.info("ProfilerAgent: /stop_profile not available — env-based profiling")
 
         # Wait for vLLM to flush the trace file to disk.
-        # The flush can take several seconds after stop_profile returns.
-        for wait_s in [3, 5, 10]:
+        # The flush can take up to 10+ minutes for large models (vLLM docs).
+        # We wait in increasing intervals up to ~3 minutes for typical workloads.
+        trace_files: List[Path] = []
+        for wait_s in [5, 10, 15, 30, 60, 60]:
             await asyncio.sleep(wait_s)
-            trace_files = (
-                list(trace_dir.glob("*.json"))
-                + list(trace_dir.glob("*.pt.trace.json"))
-                + list(trace_dir.rglob("*.json"))   # vLLM may write into a subdirectory
-            )
-            # Exclude empty files
-            trace_files = [p for p in trace_files if p.stat().st_size > 100]
+            trace_files = _find_trace_files(trace_dir)
             if trace_files:
+                log.info(
+                    "ProfilerAgent: trace files appeared after %ds wait: %d file(s)",
+                    wait_s, len(trace_files),
+                )
                 break
 
         if not trace_files:
             log.warning("ProfilerAgent: no trace files found in %s after waiting", trace_dir)
             return None
 
-        # Parse the most recent trace file
+        # Parse the most recent trace file (handles both plain JSON and gzip)
         latest = max(trace_files, key=lambda p: p.stat().st_mtime)
         log.info("ProfilerAgent: parsing trace file %s (%.1f MB)",
                  latest.name, latest.stat().st_size / 1e6)
 
         try:
-            with open(latest, encoding="utf-8") as f:
-                return json.load(f)
+            return _load_trace_file(latest)
         except Exception as exc:
             log.warning("ProfilerAgent: failed to parse trace: %s", exc)
             return None
@@ -383,80 +391,138 @@ class ProfilerAgent:
         raw_trace: Dict[str, Any],
     ) -> ProfileTrace:
         """
-        Parse a PyTorch profiler trace JSON into structured ProfileTrace.
+        Parse a PyTorch profiler Chrome trace JSON into structured ProfileTrace.
 
         PyTorch Chrome trace format:
-          {"traceEvents": [{"name": ..., "dur": ..., "cat": ..., ...}, ...]}
+          {"traceEvents": [{"name": ..., "dur": ..., "cat": ..., "ph": "X", ...}]}
+
+        Event categories we care about:
+          GPU side  — "kernel", "gpu_memcpy", "gpu_memset", "gpu_user_annotation"
+          CPU side  — "cpu_op", "user_annotation"  (used for Python overhead estimate)
         """
         events = raw_trace.get("traceEvents", [])
 
-        # Aggregate GPU kernel times by name
+        # ------------------------------------------------------------------
+        # Pass 1: separate GPU kernel events from CPU op events
+        # ------------------------------------------------------------------
+        _GPU_CATS = {"kernel", "gpu_memcpy", "gpu_memset", "gpu_user_annotation"}
+        _CPU_CATS = {"cpu_op", "user_annotation"}
+
         kernel_times: Dict[str, Dict[str, Any]] = {}
         total_gpu_us = 0.0
+        total_cpu_op_us = 0.0
+        wall_ts_min = float("inf")
+        wall_ts_max = float("-inf")
 
         for event in events:
-            # Only GPU kernels (cat="kernel" or cat="gpu_memcpy")
             if event.get("ph") != "X":
                 continue
             cat = event.get("cat", "")
-            if cat not in ("kernel", "gpu_memcpy", "gpu_user_annotation"):
-                continue
+            dur = float(event.get("dur", 0))
+            ts = float(event.get("ts", 0))
 
-            name = event.get("name", "unknown")
-            dur = float(event.get("dur", 0))  # microseconds
-            total_gpu_us += dur
+            # Track wall-clock span for Python overhead estimation
+            if dur > 0:
+                wall_ts_min = min(wall_ts_min, ts)
+                wall_ts_max = max(wall_ts_max, ts + dur)
 
-            if name not in kernel_times:
-                kernel_times[name] = {"total_us": 0.0, "count": 0}
-            kernel_times[name]["total_us"] += dur
-            kernel_times[name]["count"] += 1
+            if cat in _GPU_CATS:
+                name = event.get("name", "unknown")
+                total_gpu_us += dur
+                if name not in kernel_times:
+                    kernel_times[name] = {"total_us": 0.0, "count": 0, "cat": cat}
+                kernel_times[name]["total_us"] += dur
+                kernel_times[name]["count"] += 1
+
+            elif cat in _CPU_CATS:
+                total_cpu_op_us += dur
 
         if total_gpu_us == 0:
             log.warning("ProfilerAgent: no GPU kernel events found in trace")
             return trace
 
-        # Classify kernels into categories
+        # ------------------------------------------------------------------
+        # Pass 2: classify kernels and build category totals
+        # ------------------------------------------------------------------
         category_totals: Dict[str, float] = {
             "attention": 0.0, "gemm": 0.0, "norm": 0.0,
-            "rope": 0.0, "moe": 0.0, "comm": 0.0, "other": 0.0,
+            "rope": 0.0, "moe": 0.0, "comm": 0.0, "memcpy": 0.0, "other": 0.0,
         }
 
         kernel_list: List[KernelTiming] = []
         for name, stats in kernel_times.items():
-            cat = _classify_kernel(name)
+            raw_cat = stats["cat"]
+            # memcpy/memset are inherently memory-bandwidth ops
+            if raw_cat in ("gpu_memcpy", "gpu_memset"):
+                kernel_cat = "memcpy"
+            else:
+                kernel_cat = _classify_kernel(name)
+
             total_us = stats["total_us"]
             count = stats["count"]
             pct = (total_us / total_gpu_us) * 100.0
 
-            category_totals[cat] = category_totals.get(cat, 0.0) + total_us
+            category_totals[kernel_cat] = category_totals.get(kernel_cat, 0.0) + total_us
             kernel_list.append(KernelTiming(
                 name=name,
-                category=cat,
+                category=kernel_cat,
                 gpu_time_ms=total_us / 1000.0,
                 gpu_time_pct=pct,
                 call_count=count,
                 avg_time_us=total_us / count if count > 0 else 0.0,
             ))
 
+        # ------------------------------------------------------------------
         # Top kernels by GPU time
+        # ------------------------------------------------------------------
         kernel_list.sort(key=lambda k: k.gpu_time_pct, reverse=True)
         trace.top_kernels = kernel_list[:20]
 
+        # ------------------------------------------------------------------
         # Category percentages
-        trace.attention_pct = (category_totals["attention"] / total_gpu_us) * 100.0
-        trace.gemm_pct = (category_totals["gemm"] / total_gpu_us) * 100.0
-        trace.norm_pct = (category_totals["norm"] / total_gpu_us) * 100.0
-        trace.rope_pct = (category_totals["rope"] / total_gpu_us) * 100.0
-        trace.moe_pct = (category_totals["moe"] / total_gpu_us) * 100.0
-        trace.comm_pct = (category_totals["comm"] / total_gpu_us) * 100.0
-        trace.other_pct = (category_totals["other"] / total_gpu_us) * 100.0
+        # ------------------------------------------------------------------
+        def _pct(cat: str) -> float:
+            return (category_totals.get(cat, 0.0) / total_gpu_us) * 100.0
 
-        # Classify primary bottleneck
+        trace.attention_pct = _pct("attention")
+        trace.gemm_pct      = _pct("gemm")
+        trace.norm_pct      = _pct("norm")
+        trace.rope_pct      = _pct("rope")
+        trace.moe_pct       = _pct("moe")
+        trace.comm_pct      = _pct("comm")
+        # Roll memcpy into other_pct (it shows up in bottleneck logic separately)
+        trace.other_pct     = _pct("memcpy") + _pct("other")
+
+        # ------------------------------------------------------------------
+        # Python / scheduling overhead
+        # Wall-clock span minus total GPU time gives an upper bound on CPU
+        # scheduling overhead.  Expressed as % of total wall time.
+        # ------------------------------------------------------------------
+        wall_span_us = wall_ts_max - wall_ts_min if wall_ts_max > wall_ts_min else 0.0
+        if wall_span_us > 0:
+            idle_us = max(0.0, wall_span_us - total_gpu_us)
+            trace.python_overhead_pct = (idle_us / wall_span_us) * 100.0
+
+        # ------------------------------------------------------------------
+        # Bottleneck classification
+        # ------------------------------------------------------------------
         top_cat = max(category_totals, key=category_totals.get)
-        trace.bottleneck_type = _map_category_to_bottleneck(top_cat, trace)
+        trace.bottleneck_type = _map_category_to_bottleneck(
+            top_cat, category_totals, total_gpu_us
+        )
         if trace.top_kernels:
             trace.bottleneck_kernel = trace.top_kernels[0].name
 
+        log.info(
+            "Trace parsed: %d unique kernels, total_gpu_ms=%.1f  "
+            "attention=%.1f%% gemm=%.1f%% norm=%.1f%% rope=%.1f%% "
+            "moe=%.1f%% comm=%.1f%% other=%.1f%% py_overhead=%.1f%%  "
+            "bottleneck=%s",
+            len(kernel_times), total_gpu_us / 1000,
+            trace.attention_pct, trace.gemm_pct, trace.norm_pct, trace.rope_pct,
+            trace.moe_pct, trace.comm_pct, trace.other_pct,
+            trace.python_overhead_pct, trace.bottleneck_type,
+        )
         return trace
 
     def _fallback_trace_from_logs(
@@ -482,6 +548,55 @@ class ProfilerAgent:
             trace.bottleneck_type = "compute"
         trace.research_summary = "Profiler trace unavailable — bottleneck inferred from logs."
         return trace
+
+
+# ---------------------------------------------------------------------------
+# Trace file helpers
+# ---------------------------------------------------------------------------
+
+def _find_trace_files(trace_dir: Path) -> List[Path]:
+    """
+    Discover PyTorch profiler trace files in *trace_dir*.
+
+    vLLM writes files named like ``0_<timestamp>.pt.trace.json`` (plain) or
+    ``0_<timestamp>.pt.trace.json.gz`` (gzip, default before we set use_gzip=False).
+    We support both to be resilient across vLLM versions.
+    """
+    patterns = [
+        "*.pt.trace.json",
+        "*.pt.trace.json.gz",
+        "*.json",
+        "*.json.gz",
+    ]
+    found: List[Path] = []
+    for pat in patterns:
+        found.extend(trace_dir.rglob(pat))
+
+    # De-duplicate and filter out empty/tiny files (< 1 KB)
+    seen: set = set()
+    result: List[Path] = []
+    for p in found:
+        if p in seen:
+            continue
+        seen.add(p)
+        try:
+            if p.stat().st_size >= 1024:
+                result.append(p)
+        except OSError:
+            pass
+    return result
+
+
+def _load_trace_file(path: Path) -> Dict[str, Any]:
+    """
+    Load a Chrome trace JSON file, handling both plain and gzip formats.
+    Returns the parsed dict (keys: "traceEvents", ...).
+    """
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)  # type: ignore[return-value]
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -511,15 +626,34 @@ def _classify_kernel(name: str) -> str:
     return "other"
 
 
-def _map_category_to_bottleneck(top_category: str, trace: ProfileTrace) -> str:
-    """Map top GPU-time category to a bottleneck type string."""
-    mapping = {
-        "attention": "compute",
-        "gemm": "compute",
-        "moe": "compute",
-        "comm": "compute",          # TP communication overhead
-        "norm": "compute",
-        "rope": "compute",
-        "other": "compute",
-    }
-    return mapping.get(top_category, "compute")
+def _map_category_to_bottleneck(
+    top_category: str,
+    category_totals: Dict[str, float],
+    total_gpu_us: float,
+) -> str:
+    """
+    Classify the primary bottleneck from GPU time distribution.
+
+    Rules (in priority order):
+    1. If memcpy/memset + norm + rope together exceed 35% → memory_bandwidth
+       (element-wise ops and large tensor copies are bandwidth-limited)
+    2. If comm exceeds 25% of GPU time → compute (TP all-reduce bound)
+    3. If the top category is gemm/attention/moe → compute
+    4. If the top category is norm/rope/memcpy → memory_bandwidth
+    5. Default → compute
+    """
+    def pct(cat: str) -> float:
+        return (category_totals.get(cat, 0.0) / total_gpu_us) * 100.0 if total_gpu_us > 0 else 0.0
+
+    mem_bw_pct = pct("memcpy") + pct("norm") + pct("rope")
+    comm_pct = pct("comm")
+
+    if mem_bw_pct > 35.0:
+        return "memory_bandwidth"
+    if comm_pct > 25.0:
+        return "compute"  # TP communication overhead
+    if top_category in ("gemm", "attention", "moe", "comm"):
+        return "compute"
+    if top_category in ("norm", "rope", "memcpy"):
+        return "memory_bandwidth"
+    return "compute"
