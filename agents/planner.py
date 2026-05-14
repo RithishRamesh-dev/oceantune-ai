@@ -74,7 +74,9 @@ Do not include any text outside the JSON array.
 
 _PROPOSE_SYSTEM_PROMPT = """\
 You are an expert vLLM performance engineer doing iterative hyperparameter optimization.
-Your goal: maximize throughput (tokens/second) on a single-GPU vLLM server.
+Your goal: maximize a balanced fitness score on a single-GPU vLLM server. The fitness
+score weights: 55% throughput, 20% p95 latency, 15% TTFT, 10% TPOT — so optimizing
+pure throughput is good, but reducing latency and time-to-first-token also matters.
 
 You will receive:
 - The model and GPU details
@@ -90,16 +92,22 @@ Your task:
    max_num_batched_tokens may help. If it plateaus, the GPU is compute-bound.
 3. If any prior iteration has an "error" field, read it carefully — you MUST NOT propose
    a configuration that would trigger the same error.
-4. Propose the single most impactful configuration change to try next.
-5. Return a JSON object with the full new configuration and a rationale.
+4. Propose a BATCH of 3 diverse configurations to benchmark in this round. Each should
+   explore a DIFFERENT hypothesis or parameter axis — do not propose minor variations of
+   the same idea. This enables broader search coverage per round.
+5. Return a JSON object with a list of 3 proposals and a shared rationale.
 
 Output format (strict JSON):
 {
-  "flags": {<complete VLLMFlags — all fields must be present>},
-  "rationale": "<2-3 sentences: what you changed, why, what bottleneck you're targeting>"
+  "proposals": [
+    {"flags": {<complete VLLMFlags>}, "rationale": "<1-2 sentences>"},
+    {"flags": {<complete VLLMFlags>}, "rationale": "<1-2 sentences>"},
+    {"flags": {<complete VLLMFlags>}, "rationale": "<1-2 sentences>"}
+  ],
+  "batch_rationale": "<2-3 sentences explaining what 3 hypotheses you are testing>"
 }
 
-Hard constraints (never violate these):
+Hard constraints (never violate these — apply to ALL proposals):
 - tensor_parallel_size: always 1 (single GPU)
 - pipeline_parallel_size: always 1
 - data_parallel_size: always 1
@@ -113,17 +121,37 @@ If history shows "World size.*larger than.*GPUs" → tensor_parallel_size must b
 If history shows "CUDA out of memory" → reduce gpu_memory_utilization by at least 0.05.
 If history shows "GatedRepoError" or "401" → this is an auth issue, not a config issue; keep flags.
 
-Tunable single-GPU parameters (choose ONE to change from current best):
+Tunable single-GPU parameters (each proposal should vary at most 2-3 of these):
 - gpu_memory_utilization: [0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
 - block_size: [8, 16, 32] — use 16 for most models
 - kv_cache_dtype: ["auto", "fp8"] — fp8 reduces KV memory on H100/H200
 - enable_prefix_caching: [true, false]
-- max_num_seqs: [32, 64, 128, 256, 512]
+- max_num_seqs: [32, 64, 128, 256, 512, 1024]
 - max_num_batched_tokens: [2048, 4096, 8192, 16384, 32768, 65536]
 - dtype: ["auto", "bfloat16", "float16"]
 - max_model_len: [4096, 8192, 16384, 32768]
 - enforce_eager: [true, false]
 - enable_chunked_prefill: [true, false]
+- scheduler_delay_factor: [0.0, 0.1, 0.2] — small values reduce TTFT at cost of throughput
+
+Do not include any text outside the JSON object.
+"""
+
+_PROPOSE_SYSTEM_PROMPT_SINGLE = """\
+You are an expert vLLM performance engineer doing iterative hyperparameter optimization.
+Your goal: maximize a balanced fitness score on a single-GPU vLLM server.
+The fitness score weights: 55% throughput, 20% p95 latency, 15% TTFT, 10% TPOT.
+
+Propose the single most impactful configuration change to try next.
+Return a JSON object:
+{
+  "flags": {<complete VLLMFlags — all fields must be present>},
+  "rationale": "<2-3 sentences>"
+}
+
+Hard constraints: tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1,
+distributed_executor_backend="mp", cpu_offload_gb=0, speculative_model=null,
+num_speculative_tokens=null.
 
 Do not include any text outside the JSON object.
 """
@@ -147,6 +175,9 @@ class PlannerAgent:
         self._search_space = search_space
         self._models = _load_yaml(_MODELS_YAML)
         self._gpu_profiles = _load_yaml(_GPU_PROFILES_YAML)
+        # Stash for batch proposals returned by propose_next() — extras beyond
+        # the first proposal are queued here and consumed by the Stage 1 loop
+        self._last_batch: List[Tuple[VLLMFlags, str]] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -298,6 +329,83 @@ class PlannerAgent:
     # Iterative proposal (agent-driven search)
     # ------------------------------------------------------------------
 
+    # Known-good seed configurations per GPU type.
+    # Used to bootstrap Stage 1 when no MongoDB history exists for this
+    # (model, GPU) pair.  Each entry is a dict of VLLMFlags overrides applied
+    # to the default baseline.  Seeds are ordered from most to least impactful.
+    _GPU_SEEDS: Dict[str, List[Dict[str, Any]]] = {
+        "H200": [
+            # H200 (141 GB HBM3e) — high bandwidth, benefits from large batches
+            {
+                "gpu_memory_utilization": 0.92,
+                "max_num_seqs": 512,
+                "max_num_batched_tokens": 32768,
+                "enable_prefix_caching": True,
+                "kv_cache_dtype": "fp8",
+            },
+            {
+                "gpu_memory_utilization": 0.90,
+                "max_num_seqs": 256,
+                "max_num_batched_tokens": 16384,
+                "enable_chunked_prefill": True,
+            },
+        ],
+        "H100": [
+            # H100 (80 GB HBM3) — fp8 KV frees headroom for larger batches
+            {
+                "gpu_memory_utilization": 0.90,
+                "max_num_seqs": 256,
+                "max_num_batched_tokens": 16384,
+                "enable_prefix_caching": True,
+                "kv_cache_dtype": "fp8",
+            },
+            {
+                "gpu_memory_utilization": 0.88,
+                "max_num_seqs": 128,
+                "max_num_batched_tokens": 8192,
+                "enable_chunked_prefill": True,
+            },
+        ],
+        "B300": [
+            # B300 (288 GB HBM3e) — very large memory, push batches hard
+            {
+                "gpu_memory_utilization": 0.92,
+                "max_num_seqs": 1024,
+                "max_num_batched_tokens": 65536,
+                "enable_prefix_caching": True,
+                "kv_cache_dtype": "fp8",
+            },
+        ],
+        "MI300X": [
+            # MI300X (192 GB HBM3) — AMD, use ROCm attention backend
+            {
+                "gpu_memory_utilization": 0.90,
+                "max_num_seqs": 512,
+                "max_num_batched_tokens": 32768,
+                "enable_prefix_caching": True,
+                "kv_cache_dtype": "fp8",
+            },
+        ],
+        "MI325X": [
+            {
+                "gpu_memory_utilization": 0.90,
+                "max_num_seqs": 512,
+                "max_num_batched_tokens": 32768,
+                "enable_prefix_caching": True,
+                "kv_cache_dtype": "fp8",
+            },
+        ],
+        "MI350X": [
+            {
+                "gpu_memory_utilization": 0.90,
+                "max_num_seqs": 512,
+                "max_num_batched_tokens": 32768,
+                "enable_prefix_caching": True,
+                "kv_cache_dtype": "fp8",
+            },
+        ],
+    }
+
     # Fallback variations tried in order when the LLM is unavailable.
     # Each entry is a dict of field overrides applied to the current best.
     _FALLBACK_VARIATIONS: List[Dict[str, Any]] = [
@@ -424,34 +532,40 @@ class PlannerAgent:
                 messages=[{"role": "user", "content": user_msg}],
                 system=_PROPOSE_SYSTEM_PROMPT,
             )
+
+            # New batch format: {"proposals": [...], "batch_rationale": "..."}
+            # Legacy single format: {"flags": {...}, "rationale": "..."}
+            proposals_raw = result.get("proposals") if isinstance(result, dict) else None
+            if proposals_raw and isinstance(proposals_raw, list):
+                batch: List[Tuple[VLLMFlags, str]] = []
+                for item in proposals_raw[:3]:
+                    if not isinstance(item, dict) or "flags" not in item:
+                        continue
+                    f = self._build_flags_from_dict(item["flags"], current_best)
+                    r = item.get("rationale", "LLM batch proposal")
+                    batch.append((f, r))
+                if batch:
+                    batch_rationale = result.get("batch_rationale", "")
+                    log.info(
+                        "LLM proposed batch of %d configs: %s",
+                        len(batch), batch_rationale[:120],
+                    )
+                    # Return primary proposal; caller may call propose_batch for the full list
+                    self._last_batch = batch[1:]  # stash extras for Stage 1 loop
+                    return batch[0][0], batch[0][1]
+
+            # Fall back to single-proposal format
             if not isinstance(result, dict) or "flags" not in result:
-                raise DOClientError("Invalid response format")
-
-            # Build VLLMFlags from LLM response, enforce single-GPU constraints
-            flags_dict = result["flags"]
-            flags_dict.update({
-                "tensor_parallel_size": 1,
-                "pipeline_parallel_size": 1,
-                "data_parallel_size": 1,
-                "distributed_executor_backend": "mp",
-                "cpu_offload_gb": 0,
-                "speculative_model": None,
-                "num_speculative_tokens": None,
-            })
-            # Build VLLMFlags, ignoring any unknown keys
-            known_fields = set(VLLMFlags.__dataclass_fields__.keys())
-            safe_dict = {k: v for k, v in flags_dict.items() if k in known_fields}
-            proposed = copy.deepcopy(current_best)
-            for k, v in safe_dict.items():
-                setattr(proposed, k, v)
-            proposed.run_id = proposed.fingerprint()
-
+                raise DOClientError("Invalid response format — no flags or proposals key")
+            f = self._build_flags_from_dict(result["flags"], current_best)
             rationale = result.get("rationale", "LLM proposal")
+            self._last_batch = []
             log.info("LLM proposed config: %s", rationale[:100])
-            return proposed, rationale
+            return f, rationale
 
         except DOClientError as exc:
             log.warning("LLM proposal failed (%s); using fallback variation", exc)
+            self._last_batch = []
             # Collect all errors from history to skip unsafe variations
             all_errors = " ".join(h.get("error", "") for h in history if h.get("error"))
 
@@ -460,7 +574,6 @@ class PlannerAgent:
             idx = iteration % len(self._FALLBACK_VARIATIONS)
             while tried < len(self._FALLBACK_VARIATIONS):
                 overrides = self._FALLBACK_VARIATIONS[idx]
-                # Skip variations that would trigger known errors
                 skip = False
                 if "ray" in all_errors.lower() and overrides.get("distributed_executor_backend") == "ray":
                     skip = True
@@ -481,6 +594,40 @@ class PlannerAgent:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _build_flags_from_dict(
+        self,
+        flags_dict: Dict[str, Any],
+        current_best: VLLMFlags,
+    ) -> VLLMFlags:
+        """
+        Build a VLLMFlags from an LLM-returned dict, inheriting missing fields
+        from current_best.  Unknown keys are silently dropped.
+
+        The LLM may return partial dicts (only changed keys) or full dicts
+        (all keys).  Both are handled correctly.
+        """
+        from dataclasses import asdict
+        known_fields = set(VLLMFlags.__dataclass_fields__)
+
+        # Start from current best, overlay LLM-provided values
+        base = asdict(current_best)
+        base.pop("run_id", None)
+
+        for k, v in flags_dict.items():
+            if k in known_fields and k != "run_id":
+                base[k] = v
+
+        # Hard-enforce single-GPU invariants (LLM sometimes violates these)
+        base["tensor_parallel_size"] = 1
+        base["pipeline_parallel_size"] = 1
+        base["data_parallel_size"] = 1
+        base["distributed_executor_backend"] = "mp"
+        base["cpu_offload_gb"] = 0
+
+        flags = VLLMFlags(**{k: v for k, v in base.items() if k in known_fields})
+        flags.run_id = flags.fingerprint()
+        return flags
 
     def _get_model_meta(self, model_id: str) -> Dict:
         """Look up model metadata from models.yaml by hf_id or alias."""

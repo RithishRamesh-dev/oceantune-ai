@@ -539,3 +539,83 @@ class Database:
         cursor = self.db["benchmark_runs"].aggregate(pipeline)
         docs = await cursor.to_list(length=limit)
         return [d["_id"] for d in docs]
+
+    async def get_best_flags_for_model(
+        self,
+        model_id: str,
+        gpu_type: str,
+        exclude_session_id: Optional[str] = None,
+        top_n: int = 3,
+    ) -> List[Dict]:
+        """
+        Return the top-N highest-fitness flag configurations benchmarked for
+        this (model_id, gpu_type) pair across all prior sessions.
+
+        Used for cross-session warm-start: Stage 1 seeds its initial iterations
+        with configurations that already proved good on prior runs, avoiding
+        the cold-start penalty of always exploring from defaults.
+
+        Parameters
+        ----------
+        model_id : str
+        gpu_type : str
+        exclude_session_id : str, optional
+            If provided, skip results from this session (avoids seeding from
+            the current run which would produce no benefit).
+        top_n : int
+            How many top configs to return.
+
+        Returns
+        -------
+        List of dicts, each with keys:
+            flags          : dict of VLLMFlags field → value
+            fingerprint    : str
+            fitness_score  : float
+            session_id     : str   (source session)
+        """
+        session_match: Dict[str, Any] = {
+            "model_id": model_id,
+            "gpu_type": gpu_type,
+            "status": "done",
+        }
+        if exclude_session_id:
+            session_match["_id"] = {"$ne": exclude_session_id}
+
+        pipeline = [
+            # Join benchmark_runs → sessions
+            {"$lookup": {
+                "from": "sessions",
+                "localField": "session_id",
+                "foreignField": "_id",
+                "as": "session",
+            }},
+            {"$unwind": "$session"},
+            {"$match": {
+                "session.model_id": model_id,
+                "session.gpu_type": gpu_type,
+                **({"session._id": {"$ne": exclude_session_id}} if exclude_session_id else {}),
+                "error": None,
+                "fitness_score": {"$gt": 0},
+            }},
+            # Keep only the best run per fingerprint
+            {"$sort": {"fitness_score": DESCENDING}},
+            {"$group": {
+                "_id": "$fingerprint",
+                "fitness_score": {"$first": "$fitness_score"},
+                "flags": {"$first": "$flags"},
+                "session_id": {"$first": "$session_id"},
+            }},
+            {"$sort": {"fitness_score": DESCENDING}},
+            {"$limit": top_n},
+        ]
+        cursor = self.db["benchmark_runs"].aggregate(pipeline)
+        docs = await cursor.to_list(length=top_n)
+        return [
+            {
+                "flags": d.get("flags", {}),
+                "fingerprint": d["_id"],
+                "fitness_score": d.get("fitness_score", 0.0),
+                "session_id": d.get("session_id", ""),
+            }
+            for d in docs
+        ]

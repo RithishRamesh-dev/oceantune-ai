@@ -127,10 +127,13 @@ vllm:
 
 # ── Benchmark Engine ──────────────────────────────────────────────────────────
 benchmark:
-  # Concurrency ramp — number of concurrent requests per run
-  concurrency_levels: [1, 2, 4, 8, 16, 32, 64, 128]
-  # Total prompts sent per concurrency level
-  num_prompts: 30
+  # Concurrency ramp — number of concurrent requests per run.
+  # Extended to 256/512 so H200/B300 with 7B models don't plateau early.
+  # The fitness function automatically picks the peak-throughput concurrency.
+  concurrency_levels: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+  # Prompts per concurrency level. ≥50 needed for reliable throughput measurement
+  # at high concurrency (30 prompts at c=128 finishes in < 1s, too noisy).
+  num_prompts: 50
   # Default token lengths (overridden per context_config entry)
   input_len: 1024
   output_len: 1024
@@ -145,7 +148,7 @@ benchmark:
 optimiser:
   strategy: "evolutionary"      # config-compat label; v4 uses LLM-guided search
   population_size: 10           # candidates sampled per generation
-  generations: 10               # number of search rounds
+  generations: 15               # number of search rounds (3 parallel × 5 batches)
   mutation_rate: 0.2            # used by search_space crossover helpers
   elite_fraction: 0.2           # used by search_space crossover helpers
   # Primary metric drives fitness scoring in MetricsCollector and Analyst ranking

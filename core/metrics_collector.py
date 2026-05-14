@@ -333,12 +333,17 @@ class MetricsCollector:
         )
 
         # ── Weighted combination ──────────────────────────────────────────
+        # "throughput" mode now uses a balanced 4-component formula instead of
+        # ignoring TTFT/TPOT entirely.  Real production serving workloads care
+        # about responsiveness (TTFT) and per-token speed (TPOT) alongside raw
+        # throughput.  The new weights: 55% throughput, 20% p95 latency,
+        # 15% TTFT, 10% TPOT.  All other modes remain focused on their primary.
         weights: Dict[str, tuple] = {
             #               throughput  latency  ttft  tpot
-            "throughput":  (0.70,       0.30,    0.00, 0.00),
-            "p95_latency": (0.30,       0.70,    0.00, 0.00),
-            "ttft":        (0.20,       0.00,    0.80, 0.00),
-            "tpot":        (0.20,       0.00,    0.00, 0.80),
+            "throughput":  (0.55,       0.20,    0.15, 0.10),
+            "p95_latency": (0.20,       0.60,    0.10, 0.10),
+            "ttft":        (0.15,       0.05,    0.70, 0.10),
+            "tpot":        (0.15,       0.05,    0.10, 0.70),
         }
         wt, wl, wttft, wtpot = weights.get(
             primary_metric, weights["throughput"]

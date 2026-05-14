@@ -104,6 +104,38 @@ Strategy selection guidelines:
 Do not include any text outside the JSON object.
 """
 
+_CATEGORY_SWEEP_PROMPT = """\
+You are an expert vLLM inference optimization engineer running Stage 2 of OceanTune.
+
+Your task: propose ONE representative strategy from EACH of the following categories.
+This enables a broad initial sweep across all strategy dimensions in a single LLM call,
+before follow-up per-iteration proposals refine the best direction.
+
+Categories to cover (propose one per category):
+  1. kv_cache        — fp8 KV dtype, prefix caching, or combination
+  2. prefill         — chunked prefill, multi-step scheduling, or scheduler_delay_factor
+  3. kernel          — attention backend (FLASH_ATTN vs FLASHINFER vs ROCM_FLASH)
+  4. moe             — MoE/AMD vendor-specific dispatch (skip if not applicable: output empty {})
+  5. batching        — max_num_batched_tokens, max_num_seqs, or num_scheduler_steps
+
+For each category, choose the configuration most likely to improve performance
+given the Stage 1 metrics. Skip categories where no meaningful change is possible
+(output empty strategy_config {} for that category).
+
+Output format (strict JSON):
+{
+  "sweep": [
+    {"category": "kv_cache",  "strategy_config": {...}, "rationale": "..."},
+    {"category": "prefill",   "strategy_config": {...}, "rationale": "..."},
+    {"category": "kernel",    "strategy_config": {...}, "rationale": "..."},
+    {"category": "moe",       "strategy_config": {},    "rationale": "Not applicable"},
+    {"category": "batching",  "strategy_config": {...}, "rationale": "..."}
+  ]
+}
+
+Do not include any text outside the JSON object.
+"""
+
 
 class StrategyOptimizerAgent:
     """
@@ -157,6 +189,8 @@ class StrategyOptimizerAgent:
         self._primary_metric = primary_metric
         self._vendor = "amd" if gpu_type in _AMD_GPU_TYPES else "nvidia"
         self._search_space = self._load_search_space()
+        # Pre-fetched category sweep proposals (consumed before per-iteration LLM calls)
+        self._batch_queue: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -207,13 +241,37 @@ class StrategyOptimizerAgent:
         best_category = "baseline"
         fallback_idx = 0
 
+        # 2. Category sweep: one proposal per strategy dimension in a single LLM call.
+        # This seeds the queue so the first N iterations cover all strategy categories
+        # before follow-up per-iteration proposals refine the best direction.
+        await self._do_category_sweep(
+            baseline_flags=baseline_flags,
+            baseline_metrics=baseline_metrics,
+        )
+        log.info(
+            "Stage 2 category sweep seeded %d proposals into queue",
+            len(self._batch_queue),
+        )
+
         for iteration in range(1, max_iterations + 1):
-            # 2. Propose next strategy
-            proposal = await self._propose_next(
-                baseline_flags=baseline_flags,
-                baseline_metrics=baseline_metrics,
-                history=history,
-            )
+            # 3. Propose next strategy — consume sweep queue first, then LLM per-iteration
+            proposal: Optional[Dict[str, Any]] = None
+
+            if self._batch_queue:
+                proposal = self._batch_queue.pop(0)
+                log.info(
+                    "Stage 2 iteration %d [sweep/%s]: %s — %s",
+                    iteration,
+                    proposal.get("category", "?"),
+                    proposal.get("strategy_config", {}),
+                    proposal.get("rationale", "")[:100],
+                )
+            else:
+                proposal = await self._propose_next(
+                    baseline_flags=baseline_flags,
+                    baseline_metrics=baseline_metrics,
+                    history=history,
+                )
 
             if proposal is None:
                 # LLM unavailable: use deterministic fallback sweep
@@ -223,7 +281,7 @@ class StrategyOptimizerAgent:
                     log.info("Stage 2 fallback sweep exhausted — stopping")
                     break
                 log.info("Stage 2 fallback proposal: %s", proposal.get("strategy_config"))
-            else:
+            elif not self._batch_queue:
                 log.info(
                     "Stage 2 iteration %d [%s]: %s — %s",
                     iteration,
@@ -281,6 +339,52 @@ class StrategyOptimizerAgent:
     # ------------------------------------------------------------------
     # LLM proposal
     # ------------------------------------------------------------------
+
+    async def _do_category_sweep(
+        self,
+        baseline_flags: Dict[str, Any],
+        baseline_metrics: Dict[str, Any],
+    ) -> None:
+        """
+        Single LLM call asking for one proposal per strategy category.
+        Populates self._batch_queue. Silently skips on LLM failure.
+        """
+        vendor_ss = {
+            name: params
+            for name, params in self._search_space.items()
+            if params.get("vendor", "all") in ("all", self._vendor)
+        }
+        user_msg = (
+            f"Model: {self._model_id}\n"
+            f"GPU: {self._gpu_type} (vendor={self._vendor})\n\n"
+            f"Stage 1 winner flags:\n{json.dumps(baseline_flags, indent=2)}\n\n"
+            f"Stage 1 winner metrics:\n{json.dumps(baseline_metrics, indent=2)}\n\n"
+            f"Strategy search space:\n{json.dumps(vendor_ss, indent=2)}\n\n"
+            "Return the category sweep JSON now."
+        )
+        try:
+            result = await self._client.chat_json(
+                messages=[{"role": "user", "content": user_msg}],
+                system=_CATEGORY_SWEEP_PROMPT,
+            )
+            if not isinstance(result, dict) or "sweep" not in result:
+                log.warning("Stage 2 category sweep: unexpected format %s", result)
+                return
+            for item in result["sweep"]:
+                cfg = item.get("strategy_config", {})
+                if not cfg:
+                    continue  # skip empty / non-applicable categories
+                self._batch_queue.append({
+                    "strategy_config": cfg,
+                    "category": item.get("category", "unknown"),
+                    "rationale": item.get("rationale", "Category sweep proposal"),
+                })
+            log.info(
+                "Stage 2 category sweep: %d non-empty proposals queued",
+                len(self._batch_queue),
+            )
+        except DOClientError as exc:
+            log.warning("Stage 2 category sweep failed (%s); will use per-iteration proposals", exc)
 
     async def _propose_next(
         self,

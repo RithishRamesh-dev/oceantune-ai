@@ -166,12 +166,13 @@ class ControllerAgent:
                 )
 
             # ── Stage 4: Autonomous Kernel Engineering ────────────────────
+            # kernel_research is always populated when stage4_enabled=True
+            # because Stage 3f now runs unconditionally in that case.
             stage4_enabled = getattr(self.cfg, "stage4_enabled", False)
             if (
                 stage4_enabled
                 and winner_flags
                 and bottleneck_analysis is not None
-                and kernel_research is not None
             ):
                 evolution_result = await self._stage4(
                     session_id=session_id,
@@ -234,6 +235,34 @@ class ControllerAgent:
         )
         analyst = AnalystAgent(do_client=self._do_client, db=self._db)
 
+        # ── Cross-session warm-start ─────────────────────────────────────
+        # Query the best flags from prior sessions for this (model, GPU) pair.
+        # These are inserted as the first configs so Stage 1 doesn't waste
+        # iterations re-discovering configurations already known to be good.
+        warm_start_flags: list[VLLMFlags] = []
+        try:
+            prior_bests = await self._db.get_best_flags_for_model(
+                model_id=self.cfg.model_id,
+                gpu_type=self.cfg.gpu_type,
+                exclude_session_id=session_id,
+                top_n=3,
+            )
+            for pb in prior_bests:
+                known = set(VLLMFlags.__dataclass_fields__)
+                flags_clean = {k: v for k, v in pb["flags"].items() if k in known}
+                try:
+                    warm_flags = VLLMFlags(**flags_clean)
+                    warm_flags.run_id = warm_flags.fingerprint()
+                    warm_start_flags.append(warm_flags)
+                    log.info(
+                        "Warm-start seed: fingerprint=%s fitness=%.4f (session %s)",
+                        pb["fingerprint"][:8], pb["fitness_score"], pb["session_id"][:8],
+                    )
+                except Exception as e:
+                    log.debug("Warm-start seed skipped (invalid flags): %s", e)
+        except Exception as e:
+            log.debug("Cross-session warm-start query failed: %s", e)
+
         # Iteration 0: bare minimum — let vLLM choose all defaults
         current_best = VLLMFlags(
             tensor_parallel_size=1,
@@ -249,11 +278,47 @@ class ControllerAgent:
         search_history: list = []
         last_analyst_eval: dict = {}
 
-        for iteration in range(n_iterations):
-            flags = current_best if iteration == 0 else None
+        # If MongoDB has no prior session data for this (model, GPU), fall back to
+        # GPU-type known-good seeds from the planner's static table.
+        if not warm_start_flags:
+            gpu_seeds = PlannerAgent._GPU_SEEDS.get(self.cfg.gpu_type, [])
+            for seed_dict in gpu_seeds:
+                known = set(VLLMFlags.__dataclass_fields__)
+                try:
+                    seed_flags = VLLMFlags(**{
+                        **{k: v for k, v in current_best.__dict__.items() if k in known and k != "run_id"},
+                        **{k: v for k, v in seed_dict.items() if k in known},
+                    })
+                    seed_flags.run_id = seed_flags.fingerprint()
+                    warm_start_flags.append(seed_flags)
+                    log.info(
+                        "GPU-type seed config for %s: %s",
+                        self.cfg.gpu_type, seed_dict,
+                    )
+                except Exception as e:
+                    log.debug("GPU-type seed skipped: %s", e)
 
-            if iteration > 0:
-                # Best run so far — pull enriched_metrics (correct key)
+        # Prepend warm-start seeds so they run in the first iterations
+        iteration_queue: list = list(warm_start_flags)  # seeds first, then LLM proposals
+
+        for iteration in range(n_iterations):
+            flags = None
+            rationale = ""
+
+            if iteration == 0:
+                # Always benchmark the vLLM-defaults baseline first
+                flags = current_best
+                rationale = "Baseline: vLLM defaults, no extra flags"
+                log.info("Iteration 0 — baseline: bare minimum vLLM flags")
+
+            elif iteration_queue:
+                # Consume warm-start seeds from prior sessions before LLM proposals
+                flags = iteration_queue.pop(0)
+                rationale = f"Cross-session warm-start seed (fingerprint {flags.fingerprint()[:8]})"
+                log.info("Iteration %d — warm-start seed: %s", iteration, rationale)
+
+            else:
+                # LLM-guided proposal
                 top = await self._db.get_top_configs(session_id, n=1)
                 best_run = top[0] if top else {}
                 best_metrics = best_run.get("enriched_metrics") or best_run.get("raw_metrics") or {}
@@ -269,9 +334,17 @@ class ControllerAgent:
                     analyst_eval=last_analyst_eval,
                 )
                 log.info("Iteration %d — agent proposal: %s", iteration, rationale[:120])
-            else:
-                log.info("Iteration 0 — baseline: bare minimum vLLM flags")
-                rationale = "Baseline: vLLM defaults, no extra flags"
+
+                # Inject any extra batch proposals into the queue so they get
+                # benchmarked in subsequent iterations without additional LLM calls
+                if planner._last_batch:
+                    extras = planner._last_batch
+                    planner._last_batch = []
+                    iteration_queue[:0] = [f for f, _ in extras]  # prepend
+                    log.info(
+                        "Iteration %d — stashed %d extra batch proposals into queue",
+                        iteration, len(extras),
+                    )
 
             from dataclasses import asdict
             config_id = await self._db.insert_config(
@@ -660,11 +733,15 @@ class ControllerAgent:
             log.info("Stage 3e: no flag recommendations improved fitness")
 
         # ── 3f. Kernel Research (deep kernel-level research) ──────────────
-        # Only run if flag changes didn't already fully address the bottleneck,
-        # or the research agent flagged that custom kernel work is warranted.
+        # Run kernel research whenever Stage 4 is enabled OR the research/
+        # bottleneck agents flag that custom kernel work is warranted.
+        # Previously this was gated on custom_kernel_warranted, so Stage 4
+        # never triggered in practice because the LLM rarely sets that flag.
         kernel_research = None
+        stage4_enabled = getattr(self.cfg, "stage4_enabled", False)
         need_kernel_work = (
-            research_report.custom_kernel_warranted
+            stage4_enabled
+            or research_report.custom_kernel_warranted
             or bottleneck_analysis.recommended_action.startswith("kernel_generation")
         )
         if need_kernel_work:
@@ -745,6 +822,66 @@ class ControllerAgent:
     # ------------------------------------------------------------------
     # Stage 3 helper: try vLLM flag recommendations in-place
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _scale_down_flags(
+        rec_flags: Dict[str, Any],
+        current_flags: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Produce a scaled-down variant of rec_flags for parameters that are
+        numeric and higher than their current value.
+
+        Rules:
+        - Integer parameters (max_num_seqs, max_num_batched_tokens, block_size,
+          max_model_len): scale to the midpoint between current and proposed,
+          rounding to the nearest power of 2.
+        - Float parameters (gpu_memory_utilization, scheduler_delay_factor):
+          scale to the midpoint between current and proposed.
+
+        Returns {} if no meaningful scaling can be produced.
+        """
+        _INT_PARAMS = {
+            "max_num_seqs",
+            "max_num_batched_tokens",
+            "max_model_len",
+        }
+        _FLOAT_PARAMS = {
+            "gpu_memory_utilization",
+            "scheduler_delay_factor",
+        }
+
+        scaled: Dict[str, Any] = {}
+        for k, proposed_val in rec_flags.items():
+            current_val = current_flags.get(k)
+            if current_val is None:
+                continue
+            try:
+                if k in _INT_PARAMS and isinstance(proposed_val, (int, float)):
+                    cur = int(current_val)
+                    prop = int(proposed_val)
+                    if prop <= cur:
+                        continue
+                    mid = (cur + prop) // 2
+                    # Round to nearest power of 2 (min 1)
+                    p2 = max(1, 1 << (mid - 1).bit_length() - 1)
+                    # If rounding produced the same as current, try next power up
+                    if p2 <= cur:
+                        p2 = p2 * 2
+                    if p2 < prop:
+                        scaled[k] = p2
+                elif k in _FLOAT_PARAMS and isinstance(proposed_val, float):
+                    cur = float(current_val)
+                    prop = float(proposed_val)
+                    if abs(prop - cur) < 0.01:
+                        continue
+                    mid = round((cur + prop) / 2, 4)
+                    if mid != cur and mid != prop:
+                        scaled[k] = mid
+            except (TypeError, ValueError):
+                continue
+
+        return scaled
 
     async def _try_flag_recommendations(
         self,
@@ -876,6 +1013,59 @@ class ControllerAgent:
                     "Stage 3 rec '%s' REJECTED: %.4f → %.4f (%.4f, %.1f%%)",
                     rec.title, current_fitness, fitness, delta, delta_pct,
                 )
+                # Smart retry: try a scaled-down version of the parameter values
+                scaled_flags = self._scale_down_flags(rec.vllm_flags, current_flags)
+                if scaled_flags:
+                    scaled_raw = {**current_flags, **scaled_flags}
+                    scaled_clean = {k: v for k, v in scaled_raw.items() if k in known_fields}
+                    scaled_vllm = VLLMFlags(**scaled_clean)
+                    scaled_id = await self._db.insert_config(
+                        session_id=session_id,
+                        fingerprint=scaled_vllm.fingerprint(),
+                        flags={k: v for k, v in asdict(scaled_vllm).items() if k != "run_id"},
+                        generation=-2,
+                        priority=-2,
+                    )
+                    if scaled_id is not None:
+                        log.info(
+                            "Stage 3 rec '%s': trying scaled-down variant %s",
+                            rec.title, scaled_flags,
+                        )
+                        await self._run_single(
+                            session_id=session_id,
+                            config_id=scaled_id,
+                            context_configs=context_configs,
+                        )
+                        scaled_doc = await self._db.get_config_by_id(scaled_id)
+                        scaled_fitness = scaled_doc.get("fitness_score", 0.0) if scaled_doc else 0.0
+                        if scaled_fitness > current_fitness:
+                            sd = scaled_fitness - current_fitness
+                            sd_pct = (sd / current_fitness * 100) if current_fitness else 0.0
+                            base_record["status"] = "accepted_scaled"
+                            base_record["flags"] = scaled_flags
+                            base_record["fitness_after"] = scaled_fitness
+                            base_record["actual_delta"] = sd
+                            base_record["actual_delta_pct"] = sd_pct
+                            log.info(
+                                "Stage 3 rec '%s' ACCEPTED (scaled): %.4f → %.4f (+%.4f)",
+                                rec.title, current_fitness, scaled_fitness, sd,
+                            )
+                            accepted.append({
+                                "title": f"{rec.title} (scaled)",
+                                "flags": scaled_flags,
+                                "fitness_before": current_fitness,
+                                "fitness_after": scaled_fitness,
+                                "delta": sd,
+                            })
+                            current_flags = {
+                                k: v for k, v in asdict(scaled_vllm).items() if k != "run_id"
+                            }
+                            current_fitness = scaled_fitness
+                        else:
+                            log.info(
+                                "Stage 3 rec '%s' scaled variant also rejected (%.4f)",
+                                rec.title, scaled_fitness,
+                            )
 
             all_tried.append(base_record)
 
