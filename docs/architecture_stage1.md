@@ -8,7 +8,7 @@ Stage 1 is a closed-loop search where four components interact each iteration: t
 flowchart TD
     START([oceantune.py run]) --> CTRL
 
-    CTRL["ControllerAgent\nagents/controller_agent.py\n─────────────────\nOrchestrates the full\nStage 1 → Stage 2 pipeline"]
+    CTRL["ControllerAgent\nagents/controller_agent.py\n─────────────────\nOrchestrates Stages 1–4\n(see technical_architecture.md)"]
 
     CTRL -->|"Iteration 0\nbare minimum VLLMFlags\n(vLLM defaults)"| MONGO_INS
 
@@ -43,7 +43,7 @@ flowchart TD
 
             LOGA -->|"LogAnalysis"| MCOL
 
-            MCOL["MetricsCollector\ncore/metrics_collector.py\n─────────────────\nEnrichedMetrics:\n• peak_throughput_tok_s\n• p95_latency_at_peak_ms\n• mean_ttft_ms\n• throughput_per_gb_vram\n• memory_headroom_fraction\nFitness score:\n70% throughput (log-scaled)\n30% latency (inverted)\nPenalties: error rate,\nfailed levels, OOM"]
+            MCOL["MetricsCollector\ncore/metrics_collector.py\n─────────────────\nEnrichedMetrics + fitness:\n55% throughput, 20% p95,\n15% TTFT, 10% TPOT\nPenalties: errors, failed levels, OOM"]
 
             MCOL -->|"EnrichedMetrics\n+ fitness_score"| DB_WRITE
         end
@@ -65,11 +65,13 @@ flowchart TD
 
     WINNER -->|"winner_flags\nas Stage 2 baseline"| STAGE2
 
-    subgraph STAGE2["Stage 2 — Kernel-Level Search"]
+    subgraph STAGE2["Stage 2 — Inference Strategy Search"]
         direction LR
-        KO["KernelOptimizerAgent\nagents/kernel_optimizer.py\n─────────────────\n10 iterations\nLLM proposes kernel\noverrides on top of\nwinner_flags\n(attention_backend,\nkv_cache_dtype,\nscheduler_delay_factor,\nNVIDIA/AMD-specific flags)"]
+        SO["StrategyOptimizerAgent\nagents/strategy_optimizer.py\n─────────────────\nUp to 12 iterations\nKV, speculative decode,\nattention backend, MoE/AMD,\nNCCL/RCCL (stage2_search_space.yaml)"]
 
-        KO -->|"best_kernel_config"| RG
+        SO -->|"best_strategy delta"| MERGE["merge_flags()\ncore/flag_merge.py"]
+
+        MERGE --> RG
     end
 
     RG["ReportGenerator\ncore/report_generator.py\n─────────────────\nYAML recipe\nShell script\nMarkdown report"]
@@ -87,7 +89,8 @@ flowchart TD
     style MONGO_INS fill:#da3633,stroke:#f85149,color:#fff
     style DB_WRITE fill:#da3633,stroke:#f85149,color:#fff
     style WINNER fill:#1a7f37,stroke:#3fb950,color:#fff
-    style KO fill:#9e6a03,stroke:#d29922,color:#fff
+    style SO fill:#9e6a03,stroke:#d29922,color:#fff
+    style MERGE fill:#1a7f37,stroke:#3fb950,color:#fff
     style RG fill:#1f6feb,stroke:#388bfd,color:#fff
 ```
 
@@ -129,8 +132,10 @@ Iteration N:
 
 | Component | Weight (throughput mode) | Formula |
 |-----------|--------------------------|---------|
-| Throughput score | 70% | `log(tok_s / 100) / log(50000 / 100)` — log-scaled |
-| Latency score | 30% | `(30000 - p95_ms) / (30000 - 10)` — inverted linear |
+| Throughput score | 55% | log-scaled vs baseline (see metrics_collector.py) |
+| p95 latency score | 20% | inverted linear |
+| TTFT score | 15% | inverted linear |
+| TPOT score | 10% | inverted linear |
 | Error rate penalty | — | `−min(50%, error_rate × 50%)` |
 | Failed level penalty | — | `−10%` per failed concurrency level |
 | OOM/crash penalty | — | `−30%` if errors detected in logs |

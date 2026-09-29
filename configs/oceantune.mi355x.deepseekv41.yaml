@@ -1,0 +1,93 @@
+# OceanTune run config — DeepSeek-V4.1-Flash Quark-MXFP4 on MI355X×8
+# Droplet: 165.245.192.27
+#
+# Baseline recipe (seed):
+#   VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MHA=1 VLLM_ROCM_USE_AITER_MOE=0
+#   vllm serve amd/DeepSeek-V4.1-Flash-Quark-MXFP4 --tensor-parallel-size 4
+#     --trust-remote-code --tokenizer-mode deepseek_v41
+#     --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 --enforce-eager
+
+model_id: "amd/DeepSeek-V4.1-Flash-Quark-MXFP4"
+gpu_type: "MI355X"
+framework: "vllm"
+framework_version: "0.9.0"
+
+# Specialized ROCm image for this model (also set via VLLM_IMAGE env)
+vllm:
+  port: 8000
+  startup_timeout_sec: 1800
+  docker_image: "vllm/vllm-openai-rocm:deepseekv41-flash-0909"
+
+agent:
+  model: "auto"
+  max_tokens: 4096
+  timeout_sec: 120
+  max_turns: 6
+  temperature: 0.3
+
+database:
+  uri: ""   # set via MONGO_URI
+  name: "oceantune"
+  collections:
+    sessions: "sessions"
+    nodes: "nodes"
+    configs: "configs"
+    benchmark_runs: "benchmark_runs"
+    kernel_runs: "kernel_runs"
+    kernel_benchmark_runs: "kernel_benchmark_runs"
+    kernel_metadata: "kernel_metadata"
+    recipes: "recipes"
+
+nodes:
+  - host: localhost
+    node_port: 9000
+    gpu_type: "MI355X"
+    gpu_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+
+coordinator:
+  max_parallel_per_node: 1
+  port_pool_start: 8000
+  port_pool_end: 8016
+  poll_interval_sec: 5
+  max_retries: 2
+
+benchmark:
+  concurrency_levels: [1, 2, 4, 8, 16, 32, 64]
+  num_prompts: 40
+  input_len: 1024
+  output_len: 128
+
+optimiser:
+  strategy: evolutionary
+  population_size: 8
+  generations: 10
+  mutation_rate: 0.2
+  elite_fraction: 0.2
+  primary_metric: "throughput"
+
+enablement_enabled: true
+enablement_max_repairs: 6
+prelude_enabled: true
+prelude_min_confidence: 0.7
+warmstart_max_trials: 3
+
+macro_cycle_enabled: true
+macro_cycle_max: 2
+macro_cycle_min_remaining_sec: 1800
+session_max_minutes: 0
+
+search_stall_limit: 2
+serving_patches_enabled: true
+quantization_scheme: "none"
+attention_e2e_enabled: false
+
+# Stage 4 optional on first bring-up — focus Stage 1–3 serving flags first
+stage4_enabled: false
+stage4_iterations: 3
+stage4_e2e_enabled: false
+stage4_campaign_enabled: false
+
+context_configs:
+  - [1024, 128]
+  - [512, 64]
+  - [2048, 256]

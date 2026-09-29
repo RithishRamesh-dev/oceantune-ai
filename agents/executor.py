@@ -111,6 +111,7 @@ class ExecutorAgent:
         node_host: str = "localhost",
         primary_metric: str = "throughput",
         docker_image: str = "",
+        framework: str = "vllm",
     ) -> None:
         self._client = do_client
         self._db = db
@@ -124,6 +125,7 @@ class ExecutorAgent:
         self._node_host = node_host
         self._primary_metric = primary_metric
         self._docker_image = docker_image
+        self._framework = (framework or "vllm").strip().lower()
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -146,7 +148,12 @@ class ExecutorAgent:
         fingerprint = config_doc["fingerprint"]
         flags_dict = config_doc["flags"]
 
-        # Reconstruct VLLMFlags from stored dict
+        # FrameworkBackend: normalize flags (SGLang drops unsupported keys)
+        from core.framework_backend import get_framework_backend
+        backend = get_framework_backend(self._framework)
+        flags_dict = backend.normalize_flags(flags_dict) if self._framework != "vllm" else flags_dict
+
+        # Reconstruct VLLMFlags from stored dict (vLLM path + shared fields)
         flags = VLLMFlags(**{
             k: v for k, v in flags_dict.items()
             if hasattr(VLLMFlags, k) or k in VLLMFlags.__dataclass_fields__
@@ -169,9 +176,26 @@ class ExecutorAgent:
 
         device_env = self._gpu_alloc.build_device_env(slot)
         log.info(
-            "Executor starting: config=%s port=%d slot=%s tp=%d",
-            fingerprint[:8], port, slot, tp_size,
+            "Executor starting: config=%s port=%d slot=%s tp=%d framework=%s",
+            fingerprint[:8], port, slot, tp_size, self._framework,
         )
+
+        launch_override_cli = None
+        launch_override_image = ""
+        container_prefix = "oceantune-vllm"
+        if self._framework != "vllm":
+            spec = backend.build_launch_spec(
+                model_id=self._model_id,
+                flags=flags_dict,
+                port=port,
+                gpu_type=self._gpu_type,
+                docker_image=self._docker_image,
+                extra_env=device_env,
+            )
+            launch_override_cli = list(spec.cli_args)
+            launch_override_image = spec.docker_image
+            container_prefix = f"oceantune-{self._framework}"
+            device_env = {**device_env, **(spec.env or {})}
 
         server = VLLMServer(
             model_id=self._model_id,
@@ -180,7 +204,10 @@ class ExecutorAgent:
             port=port,
             startup_timeout=self._startup_timeout_sec,
             extra_env=device_env,
-            docker_image=self._docker_image,
+            docker_image=self._docker_image or launch_override_image,
+            launch_override_cli=launch_override_cli,
+            launch_override_image=launch_override_image,
+            container_name_prefix=container_prefix,
         )
 
         best_fitness = 0.0

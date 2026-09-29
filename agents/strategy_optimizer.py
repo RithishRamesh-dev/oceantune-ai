@@ -49,6 +49,9 @@ from agents.do_client import DOClient, DOClientError
 from core.db import Database
 from core.gpu_allocator import GPUSlotAllocator
 from core.port_allocator import PortAllocator
+from core.attention_bench import load_model_meta
+from core.kernel_registry import CapabilityDetector, model_has_gqa
+from core.measurement_gate import MeasurementGate
 from core.search_space import VLLMFlags
 from core.vllm_server import VLLMServer, _load_gpu_profile
 from core.benchmark_runner import BenchmarkEngine
@@ -60,7 +63,7 @@ log = logging.getLogger("agents.strategy_optimizer")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _STAGE2_SS_YAML = _REPO_ROOT / "configs" / "stage2_search_space.yaml"
 
-_AMD_GPU_TYPES = {"MI300X", "MI325X", "MI350X"}
+_AMD_GPU_TYPES = {"MI300X", "MI325X", "MI350X", "MI355X"}
 
 _PROPOSE_SYSTEM_PROMPT = """\
 You are an expert vLLM inference optimization engineer running Stage 2 of OceanTune.
@@ -174,6 +177,7 @@ class StrategyOptimizerAgent:
         node_host: str = "localhost",
         docker_image: str = "",
         primary_metric: str = "throughput",
+        critic: Optional[Any] = None,
     ) -> None:
         self._client = do_client
         self._db = db
@@ -189,8 +193,16 @@ class StrategyOptimizerAgent:
         self._primary_metric = primary_metric
         self._vendor = "amd" if gpu_type in _AMD_GPU_TYPES else "nvidia"
         self._search_space = self._load_search_space()
+        self._capabilities = CapabilityDetector()
+        self._model_meta = load_model_meta(model_id)
         # Pre-fetched category sweep proposals (consumed before per-iteration LLM calls)
         self._batch_queue: List[Dict[str, Any]] = []
+        self._critic = critic
+        self._experience_constraints: str = ""
+
+    def set_experience_constraints(self, block: str) -> None:
+        """Inject distilled failure constraints into Stage 2 LLM prompts."""
+        self._experience_constraints = block or ""
 
     # ------------------------------------------------------------------
     # Public API
@@ -204,11 +216,13 @@ class StrategyOptimizerAgent:
         baseline_metrics: Dict[str, Any],
         context_configs: List[Tuple[int, int]],
         max_iterations: int = 12,
-    ) -> Dict[str, Any]:
+        profiler_hints: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Any], float, Dict[str, Any]]:
         """
         Run Stage 2 strategy search.
 
-        Returns the best strategy_config dict (to merge with baseline_flags).
+        Returns (best_strategy_config, best_fitness, best_enriched_metrics).
+        best_strategy_config is the delta to merge with baseline_flags via merge_flags().
         Always records all experiments in MongoDB for visibility, regardless of
         whether any improve on the baseline.
         """
@@ -240,6 +254,7 @@ class StrategyOptimizerAgent:
         best_fitness = baseline_fitness
         best_category = "baseline"
         fallback_idx = 0
+        gate = MeasurementGate()
 
         # 2. Category sweep: one proposal per strategy dimension in a single LLM call.
         # This seeds the queue so the first N iterations cover all strategy categories
@@ -247,6 +262,11 @@ class StrategyOptimizerAgent:
         await self._do_category_sweep(
             baseline_flags=baseline_flags,
             baseline_metrics=baseline_metrics,
+        )
+        self._inject_attention_backend_trials(
+            baseline_flags=baseline_flags,
+            baseline_metrics=baseline_metrics,
+            profiler_hints=profiler_hints,
         )
         log.info(
             "Stage 2 category sweep seeded %d proposals into queue",
@@ -294,6 +314,32 @@ class StrategyOptimizerAgent:
             category = proposal.get("category", "unknown")
             rationale = proposal.get("rationale", "")
 
+            strategy_cfg = self._capabilities.filter_strategy_config(
+                strategy_cfg,
+                gpu_type=self._gpu_type,
+                model_meta=self._model_meta,
+                model_id=self._model_id,
+            )
+            # Speculative decoding: only allow registered draft pairs
+            if strategy_cfg and strategy_cfg.get("speculative_model"):
+                from core.draft_registry import speculative_strategy_allowed
+                vendor = "amd" if self._vendor == "amd" else "nvidia"
+                ok, reason = speculative_strategy_allowed(
+                    self._model_id, strategy_cfg, vendor=vendor,
+                )
+                if not ok:
+                    log.info(
+                        "Stage 2 iteration %d: speculative blocked (%s)",
+                        iteration, reason,
+                    )
+                    continue
+            if not strategy_cfg:
+                log.info(
+                    "Stage 2 iteration %d: skipped — no supported params after capability filter",
+                    iteration,
+                )
+                continue
+
             # 3. Benchmark the proposed strategy
             fitness, em = await self._benchmark_strategy(
                 session_id=session_id,
@@ -320,25 +366,136 @@ class StrategyOptimizerAgent:
                 "metrics": em,
             })
 
-            if fitness > best_fitness:
+            decision = gate.decide(
+                incumbent_fitness=best_fitness,
+                candidate_fitness=fitness,
+                label=f"stage2_iter{iteration}",
+                metadata={"category": category, "strategy_config": strategy_cfg},
+            )
+            keep = decision.keep
+            if keep and self._critic is not None:
+                verdict = await self._critic.review(
+                    gate=decision,
+                    primary_metric=self._primary_metric,
+                    candidate_flags=strategy_cfg,
+                    incumbent_flags=best_config or baseline_flags,
+                    candidate_metrics=em,
+                    constraints_block=self._experience_constraints,
+                    label=f"stage2_iter{iteration}",
+                )
+                keep = verdict.accept
+                if not keep:
+                    log.info(
+                        "Stage 2 Critic rejected KEEP (iter %d): %s",
+                        iteration, verdict.reason[:120],
+                    )
+            if keep:
                 best_fitness = fitness
                 best_config = strategy_cfg
                 best_category = category
                 log.info(
                     "New best strategy (iteration %d, %s): fitness=%.4f (+%.4f)",
-                    iteration, category, fitness, delta,
+                    iteration, category, fitness, decision.delta,
                 )
 
         improvement = best_fitness - baseline_fitness
+        best_metrics: Dict[str, Any] = {}
+        for entry in history:
+            if entry.get("fitness_score") == best_fitness:
+                best_metrics = entry.get("metrics") or {}
+                break
+        if not best_metrics and history:
+            best_metrics = history[0].get("metrics") or {}
+
         log.info(
             "Stage 2 done: best_fitness=%.4f improvement=%+.4f category=%s config=%s",
             best_fitness, improvement, best_category, best_config,
         )
-        return best_config, best_fitness
+        return best_config, best_fitness, best_metrics
 
     # ------------------------------------------------------------------
     # LLM proposal
     # ------------------------------------------------------------------
+
+    def _inject_attention_backend_trials(
+        self,
+        *,
+        baseline_flags: Dict[str, Any],
+        baseline_metrics: Dict[str, Any],
+        profiler_hints: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Queue attention_backend trials when compute-bound (trace) or GQA+high VRAM.
+        Phase 1 Step 10: systematic backend comparison vs LLM-only luck.
+        """
+        hints = profiler_hints or {}
+        attention_pct = float(hints.get("attention_pct", 0))
+        gemm_pct = float(hints.get("gemm_pct", 0))
+        compute_bound = attention_pct + gemm_pct > 50.0
+
+        util = float(
+            baseline_flags.get("gpu_memory_utilization")
+            or baseline_metrics.get("gpu_memory_utilization")
+            or 0.9
+        )
+        current = baseline_flags.get("attention_backend", "FLASH_ATTN")
+        backends = self._capabilities.supported_attention_backends(
+            self._gpu_type, self._model_meta, self._model_id
+        )
+        if not compute_bound and not (
+            model_has_gqa(self._model_meta, self._model_id) and util >= 0.85
+        ):
+            return
+
+        queued_keys = {
+            json.dumps(q.get("strategy_config", {}), sort_keys=True)
+            for q in self._batch_queue
+        }
+        proposals: List[Dict[str, Any]] = []
+
+        if self._capabilities.flashinfer_recommended(
+            gpu_type=self._gpu_type,
+            model_meta=self._model_meta,
+            model_id=self._model_id,
+            gpu_memory_utilization=util,
+        ) and "FLASHINFER" in backends and current != "FLASHINFER":
+            proposals.append({
+                "strategy_config": {"attention_backend": "FLASHINFER"},
+                "category": "kernel",
+                "rationale": "Phase 1: GQA + high VRAM — FLASHINFER trial",
+            })
+
+        for backend in backends:
+            if backend == current:
+                continue
+            cfg = {"attention_backend": backend}
+            key = json.dumps(cfg, sort_keys=True)
+            if key in queued_keys:
+                continue
+            proposals.append({
+                "strategy_config": cfg,
+                "category": "kernel",
+                "rationale": (
+                    f"Phase 1 attention sweep: {backend} vs {current}"
+                    + (
+                        f" (trace attention={attention_pct:.0f}% gemm={gemm_pct:.0f}%)"
+                        if compute_bound
+                        else ""
+                    )
+                ),
+            })
+
+        for prop in reversed(proposals):
+            key = json.dumps(prop.get("strategy_config", {}), sort_keys=True)
+            if key not in queued_keys:
+                self._batch_queue.insert(0, prop)
+                queued_keys.add(key)
+
+        if proposals:
+            log.info(
+                "Stage 2: queued %d attention backend trial(s) (compute_bound=%s)",
+                len(proposals), compute_bound,
+            )
 
     async def _do_category_sweep(
         self,
@@ -426,7 +583,12 @@ class StrategyOptimizerAgent:
             f"Already tried ({len(tried)}):\n{json.dumps(tried, indent=2)}\n\n"
             f"Experiment history ({len(history_summary)} runs):\n"
             f"{json.dumps(history_summary, indent=2)}\n\n"
-            "Propose the next strategy to try."
+            + (
+                f"{self._experience_constraints}\n\n"
+                if self._experience_constraints
+                else ""
+            )
+            + "Propose the next strategy to try."
         )
 
         try:

@@ -1,0 +1,10 @@
+{
+  "patch_id": "shadow_hook_smoke",
+  "framework": "vllm",
+  "min_version": "0.6.0",
+  "max_version": "1.0.0",
+  "env_flag": "OCEANTUNE_PATCH_SHADOW_HOOK_SMOKE",
+  "hook_ids": ["fused_residual_rmsnorm", "fused_silu_mul"],
+  "description": "Env-gated shadow hook smoke markers for E2E apply verification",
+  "enabled_by_default": false
+}

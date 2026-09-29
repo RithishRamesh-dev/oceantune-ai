@@ -58,7 +58,7 @@ from core.log_analyzer import LogAnalyzer
 log = logging.getLogger("agents.profiler_agent")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_AMD_GPU_TYPES = {"MI300X", "MI325X", "MI350X"}
+_AMD_GPU_TYPES = {"MI300X", "MI325X", "MI350X", "MI355X"}
 
 # Number of warmup + profiling requests
 _WARMUP_REQUESTS = 10

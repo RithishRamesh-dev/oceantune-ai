@@ -216,6 +216,12 @@ class VLLMServer:
     extra_docker_args: List[str] = field(default_factory=list)
     # Extra vLLM CLI args appended after the standard vllm_args (e.g. ["--profiler-config", "{...}"]).
     extra_vllm_args: List[str] = field(default_factory=list)
+    # Optional FrameworkBackend launch override (e.g. SGLang). When set,
+    # _build_command uses docker_image + cli_args from the spec instead of
+    # `vllm serve`.
+    launch_override_cli: Optional[List[str]] = field(default=None)
+    launch_override_image: str = ""
+    container_name_prefix: str = "oceantune-vllm"
 
     # Internal state — not part of __init__ signature
     _process: Optional[asyncio.subprocess.Process] = field(
@@ -513,21 +519,29 @@ class VLLMServer:
     # ── Internal: build command ───────────────────────────────────────────
 
     def _build_command(self) -> List[str]:
-        """Build the docker run command that launches vLLM inside a container."""
+        """Build the docker run command that launches the serving container."""
         profile = _load_gpu_profile(self.gpu_type)
-        docker_image = self._resolve_docker_image()
+        docker_image = self.launch_override_image or self._resolve_docker_image()
 
         hf_token = (
             self.hf_token
             or os.environ.get("HF_TOKEN", "")
             or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
         )
-        hf_cache = os.path.expanduser("~/.cache/huggingface")
+        # Allow HF cache override (DigitalOcean droplets often use /data/hf-cache)
+        hf_cache = (
+            os.environ.get("HF_HOME")
+            or os.environ.get("HUGGINGFACE_HUB_CACHE")
+            or os.path.expanduser("~/.cache/huggingface")
+        )
+        # If HF_HOME / cache env points at .../hub, mount the huggingface root
+        if hf_cache.rstrip("/").endswith("/hub"):
+            hf_cache = str(Path(hf_cache).parent)
         os.makedirs(hf_cache, exist_ok=True)   # must exist before docker -v mount
 
         cmd = [
             "docker", "run", "--rm",
-            "--name", f"oceantune-vllm-{self.port}",
+            "--name", f"{self.container_name_prefix}-{self.port}",
             "-p", f"{self.port}:{self.port}",
             "--shm-size", "2g",
             "-v", f"{hf_cache}:/root/.cache/huggingface",
@@ -568,6 +582,11 @@ class VLLMServer:
 
         # Docker image
         cmd.append(docker_image)
+
+        # FrameworkBackend override (SGLang etc.) — python -m ... style CMD
+        if self.launch_override_cli:
+            cmd += list(self.launch_override_cli)
+            return cmd
 
         # vLLM server args (passed as container CMD to `vllm serve`)
         # model_id is a positional arg that MUST come first

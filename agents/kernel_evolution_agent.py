@@ -289,15 +289,27 @@ class KernelEvolutionAgent:
             )
             ev_iter.benchmark = bench
 
-            # 4. Keep or revert decision
-            speedup = bench.speedup_pct
+            # 4. Keep or revert decision (SNR contract: speedup vs noise margin)
+            from core.snr_contract import evaluate_keep, speedup_from_latencies
 
-            if bench.success and speedup > _MIN_SPEEDUP_PCT:
+            speedup = bench.speedup_pct
+            ratio = speedup_from_latencies(
+                bench.latency_us_ref or best_latency_us or 0.0,
+                bench.latency_us_p50 or 0.0,
+            )
+            keep_eval = evaluate_keep(
+                [ratio] if ratio > 0 else [],
+                incumbent_mean_speedup=1.0,
+                min_speedup=1.0 + (_MIN_SPEEDUP_PCT / 100.0),
+            )
+
+            if bench.success and keep_eval.keep:
                 # Keep!
                 ev_iter.decision = "kept"
                 ev_iter.reason = (
                     f"Speedup +{speedup:.1f}% over reference "
-                    f"({bench.latency_us_p50:.1f}us vs {bench.latency_us_ref:.1f}us ref)"
+                    f"({bench.latency_us_p50:.1f}us vs {bench.latency_us_ref:.1f}us ref); "
+                    f"snr_keep={keep_eval.reason}"
                 )
                 best_kernel = kernel
                 best_speedup = max(best_speedup, speedup)
@@ -313,7 +325,9 @@ class KernelEvolutionAgent:
                     ev_iter.reason = f"Benchmark failed: {bench.error}"
                 else:
                     ev_iter.reason = (
-                        f"No improvement: speedup={speedup:.1f}% < threshold={_MIN_SPEEDUP_PCT}%"
+                        f"No improvement: speedup={speedup:.1f}% "
+                        f"(required_ratio={keep_eval.required_speedup:.3f}, "
+                        f"observed={keep_eval.observed_speedup:.3f})"
                     )
                 result.total_reverted += 1
                 log.info(

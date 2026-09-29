@@ -1,0 +1,51 @@
+# Speculative decoding draft pairs for OceanTune Stage 2.
+# Only propose speculative_model when a pair matches the target HF id.
+
+pairs:
+  - target_model: "Qwen/Qwen2.5-72B-Instruct"
+    draft_model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_speculative_tokens: 5
+    gpu_vendors: ["nvidia", "amd"]
+    notes: "Small Qwen draft for 72B target"
+
+  - target_model: "Qwen/Qwen2.5-7B-Instruct"
+    draft_model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_speculative_tokens: 5
+    gpu_vendors: ["nvidia", "amd"]
+    notes: "Same-family draft"
+
+  - target_model: "meta-llama/Llama-3.1-70B-Instruct"
+    draft_model: "meta-llama/Llama-3.2-1B-Instruct"
+    num_speculative_tokens: 5
+    gpu_vendors: ["nvidia"]
+    notes: "Llama 3.x draft; validate tokenizer compatibility"
+
+  - target_model: "mistralai/Mistral-7B-Instruct-v0.3"
+    draft_model: "mistralai/Mistral-7B-Instruct-v0.3"
+    num_speculative_tokens: 3
+    gpu_vendors: ["nvidia", "amd"]
+    notes: "Self-draft / n-gram style — prefer small draft when available"
+
+  - target_model: "deepseek-ai/DeepSeek-V3"
+    draft_model: "deepseek-ai/DeepSeek-V2-Lite-Chat"
+    num_speculative_tokens: 3
+    gpu_vendors: ["nvidia", "amd"]
+    notes: "MoE target — validate MTP / draft API on stack version"
+
+  - target_model: "deepseek-ai/DeepSeek-V3.2"
+    draft_model: "deepseek-ai/DeepSeek-V2-Lite-Chat"
+    num_speculative_tokens: 3
+    gpu_vendors: ["nvidia", "amd"]
+    notes: "OceanTune default MoE target draft pair"
+
+  - target_model: "Qwen/Qwen2.5-Moe-A14B-Instruct"
+    draft_model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_speculative_tokens: 5
+    gpu_vendors: ["nvidia", "amd"]
+    notes: "Qwen MoE with dense micro-draft"
+
+  - target_model: "moonshotai/Kimi-K2-Instruct"
+    draft_model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_speculative_tokens: 3
+    gpu_vendors: ["nvidia"]
+    notes: "Cross-family draft — experimental; prefer same-tokenizer when available"

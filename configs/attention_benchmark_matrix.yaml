@@ -1,0 +1,28 @@
+# OceanTune — Attention benchmark matrix (Phase 1)
+# Used by AttentionBenchmarkSuite / KernelBenchmarkEngine.
+
+microbench:
+  op_type: attention
+  warmup: 10
+  iters: 50
+  params:
+    batch_size: 1
+    seq_len: 2048
+    num_heads: 32
+    head_dim: 128
+    num_kv_heads: 8
+
+# Optional per-backend vLLM E2E short ramp (expensive — off by default)
+e2e:
+  enabled: false
+  backends: [FLASH_ATTN, FLASHINFER]
+  concurrency_levels: [1, 8, 64]
+  num_prompts: 20
+  context:
+    input_len: 1024
+    output_len: 1024
+
+# Decode-heavy profile for Stage 1/2 context matrix (Step 9)
+decode_heavy_context:
+  input_len: 512
+  output_len: 64

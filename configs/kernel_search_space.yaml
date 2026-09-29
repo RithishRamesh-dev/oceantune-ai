@@ -1,4 +1,10 @@
-# OceanTune AI — Stage 2 Kernel Search Space
+# OceanTune AI — Legacy Kernel Search Space (DEPRECATED)
+# ─────────────────────────────────────────────────────────────────────────────
+# Superseded by configs/stage2_search_space.yaml (StrategyOptimizerAgent).
+# KernelOptimizerAgent is not wired in the live pipeline. NCCL/RCCL, DBO, and
+# attention backend dimensions live in stage2_search_space.yaml.
+#
+# Kept for reference and tests only.
 # ─────────────────────────────────────────────────────────────────────────────
 # These parameters control low-level kernel and runtime behaviour in vLLM.
 # Unlike Stage 1 (VLLMFlags), these are explored via iterative LLM-guided

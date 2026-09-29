@@ -404,6 +404,25 @@ class PlannerAgent:
                 "kv_cache_dtype": "fp8",
             },
         ],
+        "MI355X": [
+            {
+                "tensor_parallel_size": 4,
+                "gpu_memory_utilization": 0.90,
+                "max_num_batched_tokens": 8192,
+                "enforce_eager": True,
+                "trust_remote_code": True,
+                "tokenizer_mode": "deepseek_v41",
+            },
+            {
+                "tensor_parallel_size": 4,
+                "gpu_memory_utilization": 0.92,
+                "max_num_batched_tokens": 16384,
+                "enforce_eager": True,
+                "trust_remote_code": True,
+                "tokenizer_mode": "deepseek_v41",
+                "enable_prefix_caching": True,
+            },
+        ],
     }
 
     # Fallback variations tried in order when the LLM is unavailable.
@@ -432,6 +451,8 @@ class PlannerAgent:
         history: List[Dict[str, Any]],
         iteration: int = 0,
         analyst_eval: Optional[Dict[str, Any]] = None,
+        recipe_context: Optional[str] = None,
+        experience_constraints: Optional[str] = None,
     ) -> Tuple[VLLMFlags, str]:
         """
         Ask the LLM to propose the next configuration to benchmark.
@@ -442,6 +463,10 @@ class PlannerAgent:
             Contains: bottleneck, diagnosis, flag_insights, recommendation.
             When provided, the LLM uses this as the primary signal for what
             to change next.
+        recipe_context : optional str
+            Warm-start lessons/pitfalls from RecipeKnowledgeBase.
+        experience_constraints : optional str
+            Negative priors distilled from failed configs / OOM signatures.
 
         Returns (VLLMFlags, rationale_string).
         Falls back to a curated list of single-parameter variations when
@@ -522,7 +547,9 @@ class PlannerAgent:
             f"Current best metrics:\n{json.dumps(current_best_metrics, indent=2)}\n"
             f"{eval_section}"
             f"{plateau_note}\n"
-            f"History (last {len(recent_history)} iterations):\n"
+            + (f"{recipe_context}\n\n" if recipe_context else "")
+            + (f"{experience_constraints}\n\n" if experience_constraints else "")
+            + f"History (last {len(recent_history)} iterations):\n"
             f"{json.dumps(history_summary, indent=2)}\n\n"
             f"Propose the next configuration to try."
         )

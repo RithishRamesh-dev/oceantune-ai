@@ -1,7 +1,7 @@
 # OceanTune AI — Technical Architecture Document
 
-**Version:** 5.0  
-**Last Updated:** 2026-05-12  
+**Version:** 6.0  
+**Last Updated:** 2026-09-29  
 **Status:** Active Development
 
 ---
@@ -10,45 +10,58 @@
 
 1. [Overview](#1-overview)
 2. [System Architecture](#2-system-architecture)
-3. [Pipeline Stages](#3-pipeline-stages)
-   - [Stage 1 — vLLM Config Search](#31-stage-1--vllm-config-search)
-   - [Stage 2 — Inference Strategy Search](#32-stage-2--inference-strategy-search)
-   - [Stage 3 — Deep Profiling & Bottleneck Reasoning](#33-stage-3--deep-profiling--bottleneck-reasoning)
-   - [Stage 4 — Autonomous Kernel Engineering](#34-stage-4--autonomous-kernel-engineering)
-4. [Core Components](#4-core-components)
-5. [Agent System](#5-agent-system)
-6. [Data Model](#6-data-model)
-7. [Configuration Reference](#7-configuration-reference)
-8. [Hardware Support](#8-hardware-support)
-9. [Fitness Scoring](#9-fitness-scoring)
-10. [Output Artefacts](#10-output-artefacts)
-11. [Deployment](#11-deployment)
-12. [Component Interaction Diagrams](#12-component-interaction-diagrams)
+3. [End-to-End Pipeline](#3-end-to-end-pipeline)
+4. [Pipeline Phases & Stages](#4-pipeline-phases--stages)
+   - [Enablement](#41-enablement--boot-repair)
+   - [Prelude](#42-prelude--warm-recipe--reject-seed)
+   - [Stage 1](#43-stage-1--serving-config-search)
+   - [Macro Stage 2↔3](#44-macro-cycle--stage-2--stage-3)
+   - [Stage 2](#45-stage-2--inference-strategy-search)
+   - [Stage 3](#46-stage-3--deep-profiling--bottleneck-reasoning)
+   - [Operating-Point Sweep](#47-operating-point-sweep)
+   - [Stage 4](#48-stage-4--autonomous-kernel-engineering)
+   - [Stage 4b Campaign](#49-stage-4b--fusion-campaign--ledger)
+   - [CLOSE](#410-close--sedimentation--artefacts)
+5. [Core Components](#5-core-components)
+6. [Agent System](#6-agent-system)
+7. [Data Model](#7-data-model)
+8. [Configuration Reference](#8-configuration-reference)
+9. [Hardware Support](#9-hardware-support)
+10. [Fitness Scoring](#10-fitness-scoring)
+11. [Output Artefacts](#11-output-artefacts)
+12. [Deployment](#12-deployment)
+13. [Component Interaction Diagrams](#13-component-interaction-diagrams)
+14. [Design Invariants](#14-design-invariants)
 
 ---
 
 ## 1. Overview
 
-OceanTune AI is an **autonomous LLM inference optimisation engine** that discovers the highest-throughput vLLM configuration for a given model and GPU without requiring any manual tuning. It wraps a multi-stage pipeline of AI agents that iteratively benchmark, analyse, and improve both server-level configuration flags and GPU kernel implementations.
+OceanTune AI is an **autonomous LLM inference optimisation engine**. Given a Hugging Face `model_id` and GPU SKU, it discovers a high-fitness serving configuration (vLLM or SGLang), optionally engineers fused kernels, and sediments reusable recipes — without manual flag tuning.
+
+Hyperloom (MIT) is used only as a **design reference**. OceanTune never imports or calls Hyperloom at runtime; portable techniques are reimplemented under `core/` and `agents/`.
 
 ### Design Goals
 
 | Goal | How OceanTune achieves it |
-|------|--------------------------|
-| Zero-expert tuning | LLM agent proposes flag changes; human never touches vLLM flags |
-| Reproducible results | Every config is fingerprinted, stored in MongoDB, emits shell scripts |
-| Hardware-aware | Per-GPU profiles gate illegal flag combinations before benchmarking |
-| Progressive depth | Run stops at Stage 1/2/3/4 depending on time budget and config |
-| Safe by default | Correctness firewall validates custom kernels before deployment |
+|------|---------------------------|
+| Zero-expert tuning | LLM agents propose; humans do not edit serving flags |
+| Measurement-owned KEEP | `MeasurementGate` + `CriticAgent` — predicted gains never decide KEEP |
+| Reproducible results | Fingerprinted configs, MongoDB, recipes, session breakdown, checkpoints |
+| Hardware-aware | GPU profiles + capability detection + quantization scheme gating |
+| Progressive depth | Enablement → Prelude → S1 → (S2↔S3)×macro → Sweep → S4 → CLOSE |
+| Multi-framework | `FrameworkBackend` for **vLLM** and **SGLang** |
+| Safe kernels | CorrectnessFirewall (abs/RMS + SNR) → microbench → shadow E2E |
+| Cross-session learning | Recipe KB, experience constraints, attempt ledger, search policy |
 
 ### What OceanTune Optimises
 
 ```
-Input:  model_id="Qwen/Qwen2.5-7B-Instruct", gpu_type="H200"
-Output: highest-fitness vLLM configuration + optional custom Triton kernels
+Input:  model_id, gpu_type, framework ∈ {vllm, sglang}
+Output: winning flags + optional Triton kernels + recipe + session_breakdown
 
-Fitness = f(throughput, latency, memory_efficiency)
-        = weighted harmonic mean of normalised per-metric scores
+Fitness modes (optimiser.primary_metric):
+  throughput | p95_latency | ttft | tpot | prefill_heavy | decode_heavy | cost_aware
 ```
 
 ---
@@ -58,82 +71,79 @@ Fitness = f(throughput, latency, memory_efficiency)
 ### High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         OceanTune AI                                │
-│                                                                     │
-│   CLI: oceantune run --model Qwen/Qwen2.5-7B-Instruct --gpu H200   │
-│                           │                                         │
-│                    ┌──────▼──────┐                                  │
-│                    │  Controller │  ← OceanTuneConfig (YAML + env)  │
-│                    │   Agent     │                                  │
-│                    └──────┬──────┘                                  │
-│                           │                                         │
-│          ┌────────────────┼─────────────────┐                       │
-│          │                │                 │                       │
-│    ┌─────▼─────┐   ┌──────▼──────┐  ┌──────▼──────┐                │
-│    │  Stage 1  │   │   Stage 2   │  │   Stage 3   │                │
-│    │ vLLM Flag │   │  Inference  │  │  Profiling  │                │
-│    │  Search   │   │  Strategy   │  │ Bottleneck  │                │
-│    └─────┬─────┘   └──────┬──────┘  └──────┬──────┘                │
-│          │                │                 │                       │
-│          └────────────────┼─────────────────┘                       │
-│                           │                                         │
-│                    ┌──────▼──────┐                                  │
-│                    │   Stage 4   │  (optional, stage4_enabled)      │
-│                    │   Kernel    │                                  │
-│                    │ Engineering │                                  │
-│                    └──────┬──────┘                                  │
-│                           │                                         │
-│                    ┌──────▼──────┐                                  │
-│                    │   Report    │  recipe.yaml + launch.sh +       │
-│                    │ Generator   │  report.md                       │
-│                    └─────────────┘                                  │
-└─────────────────────────────────────────────────────────────────────┘
-          │                                      │
-   ┌──────▼──────┐                      ┌────────▼────────┐
-   │  MongoDB    │                      │  DO Serverless  │
-   │  (sessions  │                      │  Inference API  │
-   │   configs   │                      │  (LLM agents)   │
-   │  benchmarks)│                      └─────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            OceanTune AI                                  │
+│                                                                          │
+│  CLI: oceantune run --model … --gpu H200                                 │
+│                           │                                              │
+│                    ┌──────▼──────┐                                       │
+│                    │ Controller  │  OceanTuneConfig + PolicyGate         │
+│                    │   Agent     │  SessionCheckpoint + AttemptLedger    │
+│                    └──────┬──────┘                                       │
+│                           │                                              │
+│   Enablement → Prelude → Stage1 → (Stage2 ↔ Stage3)×macro                │
+│                → Sweep → Stage4 → Campaign/Ledger → CLOSE                │
+│                           │                                              │
+│                    ┌──────▼──────┐                                       │
+│                    │   Report    │  recipe.yaml · launch.sh · report.md  │
+│                    │ Generator   │  session_breakdown · checkpoint       │
+│                    └─────────────┘                                       │
+└──────────────────────────────────────────────────────────────────────────┘
+          │                         │                      │
+   ┌──────▼──────┐         ┌────────▼────────┐    ┌───────▼────────┐
+   │  MongoDB    │         │ DO Inference API│    │ Docker serving │
+   │ sessions ·  │         │ (LLM agents)    │    │ vLLM / SGLang  │
+   │ configs ·   │         └─────────────────┘    └────────────────┘
+   │ recipes ·   │
+   │ benchmarks  │
    └─────────────┘
 ```
 
 ### Component Layers
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Presentation Layer                                          │
-│  oceantune.py (Click CLI)  ·  show_results.py               │
-├──────────────────────────────────────────────────────────────┤
-│  Orchestration Layer                                         │
-│  ControllerAgent  ·  Coordinator  ·  NodeClient             │
-├──────────────────────────────────────────────────────────────┤
-│  Agent Layer (LLM-powered)                                   │
-│  PlannerAgent  ·  ExecutorAgent  ·  AnalystAgent            │
-│  StrategyOptimizerAgent  ·  ProfilerAgent                   │
-│  BottleneckReasoningAgent  ·  ResearchAgent                  │
-│  KernelResearchAgent  ·  KernelGenerationAgent              │
-│  CorrectnessFirewallAgent  ·  KernelEvolutionAgent          │
-├──────────────────────────────────────────────────────────────┤
-│  Infrastructure Layer                                        │
-│  VLLMServer  ·  BenchmarkEngine  ·  GPUSlotAllocator        │
-│  PortAllocator  ·  Database  ·  DOClient                    │
-├──────────────────────────────────────────────────────────────┤
-│  Analysis Layer                                              │
-│  MetricsCollector  ·  LogAnalyzer  ·  NcuProfiler           │
-│  RocprofProfiler  ·  OperatorBench  ·  RooflineAnalyzer     │
-├──────────────────────────────────────────────────────────────┤
-│  Configuration Layer                                         │
-│  OceanTuneConfig  ·  SearchSpace  ·  VLLMFlags              │
-│  ConfigValidator  ·  gpu_profiles.yaml                      │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Presentation                                                    │
+│  oceantune.py (Click CLI) · show_results.py                      │
+├─────────────────────────────────────────────────────────────────┤
+│  Orchestration                                                   │
+│  ControllerAgent · PolicyGate · SessionCheckpoint · MacroCycle   │
+│  Enablement · Prelude · Coordinator · NodeClient                 │
+├─────────────────────────────────────────────────────────────────┤
+│  Agent Layer (LLM-powered)                                       │
+│  Planner · Executor · Analyst · Critic · StrategyOptimizer       │
+│  Profiler · BottleneckReasoning · Research                       │
+│  KernelResearch · KernelGeneration · CorrectnessFirewall         │
+│  KernelEvolution                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  Measurement & Learning                                          │
+│  MeasurementGate · PairedBench · Convergence · SearchPolicy      │
+│  RecipeKB · ExperienceConstraints · AttemptLedger · DraftRegistry│
+├─────────────────────────────────────────────────────────────────┤
+│  Kernel / Fusion Plane                                           │
+│  Fusion diagnose/patterns · SNR · NumericalPipeline              │
+│  KernelHarness · KernelIntegration (shadow E2E)                  │
+│  KernelCampaign · KernelLedger · WorkspacePolicy · ServingPatches│
+├─────────────────────────────────────────────────────────────────┤
+│  Serving Infrastructure                                          │
+│  FrameworkBackend (vLLM|SGLang) · VLLMServer · BenchmarkEngine   │
+│  GPUSlotAllocator · PortAllocator · Database · DOClient          │
+├─────────────────────────────────────────────────────────────────┤
+│  Analysis                                                        │
+│  MetricsCollector · LogAnalyzer · NcuProfiler · RocprofProfiler  │
+│  OperatorBench · RooflineAnalyzer · AttentionBench               │
+├─────────────────────────────────────────────────────────────────┤
+│  Configuration & Knowledge                                       │
+│  OceanTuneConfig · SearchSpace · VLLMFlags · gpu_profiles        │
+│  knowledge/{nvidia,amd,common} · QuantizationSchemes             │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 3. Pipeline Stages
+## 3. End-to-End Pipeline
 
-### Full Pipeline Sequence
+Canonical order executed by `ControllerAgent._run_async()`:
 
 ```
 oceantune run
@@ -141,1332 +151,689 @@ oceantune run
       ▼
 ControllerAgent._run_async()
       │
-      ├──▶ Stage 1: vLLM Config Search
-      │         │
-      │         ├── Iteration 0: Baseline (bare minimum flags)
-      │         ├── Iteration 1..N: PlannerAgent proposes → ExecutorAgent benchmarks
-      │         │                   AnalystAgent evaluates → feeds next proposal
-      │         └── Returns: (winner_flags, fingerprint, stage1_fitness)
+      ├── Session create / resume (SessionCheckpoint)
+      ├── FrameworkBackend validate (vllm | sglang)
+      ├── Serving patches → env gates (optional)
+      ├── Quantization scheme → seed flag delta (optional)
       │
-      ├──▶ Stage 2: Inference Strategy Search
-      │         │
-      │         ├── StrategyOptimizerAgent.run() — up to 12 iterations
-      │         │   Each iter: LLM proposes strategy → benchmark → keep if better
-      │         └── Returns: (best_strategy, winner_metrics, stage2_fitness)
+      ├──▶ ENABLEMENT — boot repair ladder
+      │         └── winning safer flags (or fail session early)
       │
-      ├──▶ Stage 3: Deep Profiling + Bottleneck Reasoning
-      │         │
-      │         ├── 3a. ProfilerAgent — PyTorch profiler trace
-      │         ├── 3b. NcuProfiler / RocprofProfiler — hardware counters
-      │         ├── 3c. BottleneckReasoningAgent — LLM classifies bottleneck
-      │         ├── 3d. ResearchAgent — ranked vLLM flag recommendations
-      │         ├── 3e. _try_flag_recommendations() — benchmark each, keep if better
-      │         └── 3f. KernelResearchAgent — deep kernel research (if warranted)
-      │         Returns: (report, bottleneck, kernel_research, stage3_fitness,
-      │                   applied_recs, updated_flags)
+      ├──▶ PRELUDE — Recipe KB warm-replay plan + reject seed
+      │         └── confidence-gated seed flags for Stage 1
       │
-      ├──▶ Stage 4: Autonomous Kernel Engineering  [optional]
-      │         │
-      │         ├── KernelGenerationAgent — generate Triton kernel
-      │         ├── CorrectnessFirewallAgent — validate vs PyTorch reference
-      │         └── KernelEvolutionAgent — keep/revert loop
-      │         Returns: EvolutionResult
+      ├──▶ STAGE 1 — Serving config search (Planner → Executor → Analyst)
+      │         └── (winner_flags, fingerprint, stage1_fitness)
       │
-      └──▶ ReportGenerator
-                │
-                ├── recipe_*.yaml  — ready-to-use vLLM config
-                ├── launch_*.sh    — docker run command
-                └── report_*.md   — full analysis report
+      ├──▶ MACRO CYCLE (Stage 2 ↔ Stage 3) × macro_cycle_max
+      │         ├── Stage 2: Inference strategy search + Critic/MeasurementGate
+      │         ├── Stage 3: Profile → bottleneck → research → flag trials
+      │         │            + fusion diagnose + kernel harness + kernel research
+      │         └── Reloop if budget + headroom remain
+      │
+      ├──▶ SWEEP — Operating-point matrix (concurrency × context)
+      │
+      ├──▶ STAGE 4 — Kernel generate → SNR firewall → evolve  [optional]
+      │         └── Shadow E2E rebench (MeasurementGate)
+      │
+      ├──▶ STAGE 4b — Fusion campaign + KernelLedger  [optional]
+      │
+      └──▶ CLOSE
+                ├── ReportGenerator (recipe.yaml, launch.sh, report.md)
+                ├── Recipe KB sedimentation
+                ├── Session breakdown JSON
+                └── Checkpoint phase=done
 ```
+
+### Phase → Module Map
+
+| Phase | Primary modules |
+|-------|-----------------|
+| Enablement | `core/enablement.py`, `PolicyGate` |
+| Prelude | `core/prelude.py`, `warmstart_policy.py`, `recipe_kb.py` |
+| Stage 1 | `PlannerAgent`, `ExecutorAgent`, `AnalystAgent`, `search_policy`, `attempt_ledger` |
+| Stage 2 | `StrategyOptimizerAgent`, `MeasurementGate`, `CriticAgent`, `draft_registry` |
+| Stage 3 | Profiler / NCU / Rocprof / Bottleneck / Research / fusion / harness |
+| Sweep | `core/operating_point_sweep.py` |
+| Stage 4 | Kernel* agents, `snr_contract`, `numerical_pipeline`, `kernel_integration` |
+| Stage 4b | `kernel_campaign.py`, `kernel_ledger.py`, `workspace_policy.py` |
+| CLOSE | `report_generator`, `recipe_kb.sediment`, `session_breakdown` |
 
 ---
 
-### 3.1 Stage 1 — vLLM Config Search
+## 4. Pipeline Phases & Stages
 
-**Purpose:** Find the best combination of low-level vLLM server flags through iterative LLM-guided search.
+### 4.1 Enablement — Boot Repair
 
-**Search Space:** 21 tunable parameters across parallel config, cache config, model config, scheduler, attention backend, MoE, and speculative decoding.
+**Purpose:** Make a broken stack runnable before search. If the baseline (or first warm config) fails with OOM / startup timeout / attention / MLA errors, walk a deterministic repair ladder.
 
-#### Stage 1 Detailed Flow
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 1: vLLM Config Search                                    │
-│                                                                 │
-│  Iteration 0 (Baseline)                                         │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  VLLMFlags(tensor_parallel_size=1,                      │   │
-│  │            gpu_memory_utilization=0.90,                 │   │
-│  │            ..all other fields at defaults..)            │   │
-│  │                      │                                  │   │
-│  │               ExecutorAgent.run()                       │   │
-│  │                      │                                  │   │
-│  │         ┌────────────▼───────────────┐                  │   │
-│  │         │  VLLMServer (Docker)        │                  │   │
-│  │         │  vllm serve <model>         │                  │   │
-│  │         │  --tensor-parallel-size 1   │                  │   │
-│  │         │  --gpu-memory-util 0.90     │                  │   │
-│  │         │  ...                        │                  │   │
-│  │         └────────────┬───────────────┘                  │   │
-│  │                      │                                  │   │
-│  │         ┌────────────▼───────────────┐                  │   │
-│  │         │  BenchmarkEngine           │                  │   │
-│  │         │  concurrency ramp:         │                  │   │
-│  │         │  [1,2,4,8,16,32,64,128]    │                  │   │
-│  │         │  × context_configs         │                  │   │
-│  │         └────────────┬───────────────┘                  │   │
-│  │                      │                                  │   │
-│  │         ┌────────────▼───────────────┐                  │   │
-│  │         │  MetricsCollector          │                  │   │
-│  │         │  → fitness_score: 0.6924   │                  │   │
-│  │         │  → throughput: 5385 tok/s  │                  │   │
-│  │         └────────────┬───────────────┘                  │   │
-│  │                      │                                  │   │
-│  │              MongoDB: insert benchmark_run              │   │
-│  └──────────────────────────────────────────────────────── ┘   │
-│                                                                 │
-│  Iteration 1..N                                                 │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  AnalystAgent.evaluate_iteration() → analyst_eval dict   │  │
-│  │  PlannerAgent.propose_next(                              │  │
-│  │      current_best=best_flags,                            │  │
-│  │      current_best_metrics=best_metrics,                  │  │
-│  │      history=[{iteration, flags, fitness, rationale}...] │  │
-│  │      analyst_eval={"bottleneck": ..., "recommendation":} │  │
-│  │  ) → (new_flags: VLLMFlags, rationale: str)              │  │
-│  │                                                          │  │
-│  │  [same ExecutorAgent.run() → MetricsCollector loop]      │  │
-│  │                                                          │  │
-│  │  if fitness > best_fitness:                              │  │
-│  │      best_flags = new_flags                              │  │
-│  │      best_fitness = fitness                              │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  Returns: (winner_flags_dict, fingerprint, stage1_fitness)      │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-#### PlannerAgent Logic
+**Module:** `core/enablement.py`
 
 ```
-PlannerAgent.propose_next()
-      │
-      ├── Build LLM context:
-      │     - Model architecture (from models.yaml)
-      │     - GPU hardware profile (from gpu_profiles.yaml)
-      │     - Full search history (all prior iterations)
-      │     - AnalystAgent evaluation of last iteration
-      │     - Current best config + metrics
-      │
-      ├── LLM call → JSON response:
-      │     {
-      │       "change_type": "single_flag",
-      │       "flag_name": "kv_cache_dtype",
-      │       "new_value": "fp8",
-      │       "rationale": "H200 supports FP8 natively ...",
-      │       "expected_improvement_pct": 15.0
-      │     }
-      │
-      ├── Parse → mutate current_best → VLLMFlags
-      │
-      └── Fallback (no LLM key):
-            random mutation via SearchSpace.mutate()
+baseline probe
+    │ fail
+    ▼
+classify_boot_failure(error) → oom | startup_timeout | attention_backend | …
+    │
+    ▼
+repair_ladder(base_flags, error, moe=, mla=)
+    ├── lower util / FP8 KV / max_seqs
+    ├── enforce_eager
+    ├── FLASH_ATTN fallback
+    └── MoE-safe eager path
+    │
+    ▼
+MeasurementGate-style probe each repair until boot succeeds
+    └── seed Stage 1 / Prelude with winning_flags
 ```
 
-#### VLLMFlags Fingerprint
+**Config:** `enablement_enabled`, `enablement_max_repairs`
 
-Every configuration is identified by a deterministic SHA-256 fingerprint:
+---
+
+### 4.2 Prelude — Warm Recipe + Reject Seed
+
+**Purpose:** Before Stage 1 search, optionally seed from Recipe KB and pre-load failure denylists.
+
+**Module:** `core/prelude.py` + `core/warmstart_policy.py`
+
+```
+RecipeKnowledgeBase.lookup(model, gpu, framework)
+    │
+    ▼
+decide_warmstart(confidence ≥ prelude_min_confidence, fitness floor, trial budget)
+    │ accept
+    ▼
+build_prelude_plan → replay_flags + reject_fingerprints + reject_pitfalls
+    │
+    ▼
+accept_warm_replay (retention vs claimed fitness)
+    └── seed_flags → merged into Stage 1 enablement seed
+```
+
+**Config:** `prelude_enabled`, `prelude_min_confidence`, `warmstart_max_trials`
+
+---
+
+### 4.3 Stage 1 — Serving Config Search
+
+**Purpose:** Find the best low-level serving flags (parallelism, memory util, KV dtype, attention, scheduler, …) via iterative LLM-guided search.
+
+**Agents:** `PlannerAgent` → `ExecutorAgent` → `AnalystAgent`  
+**Backend:** `FrameworkBackend` normalizes flags; Executor launches **vLLM** or **SGLang** via `VLLMServer` (optional `launch_override_cli`).
+
+#### Stage 1 Flow
+
+```
+Iteration 0: baseline (defaults)
+Iteration 1..N:
+  ├── warm-start seeds (enablement + prelude + Recipe KB + GPU seeds)
+  ├── or PlannerAgent.propose_next(
+  │         history, analyst_eval, recipe_context,
+  │         experience_constraints + attempt_ledger denylist,
+  │         search_policy EXPLOIT|DIVERSIFY hint
+  │     )
+  ├── PolicyGate.sanitize_flags("stage1", …)
+  ├── ExecutorAgent → Docker serve → BenchmarkEngine ramp → MetricsCollector
+  └── keep if fitness improves
+Returns: (winner_flags, fingerprint, stage1_fitness)
+```
+
+#### Planner context sources
+
+- `models.yaml` architecture metadata  
+- `gpu_profiles.yaml` legality  
+- Recipe KB cascade warm-start  
+- Experience constraints + attempt ledger  
+- Vendor knowledge packs (`knowledge/`)  
+- Search policy (stall → diversify flag families)  
+- Speculative draft hint (`draft_registry` / `configs/draft_models.yaml`)
+
+#### Fingerprint
 
 ```python
-fingerprint = SHA256(
-    sorted(flags.to_dict().items())
-).hexdigest()[:12]
-# Example: "3278005fb230"
+fingerprint = SHA256(sorted(flags.items())).hexdigest()[:12]
 ```
 
-This prevents re-benchmarking the same config across iterations and sessions.
+Prevents duplicate benchmarks within and across sessions.
 
 ---
 
-### 3.2 Stage 2 — Inference Strategy Search
+### 4.4 Macro-Cycle — Stage 2 ↔ Stage 3
 
-**Purpose:** Layer higher-level inference strategies on top of the Stage 1 winner. Explores a different parameter class — not raw vLLM flags, but serving strategies that interact with the scheduler, memory management, and attention kernels.
+**Purpose:** Budgeted reloop between strategy search and profiling so Stage 2 can consume Stage 3 bottleneck / fusion hints.
 
-**Key strategies explored:**
-
-| Strategy | vLLM Flag | Expected Impact |
-|----------|-----------|-----------------|
-| FP8 KV cache | `--kv-cache-dtype fp8` | 10–25% throughput |
-| FlashInfer backend | `--attention-backend FLASHINFER` | 5–15% on GQA models |
-| Chunked prefill | `--enable-chunked-prefill` | Latency variance reduction |
-| Prefix caching | `--enable-prefix-caching` | 15–25% if prefix reuse |
-| Speculative decoding | `--speculative-model` | 30–50% for short outputs |
-| AMD AITER kernels | env var | AMD-specific gains |
-
-#### Stage 2 Detailed Flow
+**Module:** `core/macro_cycle.py`
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 2: StrategyOptimizerAgent.run()  (max 12 iterations)     │
-│                                                                 │
-│  Input: Stage 1 winner_flags + winner_metrics                   │
-│                                                                 │
-│  Each iteration:                                                │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  LLM proposes strategy delta (one or more flag changes):  │  │
-│  │  {                                                        │  │
-│  │    "strategy_type": "kv_cache",                          │  │
-│  │    "flags": {"kv_cache_dtype": "fp8"},                   │  │
-│  │    "rationale": "...",                                    │  │
-│  │    "expected_improvement_pct": 15.0                       │  │
-│  │  }                                                        │  │
-│  │                      │                                    │  │
-│  │  Merge with Stage 1 winner_flags                          │  │
-│  │  → trial_flags = {**winner_flags, **proposed_delta}       │  │
-│  │                      │                                    │  │
-│  │  ConfigValidator.validate(trial_flags, gpu_type)          │  │
-│  │       if invalid → skip                                   │  │
-│  │                      │                                    │  │
-│  │  ExecutorAgent.run() → fitness                            │  │
-│  │                      │                                    │  │
-│  │  if fitness > best_fitness:                               │  │
-│  │      best_strategy = proposed_delta                       │  │
-│  │      best_fitness = fitness                               │  │
-│  │      winner_flags = trial_flags  (cumulative)             │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  Fallback (no LLM): deterministic strategy sweep               │
-│  [fp8 → prefix_caching → FLASHINFER → chunked_prefill → ...]   │
-│                                                                 │
-│  Returns: (best_strategy_delta, winner_metrics, stage2_fitness) │
-└─────────────────────────────────────────────────────────────────┘
+macro_cycle = 0
+cycle_flags = stage1_winner
+loop:
+  Stage 2(cycle_flags, profiler_hints if macro>0)
+  Stage 3(merged_flags)
+  decision = should_reloop_stage2_3(
+      gain headroom, macro_cycle_max,
+      session_remaining_sec from SessionCheckpoint,
+      macro_cycle_min_remaining_sec
+  )
+  if not decision.reloop: break
+  cycle_flags = stage3_flags
+  macro_cycle += 1
 ```
+
+**Config:** `macro_cycle_enabled`, `macro_cycle_max`, `macro_cycle_min_remaining_sec`, `session_max_minutes`
 
 ---
 
-### 3.3 Stage 3 — Deep Profiling & Bottleneck Reasoning
+### 4.5 Stage 2 — Inference Strategy Search
 
-**Purpose:** Understand *why* the current best config performs as it does, identify the dominant bottleneck with hardware-level evidence, then benchmark targeted flag changes and kernel improvements derived from the bottleneck analysis.
+**Purpose:** Layer serving strategies on the Stage 1 winner (KV dtype, attention backend, chunked prefill, prefix cache, speculative decode, scheduler knobs).
 
-#### Stage 3 Detailed Flow
+| Strategy | Typical flag | Notes |
+|----------|--------------|-------|
+| FP8 KV | `kv_cache_dtype=fp8` | Capacity / bandwidth |
+| FlashInfer / FA | `attention_backend` | GPU-gated |
+| Chunked prefill | `enable_chunked_prefill` | Prefill/decode balance |
+| Prefix caching | `enable_prefix_caching` | Shared prefixes |
+| Speculative decode | `speculative_model` + tokens | **Draft registry gated** |
+| Scheduler | `num_scheduler_steps`, … | Throughput vs latency |
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Stage 3: Deep Profiling + Bottleneck Reasoning                     │
-│                                                                     │
-│  Input: Stage 1+2 merged winner_flags, stage2_fitness               │
-│                                                                     │
-│  ─── 3a. PyTorch Profiler Trace ─────────────────────────────────  │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  VLLMServer starts with:                                     │  │
-│  │    extra_docker_args: ["-v", "trace_dir:/tmp/vllm_profile"]  │  │
-│  │    extra_vllm_args:   ["--profiler-config", '{"profiler":    │  │
-│  │                         "torch", "torch_profiler_dir":       │  │
-│  │                         "/tmp/vllm_profile"}']               │  │
-│  │    env: VLLM_RPC_TIMEOUT=1800000                             │  │
-│  │                                                              │  │
-│  │  Warmup: 10 requests at optimal_concurrency                  │  │
-│  │  POST /start_profile                                         │  │
-│  │  Profile: 30 requests at optimal_concurrency                 │  │
-│  │  POST /stop_profile                                          │  │
-│  │  Wait for trace flush (retry 3s → 5s → 10s)                 │  │
-│  │                                                              │  │
-│  │  Parse Chrome trace JSON:                                    │  │
-│  │  {"traceEvents": [{"ph":"X", "cat":"kernel", "dur":us, ...}]}│  │
-│  │                                                              │  │
-│  │  Classify kernels → ProfileTrace:                            │  │
-│  │    attention_pct, gemm_pct, moe_pct, rope_pct, norm_pct,    │  │
-│  │    comm_pct, python_overhead_pct                             │  │
-│  │    top_kernels: List[KernelTiming]                           │  │
-│  │    bottleneck_kernel: str (top kernel by GPU time)           │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  ─── 3b. Hardware Counters ──────────────────────────────────────  │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  if NVIDIA GPU:                                              │  │
-│  │    NcuProfiler (nsight compute CLI)                         │  │
-│  │    Metrics: SM throughput, Tensor Core active %,            │  │
-│  │             DRAM BW util, warp stall reasons,               │  │
-│  │             L1/L2 cache hit rates, occupancy                │  │
-│  │    → NvidiaCounters → HardwareCounters                      │  │
-│  │                                                              │  │
-│  │  if AMD GPU:                                                 │  │
-│  │    RocprofProfiler (omniperf > rocprofv2 > rocprof)         │  │
-│  │    Metrics: MFMA util, VALU util, HBM BW,                   │  │
-│  │             L2 hit rate, wavefront occupancy,               │  │
-│  │             LDS bank conflicts                               │  │
-│  │    → AmdCounters → HardwareCounters                         │  │
-│  │                                                              │  │
-│  │  if tool unavailable: hw_counters = None                    │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  ─── 3c. Bottleneck Reasoning ──────────────────────────────────  │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  BottleneckReasoningAgent.analyse(                           │  │
-│  │      trace, hw_counters, winner_flags,                       │  │
-│  │      model_id, gpu_type                                      │  │
-│  │  ) → BottleneckAnalysis:                                     │  │
-│  │      primary_bottleneck: one of 8 classes:                  │  │
-│  │        compute_tensor | compute_scalar |                     │  │
-│  │        memory_bandwidth | memory_capacity |                  │  │
-│  │        scheduling_overhead | communication |                 │  │
-│  │        occupancy_limited | launch_overhead                   │  │
-│  │      primary_component: str (e.g. "FlashAttention-GQA")     │  │
-│  │      primary_kernel: str                                     │  │
-│  │      evidence_chain: List[str]                               │  │
-│  │      recommended_action: str                                 │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  ─── 3d. Research Agent ────────────────────────────────────────  │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  ResearchAgent.analyse(                                      │  │
-│  │      trace, winner_flags,                                    │  │
-│  │      stage2_strategy,  ← "don't re-recommend these"         │  │
-│  │      model_id, gpu_type                                      │  │
-│  │  ) → ResearchReport:                                         │  │
-│  │      recommendations: List[OptimizationRecommendation]       │  │
-│  │        Each recommendation includes:                         │  │
-│  │          rank, title, category, description                  │  │
-│  │          expected_improvement_pct, confidence, evidence      │  │
-│  │          implementation (CLI string)                         │  │
-│  │          stage: "stage3_flag" | "stage4_custom_kernel"       │  │
-│  │          vllm_flags: {"field": value}  ← machine-readable   │  │
-│  │          (fallback: parsed from implementation string)       │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  ─── 3e. Flag Trials ───────────────────────────────────────────  │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  For each recommendation with stage3_flag and vllm_flags:   │  │
-│  │                                                              │  │
-│  │    Skip if vllm_flags values already in winner_flags         │  │
-│  │    Skip if fingerprint already benchmarked (DB check)        │  │
-│  │                                                              │  │
-│  │    trial_flags = merge(current_flags, rec.vllm_flags)        │  │
-│  │    benchmark(trial_flags) → trial_fitness                    │  │
-│  │                                                              │  │
-│  │    if trial_fitness > current_fitness:                       │  │
-│  │        current_flags = trial_flags     ← cumulative          │  │
-│  │        current_fitness = trial_fitness                       │  │
-│  │        applied_recs.append(rec + delta)                      │  │
-│  │    else:                                                     │  │
-│  │        revert (next rec uses previous best)                  │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  ─── 3f. Kernel Research ───────────────────────────────────────  │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  Only if: custom_kernel_warranted = true                     │  │
-│  │        OR bottleneck.recommended_action starts with          │  │
-│  │           "kernel_generation"                                │  │
-│  │                                                              │  │
-│  │  KernelResearchAgent.research(                               │  │
-│  │      bottleneck, trace, model_id, gpu_type,                  │  │
-│  │      winner_flags=updated_flags  ← post-trial best           │  │
-│  │  ) → KernelResearchReport:                                   │  │
-│  │      approaches: List[KernelApproach]                        │  │
-│  │        approach_type: existing_flag | triton_rewrite |       │  │
-│  │                        cutlass_variant | aiter_flag          │  │
-│  │        expected_speedup_pct, confidence                      │  │
-│  │        can_use_existing_impl, existing_impl_flag             │  │
-│  │        triton_approach, tile_config                          │  │
-│  │      proceed_to_generation: bool                             │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  Returns: (research_report, bottleneck_analysis, kernel_research,  │
-│            stage3_fitness, applied_recs, updated_winner_flags)      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+**KEEP path:** benchmark → `MeasurementGate.decide` → `CriticAgent` sign-off.  
+**PolicyGate:** Stage 2 may only mutate strategy flag keys (TP frozen).
 
-#### Kernel Classification
+---
+
+### 4.6 Stage 3 — Deep Profiling & Bottleneck Reasoning
+
+**Purpose:** Explain *why* the winner is slow and try validated flag remedies; prepare Stage 4 handoff.
 
 ```
-Kernel name → category mapping:
+3a   ProfilerAgent — PyTorch profiler trace
+3a′  KernelHarness — YAML phase cases (prefill/decode shapes)
+3b   NcuProfiler / RocprofProfiler — hardware counters + roofline microbench
+3c   BottleneckReasoningAgent — classify compute / memory / launch / …
+3c′  Fusion diagnose — match residual+RMSNorm, SwiGLU, QK+RoPE, …
+3d   ResearchAgent — ranked flag recommendations (+ knowledge pack)
+3e   Flag trials — MeasurementGate + Critic per recommendation
+3f   KernelResearchAgent — if kernel path warranted
+```
 
-"flash_attn*", "paged_attn*", "self_attn*"  → attention
-"cutlass*", "cublas*", "gemm*", "matmul*"    → gemm
-"rmsnorm*", "layernorm*"                     → norm
-"rope*", "rotary*", "apply_rotary*"          → rope
-"moe*", "expert*", "grouped_gemm*"           → moe
-"nccl*", "all_reduce*", "rccl*"              → comm
-everything else                              → other
+Returns: research report, bottleneck, kernel research, stage3 fitness, applied recs, updated flags, fusion diagnosis.
+
+---
+
+### 4.7 Operating-Point Sweep
+
+**Purpose:** After the macro winner, sweep concurrency × sequence-length operating points to find the real peak (not a single-ramp artifact).
+
+**Module:** `core/operating_point_sweep.py`  
+**PolicyGate action:** `sweep / operating_point_sweep`
+
+---
+
+### 4.8 Stage 4 — Autonomous Kernel Engineering
+
+**Activation:** `stage4_enabled: true` and Stage 3 produced a bottleneck / kernel research handoff.
+
+```
+KernelGenerationAgent
+        │
+        ▼
+CorrectnessFirewallAgent
+  · abs / RMS thresholds per op
+  · SNR estimate gate (≥ ~30 dB) via numerical_pipeline
+        │ pass
+        ▼
+KernelEvolutionAgent — microbench keep/revert (SNR + speedup contract)
+        │
+        ▼
+KernelIntegrationLayer.run_e2e_rebench  [stage4_e2e_enabled]
+  · shadow package + env-gated hooks
+  · Docker serve + MeasurementGate vs incumbent fitness
 ```
 
 ---
 
-### 3.4 Stage 4 — Autonomous Kernel Engineering
+### 4.9 Stage 4b — Fusion Campaign & Ledger
 
-**Purpose:** When Stage 3 identifies a kernel bottleneck that cannot be addressed by flag changes alone, generate a custom Triton (or CUDA) kernel, validate it for correctness, and evolve it through a keep/revert benchmarking loop.
+**Purpose:** Bind evolved kernels to fusion patterns, record provenance, sediment lessons.
 
-**Activation condition:** `stage4_enabled: true` in config AND Stage 3 returns `kernel_research` with `proceed_to_generation: true`.
-
-#### Stage 4 Detailed Flow
+**Modules:** `core/kernel_campaign.py`, `core/kernel_ledger.py`, `core/workspace_policy.py`
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Stage 4: Autonomous Kernel Engineering                             │
-│                                                                     │
-│  Input: bottleneck_analysis, kernel_research, stage3_flags          │
-│                                                                     │
-│  KernelEvolutionAgent.evolve()  (max stage4_iterations=3)           │
-│                                                                     │
-│  For each iteration:                                                │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │                                                              │  │
-│  │  ① KernelGenerationAgent.generate()                         │  │
-│  │     LLM generates complete Triton kernel file:              │  │
-│  │     - @triton.autotune with hardware-specific tile configs   │  │
-│  │     - TMA (H100/H200) or LDS padding (AMD) as appropriate   │  │
-│  │     - Wrapper function matching PyTorch signature            │  │
-│  │     - Built-in correctness test                              │  │
-│  │     - Built-in microbenchmark                                │  │
-│  │     Saved to: kernels/generated/<session_id>/<op>_v<n>.py   │  │
-│  │                                                              │  │
-│  │  ② CorrectnessFirewallAgent.validate()                      │  │
-│  │     Shape sweep against PyTorch reference:                   │  │
-│  │       Checks: max_abs_error, rms_error, NaN/Inf, determinism │  │
-│  │       Thresholds per op:                                     │  │
-│  │         attention: max_abs ≤ 1e-2                           │  │
-│  │         rmsnorm:   max_abs ≤ 1e-3                           │  │
-│  │         gemm:      max_abs ≤ 1e-2                           │  │
-│  │     if fails → _attempt_repair() (LLM fixes kernel)         │  │
-│  │              → if still fails: decision = "failed_correctness"│  │
-│  │                continue to next iteration                    │  │
-│  │                                                              │  │
-│  │  ③ OperatorBench.run()   (microbenchmark)                   │  │
-│  │     Isolated subprocess with CUDA events                    │  │
-│  │     Roofline model: arithmetic_intensity vs ridge_point      │  │
-│  │     speedup_pct = (custom_latency - reference_latency)      │  │
-│  │                    / reference_latency × 100                 │  │
-│  │                                                              │  │
-│  │  ④ Keep/Revert decision:                                    │  │
-│  │     if speedup_pct > 1.0%:   decision = "kept"              │  │
-│  │                               best_kernel = this kernel      │  │
-│  │     else:                    decision = "reverted"           │  │
-│  │                               revert to previous best        │  │
-│  │                                                              │  │
-│  │  Persist: experiments/kernel_experiments.json               │  │
-│  │           experiments/best_kernels.json                      │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  Returns: EvolutionResult:                                          │
-│    best_kernel: GeneratedKernel                                     │
-│    best_speedup_pct: float                                          │
-│    iterations_run, total_kept, total_reverted: int                  │
-└─────────────────────────────────────────────────────────────────────┘
+run_fusion_campaign(patterns, kernels, …)
+    ├── per-pattern research / bind / optional E2E
+    └── KernelLedger.record(decision, snr_db, speedup, identity)
+         └── lessons_for_recipe → Recipe what_worked on CLOSE
 ```
 
-#### Kernel Generation Targets (by operation type)
-
-| Op Type | Reference | Hardware Optimisation |
-|---------|-----------|----------------------|
-| Attention (GQA/MHA) | `flash_attn_func` / SDPA | TMA tiling (H100+), paged cache fusion |
-| GEMM | `torch.mm` / cuBLAS | CUTLASS stream-K, mixed precision |
-| RMSNorm | `torch.nn.RMSNorm` | Fused kernel, vectorised loads |
-| RoPE | manual application | Fused with Q/K projection |
-| MoE dispatch | `torch.topk` + scatter | Grouped GEMM, EP fusion |
+**Config:** `stage4_campaign_enabled`
 
 ---
 
-## 4. Core Components
-
-### 4.1 VLLMServer
-
-Manages the full lifecycle of a vLLM process running inside a Docker container.
+### 4.10 CLOSE — Sedimentation & Artefacts
 
 ```
-VLLMServer lifecycle:
-                                    
-  start()                           
-    │                               
-    ├── docker rm -f oceantune-vllm-{port}   ← clean up stale containers
-    │                               
-    ├── _build_command() →           
-    │   docker run                  
-    │     --gpus device={CUDA_VISIBLE_DEVICES}  (NVIDIA)
-    │     --device /dev/kfd          (AMD)
-    │     -v {hf_cache}:/root/.cache/huggingface
-    │     {extra_docker_args}        ← e.g. profiler volume mount
-    │     {docker_image}             
-    │     {model_id}                 ← positional vllm serve arg
-    │     --host 0.0.0.0             
-    │     --port {port}              
-    │     {flags.to_vllm_args()}     ← VLLMFlags → CLI args
-    │     {gpu_profile.vllm_extra_args}
-    │     {extra_vllm_args}          ← e.g. --profiler-config JSON
-    │                               
-    ├── _capture_logs() task         ← async streaming into deque(maxlen=500)
-    │                               
-    ├── _wait_healthy()              ← poll GET /health (exp backoff, cap 10s)
-    │     monitor logs for OOM / CUDA errors (fail-fast)
-    │     classify: OOMError | StartupTimeout | PortConflict | CUDAError
-    │                               
-    └── state = HEALTHY              
-                                    
-  stop()                            
-    ├── SIGTERM → process group      
-    ├── wait grace_sec=10            
-    ├── SIGKILL if still running     
-    └── docker stop oceantune-vllm-{port}  ← belt-and-suspenders
+ReportGenerator → storage/results/
+  recipe_*.yaml · launch_*.sh · report_*.md
+
+RecipeKnowledgeBase.sediment(
+  best_flags, fitness, lessons, pitfalls, what_worked/failed
+)
+
+build_session_breakdown → session_breakdown_<id>.json
+  (enablement, prelude, macro, sweep, campaign, policy_denials, …)
+
+SessionCheckpoint.phase = done
 ```
-
-**Failure hierarchy:**
-- `OOMError` — CUDA OOM detected in logs
-- `StartupTimeout` — /health never returned 200
-- `PortConflict` — address already in use
-- `CUDAError` — CUDA runtime error
-- `ProcessCrash` — non-zero exit code
-
-### 4.2 BenchmarkEngine
-
-Runs the concurrency ramp benchmark against a running vLLM server.
-
-```
-BenchmarkEngine.run_full_ramp()
-      │
-      ├── For each concurrency level in [1,2,4,8,16,32,64,128]:
-      │     For each (input_len, output_len) in context_configs:
-      │         │
-      │         ├── vllm bench serve
-      │         │     --backend vllm
-      │         │     --model {model_id}
-      │         │     --num-prompts {num_prompts}
-      │         │     --request-rate {concurrency}
-      │         │     --input-len {input_len}
-      │         │     --output-len {output_len}
-      │         │
-      │         └── Parse stdout → BenchmarkResult:
-      │               requests_per_sec
-      │               output_tokens_per_sec  ← primary throughput
-      │               mean/p95/p99 latency_ms
-      │               mean/p95/p99 ttft_ms   ← time to first token
-      │               mean/p95/p99 tpot_ms   ← time per output token
-      │               error_rate
-      │
-      └── Aggregate → RampResult:
-            peak_throughput = max(output_tokens_per_sec across levels)
-            best_concurrency = level at peak
-            summary = {fitness-relevant aggregate metrics}
-```
-
-### 4.3 MetricsCollector & Fitness Score
-
-The fitness score is a weighted harmonic mean of normalised per-metric scores, bounded to [0, 1].
-
-```
-fitness_score = weighted_harmonic_mean([
-    throughput_score   × weight_throughput,
-    latency_score      × weight_latency,
-    ttft_score         × weight_ttft,
-])
-
-where:
-  throughput_score = min(peak_throughput / BASELINE_THROUGHPUT, 1.0)
-  latency_score    = 1 - min(p95_latency / MAX_ACCEPTABLE_LATENCY, 1.0)
-  ttft_score       = 1 - min(mean_ttft / MAX_ACCEPTABLE_TTFT, 1.0)
-
-BASELINE_THROUGHPUT = 5000 tok/s  (normalisation reference)
-MAX_ACCEPTABLE_LATENCY = 10000 ms
-MAX_ACCEPTABLE_TTFT = 2000 ms
-
-primary_metric weighting (default: "throughput"):
-  throughput:  0.70
-  latency:     0.20
-  ttft:        0.10
-```
-
-**Penalties applied before fitness calculation:**
-- OOM failure: `fitness = 0.0`
-- Startup timeout: `fitness = 0.0`
-- Error rate > 5%: `fitness *= 0.5`
-
-### 4.4 Database Schema (MongoDB)
-
-```
-Database: oceantune
-├── sessions                ← one document per optimisation run
-│   ├── _id: ObjectId
-│   ├── model_id: str
-│   ├── gpu_type: str
-│   ├── strategy: str
-│   ├── status: "running" | "done" | "error"
-│   ├── context_configs: [[1024,1024], [1024,4096]]
-│   ├── created_at: datetime
-│   └── metadata: dict
-│
-├── configs                 ← one document per candidate VLLMFlags config
-│   ├── _id: ObjectId
-│   ├── session_id: str
-│   ├── fingerprint: str   ← SHA-256[:12] of sorted flags
-│   ├── flags: dict        ← full VLLMFlags dict
-│   ├── generation: int    ← which iteration (-1 = Stage 3 trial)
-│   ├── priority: int
-│   ├── status: "pending" | "running" | "done" | "failed"
-│   ├── fitness_score: float
-│   ├── enriched_metrics: dict
-│   └── error: str
-│
-├── benchmark_runs          ← one document per (config × context_config) run
-│   ├── _id: ObjectId
-│   ├── session_id: str
-│   ├── config_id: str
-│   ├── input_len, output_len: int
-│   ├── raw_metrics: dict  ← BenchmarkResult fields
-│   ├── enriched_metrics: dict  ← EnrichedMetrics fields
-│   └── timestamp: datetime
-│
-├── kernel_runs             ← Stage 4 kernel evolution results
-│   ├── session_id: str
-│   ├── op_type: str
-│   ├── iteration: int
-│   ├── decision: "kept" | "reverted" | "failed_correctness"
-│   ├── speedup_pct: float
-│   ├── kernel_path: str
-│   └── reason: str
-│
-└── nodes                   ← GPU node heartbeats (multi-node mode)
-    ├── host: str
-    ├── port: int
-    ├── gpu_type: str
-    ├── status: "idle" | "busy"
-    └── last_seen: datetime
-```
-
-### 4.5 Resource Allocators
-
-#### GPUSlotAllocator
-
-```
-GPUSlotAllocator(gpu_indices=[0,1,2,3,4,5,6,7], gpu_type="H100")
-
-acquire(tensor_parallel_size=2) → [0, 1]  ← contiguous slot
-    │
-    ├── NVIDIA: CUDA_VISIBLE_DEVICES=0,1
-    └── AMD:    ROCR_VISIBLE_DEVICES=0,1
-
-release([0, 1]) → returns slot to pool
-```
-
-#### PortAllocator
-
-```
-PortAllocator(start=8000, end=8099)
-
-acquire() → 8001   ← next free port from pool
-release(8001) → returns to pool
-```
-
-Both allocators use `asyncio.Lock` for thread-safe access.
 
 ---
 
-## 5. Agent System
+## 5. Core Components
 
-### 5.1 DOClient (LLM Client)
+### 5.1 FrameworkBackend & VLLMServer
 
-All LLM calls go through `DOClient` which wraps the DigitalOcean Serverless Inference API (OpenAI-compatible):
+| Piece | Role |
+|-------|------|
+| `FrameworkBackend` | Abstract launch/normalize for `vllm` \| `sglang` |
+| `VLLMBackend` | `VLLMFlags.to_vllm_args` → Docker `vllm serve` |
+| `SGLangBackend` | Remap OceanTune flags → `python -m sglang.launch_server` |
+| `VLLMServer` | Docker lifecycle; optional `launch_override_cli` for SGLang |
+| `ExecutorAgent` | Acquires GPU/port, builds backend launch, runs BenchmarkEngine |
+
+### 5.2 Measurement Stack
+
+| Module | Role |
+|--------|------|
+| `MeasurementGate` | Single KEEP/REVERT API from measured fitness |
+| `CriticAgent` | Mission-grounded sign-off on KEEP |
+| `measurement_convergence` | Reject high-spread / monotonic-climb ramps |
+| `paired_bench` | Multi-probe sign agreement before KEEP |
+| `snr_contract` / `numerical_pipeline` | Kernel numerical + statistical KEEP |
+
+### 5.3 Learning Stack
+
+| Module | Role |
+|--------|------|
+| `RecipeKnowledgeBase` | Cascade lookup + CLOSE sediment (Mongo `recipes`) |
+| `experience_constraints` | Negative priors for Planner / Stage 2 |
+| `AttemptLedger` | Typed failure rows → Planner denylist text |
+| `search_policy` | EXPLOIT vs DIVERSIFY on stall |
+| `draft_registry` | Speculative draft pairs (incl. MoE targets) |
+| `knowledge_pack` | NVIDIA / AMD methodology levers |
+
+### 5.4 Kernel / Fusion Stack
+
+| Module | Role |
+|--------|------|
+| `core/fusion/` | Pattern library + diagnose from profiler shares |
+| `kernel_harness` | YAML phase-attributed micro cases |
+| `kernel_integration` | Shadow hooks + E2E rebench |
+| `serving_patches` | Versioned manifests + env gates |
+| `kernel_campaign` / `kernel_ledger` | Stage 4b provenance |
+| `workspace_policy` | Isolated writable paths per session |
+
+### 5.5 BenchmarkEngine & MetricsCollector
+
+- Concurrency ramp over `benchmark.concurrency_levels`  
+- × each `context_configs` pair `(input_len, output_len)`  
+- Fitness via `MetricsCollector` (see §10)  
+- Failures (OOM, timeout) → fitness `0` + attempt ledger / pitfalls
+
+### 5.6 PolicyGate
+
+Stage-allowed actions and flag keys:
+
+| Stage | May mutate serving flags? | Example actions |
+|-------|---------------------------|-----------------|
+| enablement / prelude | Yes (boot set) | `baseline_probe`, `warm_replay` |
+| stage1 | Yes (full Stage 1 set) | `propose_flags`, `benchmark` |
+| stage2 | Strategy keys only | `propose_strategy` |
+| stage3 | Limited set | `profile`, `flag_trial`, `harness` |
+| stage4 | **Frozen** | `generate_kernel`, `shadow_e2e` |
+| sweep / close | Frozen | `operating_point_sweep`, `sediment_recipe` |
+
+### 5.7 SessionCheckpoint
+
+Persists under `storage/sessions/<id>/checkpoint.json`:
+
+- `phase` cursor for `--resume` / `resume_session_id` / `OCEANTUNE_RESUME_SESSION`  
+- winner flags, fitnesses, macro cycle  
+- `RoundBudget.session_max_sec` → feeds macro `session_remaining_sec`
+
+### 5.8 Database (MongoDB)
 
 ```
-DOClient.chat(
-    messages=[{"role": "user", "content": prompt}],
-    system=system_prompt,
-    json_mode=True  ← force JSON output
-) → str  (raw LLM response)
-
-Model selection:
-  1. OCEANTUNE_MODEL_ID env var (explicit override)
-  2. DO_INFERENCE_MODEL env var
-  3. "auto" → pick highest suitability_score from inference_models.yaml
-  4. Fallback: empty string → agent uses heuristic fallback
-
-Credentials:
-  DO_INFERENCE_KEY    ← API key (required for LLM features)
-  DO_INFERENCE_ENDPOINT  ← default: https://inference.do-ai.run/v1
+oceantune
+├── sessions
+├── configs          (fingerprinted candidates)
+├── benchmark_runs
+├── recipes          (Recipe KB)
+├── kernel_runs
+├── kernel_benchmark_runs / kernel_metadata
+└── nodes            (multi-node heartbeats)
 ```
 
-**All agents are designed to degrade gracefully when `DO_INFERENCE_KEY` is absent.** They fall back to heuristic or random behaviour rather than crashing.
+### 5.9 Resource Allocators
 
-### 5.2 Agent Prompting Strategy
-
-All LLM calls use a two-part prompt structure:
-
-```
-System prompt:  Role definition + output schema
-                "You are a world-class GPU inference optimization researcher..."
-                "Respond with a JSON object: {...schema...}"
-
-User prompt:    Factual context (no instructions)
-                - Current config flags
-                - Benchmark metrics
-                - GPU hardware profile
-                - Model architecture
-                - Search history
-```
-
-Requiring JSON output via `json_mode=True` (or via prompt instruction as fallback) makes responses machine-parseable. Every agent has a `_fallback_*()` method for the LLM-unavailable case.
-
-### 5.3 Agent Responsibility Matrix
-
-| Agent | Stage | Input | Output | LLM? | Fallback |
-|-------|-------|-------|--------|------|----------|
-| `PlannerAgent` | 1 | history, metrics | next VLLMFlags | Yes | random mutation |
-| `ExecutorAgent` | 1 | VLLMFlags | benchmark results | Optional | skip sanity |
-| `AnalystAgent` | 1 | session results | AnalysisResult | Yes | basic winner |
-| `StrategyOptimizerAgent` | 2 | winner flags | strategy delta | Yes | deterministic sweep |
-| `ProfilerAgent` | 3 | winner flags | ProfileTrace | No | log fallback |
-| `BottleneckReasoningAgent` | 3 | trace + hw_counters | BottleneckAnalysis | Yes | heuristic 8-class |
-| `ResearchAgent` | 3 | trace, flags | ResearchReport | Yes | heuristic recs |
-| `KernelResearchAgent` | 3 | bottleneck | KernelResearchReport | Yes | skip Stage 4 |
-| `KernelGenerationAgent` | 4 | bottleneck, research | GeneratedKernel | Yes | skeleton kernel |
-| `CorrectnessFirewallAgent` | 4 | kernel, op_type | CorrectnessReport | No | subprocess test |
-| `KernelEvolutionAgent` | 4 | bottleneck, research | EvolutionResult | Yes (repair) | no-op |
+- **GPUSlotAllocator** — contiguous TP slots; `CUDA_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES`  
+- **PortAllocator** — port pool for parallel Docker serves  
 
 ---
 
-## 6. Data Model
+## 6. Agent System
 
-### Key Dataclass Hierarchy
+### 6.1 DOClient
+
+All LLM calls use DigitalOcean Serverless Inference (OpenAI-compatible). Without `DO_INFERENCE_KEY`, agents fall back to heuristic / evolutionary mutations.
+
+### 6.2 Responsibility Matrix
+
+| Agent / Module | Phase | Input | Output | LLM? |
+|----------------|-------|-------|--------|------|
+| Enablement | Boot | Error class | Safer flags | No |
+| Prelude | Warm | Recipe | Seed + rejects | No |
+| PlannerAgent | S1 | History + constraints | Flag proposal | Yes |
+| ExecutorAgent | S1–3 | Flags | Benchmark + fitness | No |
+| AnalystAgent | S1 | Metrics | Bottleneck note | Yes |
+| StrategyOptimizer | S2 | Winner flags | Strategy delta | Yes |
+| CriticAgent | S2/S3 KEEP | GateDecision | KEEP/REVERT | Optional |
+| ProfilerAgent | S3 | Winner | Trace | No |
+| BottleneckReasoning | S3 | Trace + counters | Classification | Yes |
+| ResearchAgent | S3 | Bottleneck | Flag recs | Yes |
+| KernelResearch | S3/S4 | Op bottleneck | Research report | Yes |
+| KernelGeneration | S4 | Spec | Triton source | Yes |
+| CorrectnessFirewall | S4 | Kernel | Pass/fail + SNR | No |
+| KernelEvolution | S4 | Kernel | Keep/revert tree | Yes |
+| ReportGenerator | CLOSE | Session | Artefacts | No |
+
+---
+
+## 7. Data Model
+
+### Key types
 
 ```
 OceanTuneConfig
-├── model_id: str
-├── gpu_type: str
-├── hf_token: str
-├── agent: AgentConfig
-│     ├── model: str
-│     ├── max_tokens: int = 4096
-│     ├── timeout_sec: int = 120
-│     ├── max_turns: int = 6
-│     ├── temperature: float = 0.3
-│     ├── inference_key: str       ← DO_INFERENCE_KEY
-│     └── inference_endpoint: str  ← DO_INFERENCE_ENDPOINT
-├── database: DatabaseConfig
-│     ├── uri: str                 ← MONGO_URI
-│     ├── name: str = "oceantune"
-│     └── collections: Dict[str, str]
-├── nodes: List[NodeConfig]
-│     ├── host: str = "localhost"
-│     ├── node_port: int = 9000
-│     ├── gpu_type: str = "H100"
-│     └── gpu_indices: List[int] = [0..7]
-├── coordinator: CoordinatorConfig
-├── spaces: SpacesConfig  (DigitalOcean Spaces S3 storage)
-├── vllm: VLLMConfig
-│     ├── port: int = 8000
-│     ├── startup_timeout_sec: int = 300
-│     └── docker_image: str
-├── benchmark: BenchmarkConfig
-│     ├── concurrency_levels: [1,2,4,8,16,32,64]
-│     ├── num_prompts: int = 200
-│     ├── input_len: int = 1024
-│     ├── output_len: int = 1024
-│     └── duration_sec: int = 60
-├── optimiser: OptimiserConfig
-│     ├── strategy: str = "evolutionary"
-│     ├── population_size: int = 10
-│     ├── generations: int = 5
-│     ├── mutation_rate: float = 0.2
-│     ├── elite_fraction: float = 0.2
-│     └── primary_metric: str = "throughput"
-├── context_configs: List[Tuple[int,int]]
-│     = [(1024,1024),(1024,4096),(1024,8192),(2048,8192),(4096,16384),(8192,32768)]
-├── stage4_enabled: bool = False
-└── stage4_iterations: int = 3
+VLLMFlags / BackendLaunchSpec
+GateDecision / ConvergenceAssessment / PairedBenchResult
+Recipe / Lesson / Pitfall
+EnablementResult / PreludePlan / PreludeResult
+MacroCycleState
+IntegrationPlan / ShadowHook
+CampaignResult / LedgerEntry
+SessionCheckpoint / AttemptRow
+CorrectnessReport (incl. snr_db_estimate)
+EnrichedMetrics / fitness_score
 ```
 
-### VLLMFlags Parameters
+### VLLMFlags (representative)
 
-```
-VLLMFlags (21+ tunable parameters)
-├── ParallelConfig
-│     ├── tensor_parallel_size: int = 1        # [1,2,4,8]
-│     ├── pipeline_parallel_size: int = 1      # [1,2,4]
-│     ├── enable_expert_parallel: bool = False
-│     ├── data_parallel_size: int = 1
-│     └── distributed_executor_backend: str = "mp"  # "mp" | "ray"
-├── CacheConfig
-│     ├── gpu_memory_utilization: float = 0.90  # [0.70..0.95] step 0.05
-│     ├── block_size: int = 16                  # [1,8,16,32]
-│     ├── kv_cache_dtype: str = "auto"          # auto|fp8|fp8_e4m3|bfloat16
-│     ├── enable_prefix_caching: bool = False
-│     ├── max_num_seqs: int = 256               # [32,64,128,256,512]
-│     └── max_num_batched_tokens: int = 8192    # [2048..65536]
-├── ModelConfig
-│     ├── dtype: str = "auto"                  # auto|bfloat16|float16
-│     ├── quantization: Optional[str] = None   # fp8|awq|gptq|marlin
-│     ├── max_model_len: int = 32768
-│     ├── enforce_eager: bool = False
-│     └── load_format: str = "auto"
-├── Scheduler
-│     ├── scheduler_delay_factor: float = 0.0  # [0.0..0.5]
-│     └── enable_chunked_prefill: bool = False
-├── AttentionConfig
-│     └── attention_backend: str = "auto"     # auto|FLASH_ATTN|FLASHINFER|TRITON
-├── MoE
-│     ├── all2all_backend: str = "allgather_reducescatter"
-│     └── enable_dbo: bool = False
-├── Stage-2
-│     ├── speculative_model: Optional[str] = None
-│     └── num_speculative_tokens: Optional[int] = None
-└── Metadata
-      ├── cpu_offload_gb: int = 0
-      ├── prefix_caching_hash_algo: str = "sha256"  # sha256|xxhash
-      └── run_id: str  # internal, not passed to vLLM
-```
+Parallelism · `gpu_memory_utilization` · `max_num_seqs` · `max_num_batched_tokens` ·  
+`block_size` · `kv_cache_dtype` · `dtype` · `quantization` · `attention_backend` ·  
+`enable_prefix_caching` · `enable_chunked_prefill` · speculative fields · scheduler knobs ·  
+`enforce_eager` · MoE-related options (search-space gated)
+
+SGLang receives a **remapped subset** via `SGLangBackend.normalize_flags`.
 
 ---
 
-## 7. Configuration Reference
+## 8. Configuration Reference
 
-### 7.1 Config File Hierarchy
+### 8.1 Hierarchy
 
-```
-Priority (later overrides earlier):
-  1. Code-level defaults (dataclass fields)
-  2. configs/oceantune.yaml
-  3. Environment variables (OCEANTUNE_* prefix)
-  4. CLI flags (--model, --gpu, --strategy)
-```
+1. `configs/oceantune.yaml`  
+2. Env vars (`OCEANTUNE_*`, `MONGO_URI`, `DO_*`, `HF_TOKEN`, `VLLM_IMAGE`)  
+3. Dataclass defaults in `core/config.py`
 
-### 7.2 Required Environment Variables
+### 8.2 Required Environment
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `MONGO_URI` | MongoDB Atlas / self-hosted connection string | **Yes** |
-| `DO_INFERENCE_KEY` | DigitalOcean Serverless Inference API key | No (agents fall back) |
-| `HF_TOKEN` | Hugging Face token for gated models | Model-dependent |
-| `VLLM_IMAGE` | Docker image override for vLLM | No (from gpu_profiles.yaml) |
+| Variable | Purpose |
+|----------|---------|
+| `MONGO_URI` | MongoDB connection |
+| `HF_TOKEN` | Model download (private models) |
+| `DO_INFERENCE_KEY` | LLM agents (optional but recommended) |
+| `DO_INFERENCE_ENDPOINT` | Inference API base URL |
 
-### 7.3 Optional Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `DO_INFERENCE_ENDPOINT` | Override inference API URL |
-| `DO_INFERENCE_MODEL` | Override LLM model selection |
-| `DO_SPACES_KEY` | DigitalOcean Spaces S3 key |
-| `DO_SPACES_SECRET` | DigitalOcean Spaces S3 secret |
-| `OCEANTUNE_MODEL_ID` | Override model_id |
-| `OCEANTUNE_GPU_TYPE` | Override gpu_type |
-| `OCEANTUNE_PORT` | Override vLLM port |
-| `OCEANTUNE_STRATEGY` | Override optimiser strategy |
-| `OCEANTUNE_PRIMARY_METRIC` | Override primary_metric |
-
-### 7.4 oceantune.yaml Quick Reference
+### 8.3 Pipeline knobs (oceantune.yaml)
 
 ```yaml
-model_id: Qwen/Qwen2.5-7B-Instruct
-gpu_type: H200  # H100 | H200 | B300 | MI300X | MI325X | MI350X
+framework: "vllm"                 # vllm | sglang
+framework_version: "0.6.0"
 
-agent:
-  model: auto
-  max_tokens: 4096
-  temperature: 0.3
-  timeout_sec: 120
-  max_turns: 6
+enablement_enabled: true
+enablement_max_repairs: 4
 
-benchmark:
-  concurrency_levels: [1, 2, 4, 8, 16, 32, 64, 128]
-  num_prompts: 30
-  input_len: 1024
-  output_len: 1024
+prelude_enabled: true
+prelude_min_confidence: 0.7
+warmstart_max_trials: 3
+
+macro_cycle_enabled: true
+macro_cycle_max: 2
+macro_cycle_min_remaining_sec: 1800
+
+session_max_minutes: 0            # 0 = unlimited
+resume_session_id: ""
+
+search_stall_limit: 2
+convergence_max_spread_pct: 15.0
+snr_threshold_db: 30.0
+serving_patches_enabled: true
+quantization_scheme: "none"       # none|fp8|fp8_kv|awq|gptq|nvfp4|bitsandbytes
+
+attention_e2e_enabled: false
+
+stage4_enabled: true
+stage4_iterations: 5
+stage4_e2e_enabled: true
+stage4_campaign_enabled: true
 
 optimiser:
-  strategy: evolutionary  # uses LLM-guided search in v4+
-  population_size: 10
-  generations: 10
-  primary_metric: throughput  # throughput | p95_latency | ttft | tpot
+  generations: 15
+  primary_metric: "throughput"
+  # throughput | p95_latency | ttft | tpot
+  # prefill_heavy | decode_heavy | cost_aware
 
 context_configs:
   - [1024, 1024]
   - [1024, 4096]
-
-nodes:
-  - host: localhost
-    node_port: 9000
-    gpu_type: H200
-    gpu_indices: [0]
-
-stage4_enabled: false   # requires ncu/rocprof + PyTorch+Triton
-stage4_iterations: 3
+  - [512, 64]      # decode-heavy
 ```
+
+### 8.4 Related config files
+
+| File | Role |
+|------|------|
+| `configs/search_space.yaml` | Stage 1 flag space |
+| `configs/stage2_search_space.yaml` | Strategy space |
+| `configs/gpu_profiles.yaml` | Per-SKU Docker / legality |
+| `configs/models.yaml` | Architecture aliases (MoE, MLA, NVFP4) |
+| `configs/draft_models.yaml` | Speculative draft pairs |
+| `configs/kernel_harness_cases.yaml` | Stage 3a′ harness |
+| `configs/kernel_registry/` | Known kernel metadata |
+| `data/serving_patches/` | Versioned patch manifests |
+| `knowledge/` | Vendor lever packs |
 
 ---
 
-## 8. Hardware Support
+## 9. Hardware Support
 
-### 8.1 Supported GPU SKUs
+### 9.1 Supported GPU SKUs
 
-| GPU | Vendor | VRAM | Compute | FP8 | Notes |
-|-----|--------|------|---------|-----|-------|
-| H100 | NVIDIA | 80 GB HBM3 | Hopper (sm_90) | Native | Max TP=8 |
-| H200 | NVIDIA | 141 GB HBM3e | Hopper (sm_90) | Native | Max TP=8 |
-| B300 | NVIDIA | 192 GB HBM3e | Blackwell (sm_100) | + NVFP4 | Max TP=8 |
-| MI300X | AMD | 192 GB HBM3 | CDNA3 (gfx942) | Yes | AITER kernels, block_size=1 for MLA |
-| MI325X | AMD | 256 GB HBM3e | CDNA3 (gfx942) | Yes | AITER kernels |
-| MI350X | AMD | 288 GB HBM3e | CDNA4 (gfx950) | Yes | AITER kernels |
+| GPU | Vendor | Notes |
+|-----|--------|-------|
+| H100 | NVIDIA | FP8 native |
+| H200 | NVIDIA | Large HBM3e |
+| B300 | NVIDIA | Blackwell; **NVFP4** scheme gated |
+| MI300X / MI325X / MI350X | AMD | AITER levers via knowledge + profiles |
 
-### 8.2 Vendor-Specific Behaviour
+### 9.2 Vendor Behaviour
 
 ```
-NVIDIA:
-  GPU slot isolation:  CUDA_VISIBLE_DEVICES=0,1,...
-  Docker GPU flag:     --gpus device={comma-separated-indices}
-  Profiler:            ncu --csv --metrics {19 counter set}
-  Kernel codegen:      Triton with TMA (H100/H200) or standard
-
-AMD:
-  GPU slot isolation:  ROCR_VISIBLE_DEVICES=0,1,...
-  Docker GPU flag:     --device /dev/kfd --device /dev/dri
-                       --group-add video
-  Profiler:            omniperf (preferred) > rocprofv2 > rocprof
-  Kernel codegen:      Triton with LDS padding for bank conflict avoidance
-  Extra flags:         AITER environment variables via kernel_search_space.yaml
+NVIDIA: CUDA_VISIBLE_DEVICES · --gpus device=… · ncu counters · Triton/TMA
+AMD:    ROCR_VISIBLE_DEVICES · /dev/kfd+/dev/dri · rocprof/omniperf · LDS-aware Triton
 ```
 
-### 8.3 Hardware Counter Sets
-
-**NVIDIA (ncu)**
-
-| Counter | Meaning |
-|---------|---------|
-| `sm__throughput.avg.pct_of_peak_sustained_elapsed` | SM utilisation % |
-| `sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak` | Tensor Core active % |
-| `l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum` | Global load bytes |
-| `dram__bytes.sum` | DRAM traffic |
-| `smsp__sass_average_branch_targets_threads_uniform.pct` | Warp divergence |
-| `smsp__warp_issue_stalled_mio_throttle_per_issue_active.pct` | Warp stall: mem throttle |
-
-**AMD (rocprof/omniperf)**
-
-| Counter | Meaning |
-|---------|---------|
-| `SQ_INSTS_MFMA` | MFMA (matrix) instructions |
-| `SQ_INSTS_VALU` | VALU instructions |
-| `TCC_EA_RDREQ` | HBM read requests |
-| `TCC_HIT` | L2 cache hits |
-| `LDS_BANK_CONFLICT` | LDS bank conflicts |
-| `WAVE_OCCUPANCY` | Average wavefront occupancy |
+Quantization schemes are GPU-gated in `core/quantization_schemes.py` (e.g. `nvfp4` → B300 only).
 
 ---
 
-## 9. Fitness Scoring
+## 10. Fitness Scoring
 
-### 9.1 Fitness Formula
+### 10.1 Formula (default `throughput`)
 
 ```
-fitness_score ∈ [0.0, 1.0]
+peak_throughput, p95_latency, mean_ttft, mean_tpot  ← from ramp
 
-Step 1 — raw metric extraction from RampResult:
-  peak_throughput = max(output_tokens_per_sec over all concurrency levels)
-  best_concurrency = concurrency level at peak_throughput
-  p95_latency = p95_latency_ms at best_concurrency
-  mean_ttft = mean_ttft_ms at best_concurrency
+throughput_score = min(peak_throughput / 5000, 1.0)
+latency_score    = 1 - min(p95_latency / 10000, 1.0)
+ttft_score       = 1 - min(mean_ttft / 2000, 1.0)
+tpot_score       = 1 - min(mean_tpot / ref, 1.0)
 
-Step 2 — normalise each metric to [0, 1]:
-  throughput_score = min(peak_throughput / 5000, 1.0)
-  latency_score    = 1 - min(p95_latency / 10000, 1.0)
-  ttft_score       = 1 - min(mean_ttft / 2000, 1.0)
-
-Step 3 — weighted sum (primary_metric="throughput"):
-  fitness = 0.70 × throughput_score
-          + 0.20 × latency_score
-          + 0.10 × ttft_score
-
-Step 4 — apply penalties:
-  if oom_detected:               fitness = 0.0
-  if startup_timeout:            fitness = 0.0
-  if error_rate > 0.05:          fitness *= 0.5
-  if peak_throughput < 100:      fitness *= 0.1   ← suspicious
+fitness = Σ (weight_i × score_i)   # weights depend on primary_metric
 ```
 
-### 9.2 Primary Metric Weights
+### 10.2 Primary metric weights
 
-| primary_metric | throughput | latency | ttft |
-|----------------|-----------|---------|------|
-| `throughput` | 0.70 | 0.20 | 0.10 |
-| `p95_latency` | 0.20 | 0.70 | 0.10 |
-| `ttft` | 0.20 | 0.10 | 0.70 |
-| `tpot` | 0.50 | 0.40 | 0.10 |
+| Mode | Emphasis |
+|------|----------|
+| `throughput` | Peak tok/s |
+| `p95_latency` / `ttft` / `tpot` | Latency-first |
+| `prefill_heavy` | Throughput + TTFT |
+| `decode_heavy` | Throughput + TPOT (short decode contexts helped by `[512,64]`) |
+| `cost_aware` | Throughput per GB VRAM (DO cost proxy) |
 
-### 9.3 Convergence Detection
+**Penalties:** OOM / startup failure → `0`; high error rate → multiplicative penalty.
 
-The `AnalystAgent` reads the fitness time-series from MongoDB and reports:
-- **Converged** — top-3 configs within 0.5% of each other
-- **Improving** — monotonic increase over last 5 iterations
-- **Stalled** — no improvement in last 3 iterations
-- **Diverged** — mid-search collapse (exploration noise)
+### 10.3 Convergence & paired fidelity
+
+- `assess_convergence` — discard warmup; reject high spread or strict monotonic climb  
+- `evaluate_paired_probes` — require agreeing positive deltas before KEEP helpers  
 
 ---
 
-## 10. Output Artefacts
+## 11. Output Artefacts
 
-After every run, three files are written to `storage/results/`:
+| Artefact | Location | Contents |
+|----------|----------|----------|
+| YAML recipe | `storage/results/recipe_*.yaml` | Winner flags + metadata |
+| Launch script | `storage/results/launch_*.sh` | Docker run command |
+| Markdown report | `storage/results/report_*.md` | Stage-by-stage summary |
+| Session breakdown | `session_breakdown_<id>.json` | Full phase extras |
+| Checkpoint | `storage/sessions/<id>/checkpoint.json` | Resume cursor |
+| Attempts | `storage/sessions/<id>/attempts.jsonl` | Failure ledger |
+| Kernel ledger | under workspace / storage | Stage 4b provenance |
+| Mongo recipes | `recipes` collection | Cross-session warm-start |
 
-### 10.1 YAML Recipe (`recipe_*.yaml`)
+---
 
-Machine-readable optimised configuration, ready to paste into any deployment:
+## 12. Deployment
 
-```yaml
-model_id: Qwen/Qwen2.5-7B-Instruct
-gpu_type: H200
-fitness_score: 0.6925
-fingerprint: 3278005fb230
+### 12.1 Prerequisites
 
-vllm_flags:
-  attention_backend: FLASHINFER
-  gpu_memory_utilization: 0.9
-  kv_cache_dtype: auto
-  enable_chunked_prefill: false
-  ...
+- Docker (GPU-enabled)  
+- MongoDB (`MONGO_URI`)  
+- Python 3.11+ / project `.venv`  
+- Optional: `ncu` / `rocprof`, PyTorch + Triton (Stage 4)  
+- Optional: `DO_INFERENCE_KEY` for LLM-guided search  
 
-stage2_strategy:
-  attention_backend: FLASHINFER
-
-stage3_research:
-  bottleneck_type: unknown
-  recommendations:
-    - rank: 1
-      title: "Enable FP8 KV Cache"
-      vllm_flags: {kv_cache_dtype: fp8}
-      expected_improvement_pct: 35.0
-      ...
-
-# Optional Stage 4 section
-stage4_kernel_engineering:
-  op_type: attention
-  best_speedup_pct: 12.3
-  best_kernel_path: kernels/generated/...
-```
-
-### 10.2 Shell Script (`launch_*.sh`)
-
-Production-ready `docker run` command with all optimised flags merged across all stages:
+### 12.2 Typical commands
 
 ```bash
-#!/usr/bin/env bash
-# OceanTune AI — Optimised vLLM launch script
-# Fitness: 0.6925
+# Full pipeline
+oceantune run --model deepseek-ai/DeepSeek-V3.2 --gpu H200
 
-MODEL=Qwen/Qwen2.5-7B-Instruct
-IMAGE=vllm/vllm-openai:latest
+# Framework override
+OCEANTUNE_FRAMEWORK=sglang oceantune run …
 
-docker run --gpus all --ipc=host \
-  -p 8000:8000 \
-  "$IMAGE" \
-  --tensor-parallel-size 1 \
-  --gpu-memory-utilization 0.9 \
-  --max-num-seqs 256 \
-  --max-num-batched-tokens 8192 \
-  --attention-backend FLASHINFER \   # ← Stage 2 flag included
-  --kv-cache-dtype fp8               # ← Stage 3 flag (if applied)
+# Resume interrupted session
+OCEANTUNE_RESUME_SESSION=<session_id> oceantune run …
+
+# Wall-clock budget (minutes)
+OCEANTUNE_SESSION_MAX_MINUTES=180 oceantune run …
 ```
 
-### 10.3 Markdown Report (`report_*.md`)
+### 12.3 Single-node vs multi-node
 
-Human-readable report sections:
+- **Single-node:** Controller + local GPUSlotAllocator / PortAllocator  
+- **Multi-node:** Coordinator dispatches configs to NodeClient workers  
+
+---
+
+## 13. Component Interaction Diagrams
+
+### 13.1 Full session sequence
 
 ```
-## Pipeline Performance Summary
-| Stage | Fitness | vs Previous |
-|-------|---------|-------------|
-| Stage 1 — vLLM Config Search  | 0.6924 | baseline       |
-| Stage 2 — Inference Strategy  | 0.7103 | +0.0179 (+2.6%)|
-| Stage 3 — Profiling + Trials  | 0.7241 | +0.0138 (+1.9%)|
-| Stage 4 — Kernel Engineering  | —      | +8.3% speedup  |
+CLI → Controller
+        ├─ Checkpoint / FrameworkBackend / Patches / Quant scheme
+        ├─ Enablement ──probe──▶ VLLMServer/SGLang
+        ├─ Prelude ──lookup──▶ RecipeKB
+        ├─ Stage1 loop
+        │     Planner → Executor → BenchmarkEngine → MetricsCollector → Analyst
+        │     SearchPolicy / AttemptLedger / ExperienceConstraints
+        ├─ Macro
+        │     Stage2 → MeasurementGate → Critic
+        │     Stage3 → Profiler → Fusion → Research → FlagTrials → KernelResearch
+        ├─ Sweep
+        ├─ Stage4 → Generate → Firewall(SNR) → Evolve → E2E rebench
+        ├─ Campaign → Ledger
+        └─ CLOSE → Report + Recipe sediment + Breakdown
+```
 
-## Stage 1 Winner Configuration
-  Top 5 configs, key flags, analyst explanation
+### 13.2 KEEP decision path (Stage 2/3/4)
 
-## Stage 2 — Inference Strategy
-  Strategy flags applied, delta vs Stage 1
+```
+Agent proposes
+      │
+      ▼
+Executor / microbench / E2E measures fitness
+      │
+      ▼
+MeasurementGate.decide(incumbent, candidate)
+      │
+      ▼
+CriticAgent (optional LLM / hard rules)
+      │
+      ▼
+KEEP → update incumbent   |   REVERT → discard
+```
 
-## Stage 3 — Profiling & Research
-  Applied Flag Changes (validated in Stage 3)
-  All Optimization Recommendations (with rank, confidence, evidence)
+### 13.3 Stage 4 kernel path
 
-## Stage 4 — Autonomous Kernel Engineering
-  Evolution history table (per-iteration decision + speedup)
+```
+Bottleneck / Fusion pattern
+      │
+      ▼
+Generate Triton → CorrectnessFirewall (abs/RMS + SNR)
+      │
+      ▼
+Evolution microbench (snr_contract.evaluate_keep)
+      │
+      ▼
+ShadowDocker E2E (MeasurementGate vs serving incumbent)
+      │
+      ▼
+Campaign bind + KernelLedger → Recipe lessons
 ```
 
 ---
 
-## 11. Deployment
+## 14. Design Invariants
 
-### 11.1 Prerequisites
+1. **Agents propose; measurements decide.** No KEEP from LLM-claimed speedups alone.  
+2. **Hyperloom is reference-only** — no runtime dependency.  
+3. **PolicyGate bounds power** per phase (Stage 4 freezes serving flags).  
+4. **Fingerprints dedupe** expensive benchmarks.  
+5. **Recipes sediment only measured winners** (+ typed failures/pitfalls).  
+6. **Kernels need numerical + performance + (optional) E2E** before trust.  
+7. **Session checkpoints** make long runs resumable under wall-clock budgets.
 
-```bash
-# Required
-Python >= 3.10
-Docker with NVIDIA Container Toolkit (or ROCm for AMD)
-MongoDB Atlas or self-hosted MongoDB 6+
+### Related docs
 
-# Environment variables
-export MONGO_URI="mongodb+srv://user:pass@host/oceantune?tls=true"
-export DO_INFERENCE_KEY="dop_v1_..."       # for LLM features
-export HF_TOKEN="hf_..."                    # for gated models
-
-# Optional (for Stage 3/4 profiling)
-# NVIDIA: nsight-systems-cli, nsight-compute (ncu)
-# AMD: rocprof / rocprofv2 / omniperf
-# Kernel generation: torch, triton
-```
-
-### 11.2 Installation
-
-```bash
-git clone https://github.com/RithishRamesh-dev/oceantune-ai
-cd oceantune-ai
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-### 11.3 Running
-
-```bash
-# Minimal run (Stage 1 only, uses heuristic fallback without LLM)
-oceantune run --model Qwen/Qwen2.5-7B-Instruct --gpu H200
-
-# Full pipeline with LLM-guided search
-DO_INFERENCE_KEY=dop_v1_... oceantune run \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --gpu H200 \
-  --config configs/oceantune.yaml
-
-# Custom config
-oceantune run --config my_config.yaml
-
-# Dry run (validate config, no GPU required)
-oceantune run --dry-run --config configs/oceantune.yaml
-
-# Validate config file
-oceantune validate-config --config configs/oceantune.yaml
-
-# Show recent results
-python show_results.py
-```
-
-### 11.4 Single-Node Architecture
-
-```
-GPU Server (e.g. DigitalOcean H200 Droplet)
-┌─────────────────────────────────────────────────────────┐
-│                                                         │
-│  Host OS                                                │
-│  ├── oceantune run  (Python process)                    │
-│  │     ├── ControllerAgent                             │
-│  │     ├── GPUSlotAllocator  (GPU indices [0..n])      │
-│  │     ├── PortAllocator     (ports 8000–8099)         │
-│  │     └── MongoDB client    (remote Atlas)            │
-│  │                                                     │
-│  └── Docker containers  (launched per experiment)      │
-│       ├── oceantune-vllm-8000  (active benchmark)      │
-│       └── oceantune-vllm-8001  (parallel, if tp=1)     │
-│                                                         │
-│  GPU: H200 (141 GB)                                     │
-│  NVIDIA Container Toolkit                               │
-└─────────────────────────────────────────────────────────┘
-          │                          │
-   MongoDB Atlas              DO Serverless
-   (sessions, configs,        Inference API
-    benchmark_runs)           (LLM agent calls)
-```
-
-### 11.5 Multi-Node Architecture (Coordinator Mode)
-
-```
-Control Node
-┌───────────────────────────────────┐
-│  ControllerAgent                  │
-│  Coordinator ──── NodeClient      │
-└───────────────────────────────────┘
-         │              │
-   ┌─────▼─────┐  ┌─────▼─────┐
-   │ GPU Node 1│  │ GPU Node 2│
-   │ node_server│  │ node_server│
-   │  :9000    │  │  :9000    │
-   │  NodeWorker│  │  NodeWorker│
-   └───────────┘  └───────────┘
-```
+- [`docs/research/hyperloom_oceantune_integration.md`](./research/hyperloom_oceantune_integration.md)  
+- [`docs/research/oceantune_capability_inventory.md`](./research/oceantune_capability_inventory.md)  
 
 ---
 
-## 12. Component Interaction Diagrams
-
-### 12.1 Full Session Sequence
-
-```
-User           CLI         Controller    Stage1        Stage2        Stage3        Stage4        DB            LLM
- │              │               │           │              │             │             │            │             │
- │  run(...)   │               │           │              │             │             │            │             │
- ├─────────────▶               │           │              │             │             │            │             │
- │              │  __init__()  │           │              │             │             │            │             │
- │              ├──────────────▶           │              │             │             │            │             │
- │              │  .run()      │           │              │             │             │            │             │
- │              ├──────────────▶           │              │             │             │            │             │
- │              │               │          │              │             │             │            │             │
- │              │               │ create_session()        │             │             │            │             │
- │              │               ├──────────────────────────────────────────────────────────────────▶            │
- │              │               │          │              │             │             │            │             │
- │              │               │ _stage1()│              │             │             │            │             │
- │              │               ├──────────▶              │             │             │            │             │
- │              │               │          │  (N iterations)            │             │            │             │
- │              │               │          │  propose_next()            │             │            │             │
- │              │               │          ├──────────────────────────────────────────────────────────────────▶ │
- │              │               │          │              │             │             │            │             │
- │              │               │          │  executor.run() (per config)             │            │             │
- │              │               │          │  VLLMServer + BenchmarkEngine            │            │             │
- │              │               │          │  → insert benchmark_run                 │            │             │
- │              │               │          ├──────────────────────────────────────────────────────▶            │
- │              │               │          │              │             │             │            │             │
- │              │               │◀─────────┘ (winner_flags, s1_fitness)│             │            │             │
- │              │               │          │              │             │             │            │             │
- │              │               │ _stage2()│              │             │             │            │             │
- │              │               ├────────────────────────▶             │             │            │             │
- │              │               │          │              │  propose strategy          │            │             │
- │              │               │          │              ├─────────────────────────────────────────────────────▶
- │              │               │          │              │  benchmark each            │            │             │
- │              │               │◀─────────────────────────────────────────────────────────────────────────────│
- │              │               │          │              │             │             │            │             │
- │              │               │ _stage3()│              │             │             │            │             │
- │              │               ├──────────────────────────────────────▶             │            │             │
- │              │               │          │              │  profiler + ncu           │            │             │
- │              │               │          │              │  bottleneck reasoning      │            │             │
- │              │               │          │              │  research + flag trials    │            │             │
- │              │               │◀──────────────────────────────────────────────────│             │            │
- │              │               │          │              │             │             │            │             │
- │              │               │ _stage4()│              │             │             │            │             │
- │              │               ├──────────────────────────────────────────────────▶│             │            │
- │              │               │          │              │             │  generate   │            │             │
- │              │               │          │              │             │  validate   │            │             │
- │              │               │          │              │             │  evolve     │            │             │
- │              │               │◀──────────────────────────────────────────────────┘             │            │
- │              │               │          │              │             │             │            │             │
- │              │               │ generate_report()       │             │             │            │             │
- │              │               ├──────────────────────────────────────────────────────────────────▶           │
- │              │               │ recipe.yaml + launch.sh + report.md                │            │             │
- │◀─────────────────────────────┘          │              │             │             │            │             │
-```
-
-### 12.2 ExecutorAgent Detail
-
-```
-ExecutorAgent.run(session_id, config_doc, context_configs)
-│
-├── await gpu_alloc.acquire(tp_size)     → slot=[0,1]
-├── await port_alloc.acquire()           → port=8001
-│
-├── VLLMServer(flags, port=8001,
-│             extra_env={CUDA_VISIBLE_DEVICES="0,1"})
-│    ├── .start()
-│    │    ├── docker rm -f oceantune-vllm-8001
-│    │    ├── docker run --gpus device=0,1 ...
-│    │    └── poll GET /health (timeout=1200s)
-│    │         ├── OOM detected in logs → raise OOMError
-│    │         └── healthy → proceed
-│    │
-│    ├── For each context in context_configs:
-│    │    ├── BenchmarkEngine.run_full_ramp()
-│    │    │    └── vllm bench serve ...
-│    │    │         → parse stdout → BenchmarkResult
-│    │    │
-│    │    ├── LogAnalyzer.analyze(server.log_tail)
-│    │    │    → LogAnalysis (load_time, kv_cache_blocks, errors)
-│    │    │
-│    │    ├── MetricsCollector.collect(ramp, analysis, flags, gpu_profile)
-│    │    │    → EnrichedMetrics (fitness_score=0.6924)
-│    │    │
-│    │    └── db.create_benchmark_run(session_id, config_id, ...)
-│    │
-│    └── .stop()
-│         ├── SIGTERM process group
-│         └── docker stop oceantune-vllm-8001
-│
-├── await gpu_alloc.release(slot)
-└── await port_alloc.release(port)
-```
-
-### 12.3 Stage 3 Flag Trial Loop
-
-```
-Stage 3e: _try_flag_recommendations()
-
-winner_flags = {attention_backend: FLASHINFER, gpu_memory_util: 0.9, ...}
-current_fitness = 0.7103
-
-recommendation 1: {title: "FP8 KV Cache", vllm_flags: {kv_cache_dtype: fp8}}
-  │
-  ├── Skip check: winner_flags["kv_cache_dtype"] = "auto" ≠ "fp8"  → proceed
-  │
-  ├── trial_flags = {**winner_flags, kv_cache_dtype: "fp8"}
-  ├── fingerprint = SHA256(trial_flags)
-  ├── db.insert_config(fingerprint) → config_id (or None if duplicate)
-  │
-  ├── executor.run(config_id, context_configs)
-  │    → fitness = 0.7241
-  │
-  ├── 0.7241 > 0.7103  → KEEP
-  │    winner_flags["kv_cache_dtype"] = "fp8"
-  │    current_fitness = 0.7241
-  │    applied.append({title, flags, before=0.7103, after=0.7241, delta=+0.0138})
-  │
-recommendation 2: {title: "Prefix Caching", vllm_flags: {enable_prefix_caching: true}}
-  │
-  ├── trial_flags = {**winner_flags, enable_prefix_caching: true}
-  ├── executor.run() → fitness = 0.7109
-  │
-  └── 0.7109 < 0.7241  → REVERT
-       winner_flags unchanged (keep fp8, reject prefix_caching)
-
-Returns: (updated_flags, 0.7241, [rec1_applied])
-```
-
-### 12.4 Stage 4 Kernel Evolution Loop
-
-```
-KernelEvolutionAgent.evolve()
-
-get_reference_latency(op_type="attention")
-  → reference_ms = 4.2 ms  (PyTorch SDPA / FlashAttn)
-
-iteration 1:
-  KernelGenerationAgent.generate()
-    → triton_code (200+ lines)
-    → saved: kernels/generated/<session>/attention_v1.py
-
-  CorrectnessFirewallAgent.validate()
-    → shape sweep: [B,H,N,D] across 12 shapes
-    → max_abs_error = 0.003 ≤ 0.01  ✓
-    → deterministic ✓
-    → passed = True
-
-  OperatorBench.run()
-    → custom_ms = 3.7 ms
-    → speedup_pct = (4.2 - 3.7) / 4.2 × 100 = 11.9%
-
-  11.9% > 1.0%  → KEPT
-    best_kernel = attention_v1.py
-    best_speedup_pct = 11.9%
-
-iteration 2:
-  KernelGenerationAgent.generate()
-    → different tile config (128×64 vs 64×64)
-
-  CorrectnessFirewallAgent.validate()
-    → max_abs_error = 0.018 > 0.01  ✗
-    → _attempt_repair() → LLM fixes accumulation type
-    → re-validate → passed = True
-
-  OperatorBench.run()
-    → custom_ms = 4.1 ms
-    → speedup_pct = 2.4%
-
-  2.4% > 1.0%  → KEPT
-    best_speedup_pct = max(11.9%, 2.4%) = 11.9%  (v1 is still best)
-
-persistence:
-  experiments/kernel_experiments.json  ← all iterations
-  experiments/best_kernels.json        ← current best per op_type
-```
-
----
-
-*Generated by OceanTune AI documentation toolchain.*  
-*For issues and contributions: [github.com/RithishRamesh-dev/oceantune-ai](https://github.com/RithishRamesh-dev/oceantune-ai)*
+*End of Technical Architecture Document v6.0*

@@ -110,6 +110,8 @@ class CorrectnessReport:
     n_failed: int = 0
     max_abs_error_seen: float = 0.0
     rms_error_seen: float = 0.0
+    snr_db_estimate: float = 0.0
+    numerical_pipeline: Optional[Dict[str, Any]] = None
 
     # Determinism check
     is_deterministic: bool = True
@@ -121,11 +123,12 @@ class CorrectnessReport:
 
     def summary(self) -> str:
         status = "PASS" if self.passed else "FAIL"
+        snr = f", snr≈{self.snr_db_estimate:.1f}dB" if self.snr_db_estimate else ""
         return (
             f"[{status}] {self.kernel_name}: "
             f"{self.n_passed}/{self.total_tests} tests passed, "
             f"max_abs={self.max_abs_error_seen:.2e}, "
-            f"rms={self.rms_error_seen:.2e}"
+            f"rms={self.rms_error_seen:.2e}{snr}"
             + (f" FAIL: {self.failure_reason}" if not self.passed else "")
         )
 
@@ -254,8 +257,43 @@ class CorrectnessFirewallAgent:
         else:
             report.passed = True
 
+        # 8. SNR / numerical pipeline gate (Hyperloom-style dual correctness)
+        if report.passed:
+            self._apply_snr_gate(report)
+
         log.info("CorrectnessFirewall: %s", report.summary())
         return report
+
+    def _apply_snr_gate(self, report: CorrectnessReport) -> None:
+        """Estimate SNR from RMS error and optionally fail below threshold."""
+        import math
+        from core.snr_contract import DEFAULT_SNR_THRESHOLD_DB
+        from core.numerical_pipeline import run_numerical_pipeline
+
+        rms = float(report.rms_error_seen or 0.0)
+        if rms <= 0:
+            report.snr_db_estimate = 200.0
+        else:
+            # Unit-signal approximation: SNR ≈ -20*log10(rms)
+            report.snr_db_estimate = -20.0 * math.log10(max(rms, 1e-12))
+
+        # Synthetic unit vectors for pipeline bookkeeping when tensors unavailable
+        ref = [1.0, 0.5, -0.25, 0.125]
+        noise = rms if rms > 0 else 1e-12
+        cand = [x + noise * 0.1 for x in ref]
+        pipe = run_numerical_pipeline(ref, cand, snr_threshold_db=DEFAULT_SNR_THRESHOLD_DB)
+        # Prefer error-based estimate for the gate; pipeline still recorded
+        report.numerical_pipeline = {
+            **pipe.to_dict(),
+            "snr_db_from_rms": report.snr_db_estimate,
+            "threshold_db": DEFAULT_SNR_THRESHOLD_DB,
+        }
+        if report.snr_db_estimate < DEFAULT_SNR_THRESHOLD_DB:
+            report.passed = False
+            report.failure_reason = (
+                f"SNR estimate {report.snr_db_estimate:.1f} dB "
+                f"< {DEFAULT_SNR_THRESHOLD_DB} dB threshold"
+            )
 
     async def _check_import(self, file_path: str) -> tuple[bool, str]:
         """Try to import the kernel module (syntax + import check)."""

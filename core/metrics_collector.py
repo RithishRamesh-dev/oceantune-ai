@@ -344,6 +344,12 @@ class MetricsCollector:
             "p95_latency": (0.20,       0.60,    0.10, 0.10),
             "ttft":        (0.15,       0.05,    0.70, 0.10),
             "tpot":        (0.15,       0.05,    0.10, 0.70),
+            # Prefill-heavy: TTFT + throughput dominate (prompt processing)
+            "prefill_heavy": (0.40,     0.15,    0.40, 0.05),
+            # Decode-heavy: TPOT + throughput (generation bandwidth / KV)
+            "decode_heavy":  (0.40,     0.10,    0.10, 0.40),
+            # Cost-aware: same as throughput but efficiency bonus applied below
+            "cost_aware":    (0.50,     0.20,    0.15, 0.15),
         }
         wt, wl, wttft, wtpot = weights.get(
             primary_metric, weights["throughput"]
@@ -354,6 +360,14 @@ class MetricsCollector:
             wttft * ttft_score +
             wtpot * tpot_score
         )
+        # Cost-aware: reward tokens per GB VRAM (proxy for $/token on fixed GPU rent)
+        if primary_metric == "cost_aware" and em.throughput_per_gb_vram:
+            eff = cls._log_score(
+                float(em.throughput_per_gb_vram),
+                baseline=1.0,
+                ceiling=500.0,
+            )
+            raw_score = 0.7 * raw_score + 0.3 * eff
 
         # ── Penalties ─────────────────────────────────────────────────────
         # Error rate: linear penalty, max 50%

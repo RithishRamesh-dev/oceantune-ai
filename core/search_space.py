@@ -12,7 +12,7 @@ Handles:
 
 Supported GPU targets:
   NVIDIA: H100, H200, B300
-  AMD:    MI300X, MI325X, MI350X
+  AMD:    MI300X, MI325X, MI350X, MI355X
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ GPU_PROFILES_YAML = REPO_ROOT / "configs" / "gpu_profiles.yaml"
 # ---------------------------------------------------------------------------
 # GPU type sets
 # ---------------------------------------------------------------------------
-_AMD_GPU_TYPES = {"MI300X", "MI325X", "MI350X"}
+_AMD_GPU_TYPES = {"MI300X", "MI325X", "MI350X", "MI355X"}
 _NVIDIA_GPU_TYPES = {"H100", "H200", "B300"}
 
 
@@ -197,6 +197,7 @@ class VLLMFlags:
     enforce_eager: bool = False
     load_format: str = "auto"
     trust_remote_code: bool = False
+    tokenizer_mode: str = "auto"
 
     # ── Scheduler ─────────────────────────────────────────────────────────
     scheduler_delay_factor: float = 0.0
@@ -269,6 +270,8 @@ class VLLMFlags:
             args.append("--trust-remote-code")
         if self.enable_chunked_prefill:
             args.append("--enable-chunked-prefill")
+        if self.tokenizer_mode and self.tokenizer_mode != "auto":
+            args += ["--tokenizer-mode", self.tokenizer_mode]
 
         # Optional value flags
         if self.quantization:

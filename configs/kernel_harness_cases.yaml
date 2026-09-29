@@ -1,0 +1,100 @@
+# OceanTune — Kernel harness case suite
+# Isolated op shapes approximating serving phases (not full paged KV).
+# Consumed by core/kernel_harness.py → kernel_benchmark_runs.
+
+defaults:
+  warmup: 5
+  iters: 30
+
+cases:
+  - id: attention_prefill_gqa
+    op_type: attention
+    phase: prefill
+    tags: [gqa, long_context]
+    params:
+      batch_size: 1
+      seq_len: 2048
+      num_heads: 32
+      head_dim: 128
+      num_kv_heads: 8
+
+  - id: attention_decode_gqa
+    op_type: attention
+    phase: decode
+    tags: [gqa, decode_heavy]
+    params:
+      batch_size: 32
+      seq_len: 1
+      num_heads: 32
+      head_dim: 128
+      num_kv_heads: 8
+    # Decode approximation: short Q against long KV is not modeled here;
+    # OperatorBench uses seq_len for both. Prefer E2E decode context for truth.
+    notes: Synthetic decode proxy; validate with context [512,64] E2E.
+
+  - id: attention_mla_proxy
+    op_type: attention
+    phase: prefill
+    tags: [mla, deepseek]
+    params:
+      batch_size: 1
+      seq_len: 1024
+      num_heads: 128
+      head_dim: 64
+      num_kv_heads: 1
+    notes: Head geometry proxy for MLA; not a true latent-cache kernel.
+
+  - id: gemm_ffn_wide
+    op_type: gemm
+    phase: both
+    tags: [ffn]
+    params:
+      M: 2048
+      N: 8192
+      K: 4096
+
+  - id: gemm_decode_narrow
+    op_type: gemm
+    phase: decode
+    tags: [decode]
+    params:
+      M: 64
+      N: 4096
+      K: 4096
+
+  - id: rmsnorm_hidden
+    op_type: rmsnorm
+    phase: both
+    tags: [norm, fusion_candidate]
+    params:
+      batch_size: 32
+      seq_len: 1
+      hidden_dim: 4096
+
+  - id: rope_gqa
+    op_type: rope
+    phase: both
+    tags: [rope, fusion_candidate]
+    params:
+      batch_size: 1
+      seq_len: 2048
+      num_heads: 32
+      head_dim: 128
+
+  - id: moe_dispatch_proxy
+    op_type: moe
+    phase: both
+    tags: [moe]
+    params:
+      batch_size: 64
+      seq_len: 128
+      hidden_dim: 2048
+      num_experts: 64
+      top_k: 2
+
+# Which cases to run by default in Stage 3 (subset for wall-clock)
+stage3_default:
+  - attention_prefill_gqa
+  - attention_decode_gqa
+  - gemm_decode_narrow
+  - rmsnorm_hidden

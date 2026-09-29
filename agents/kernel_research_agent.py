@@ -207,6 +207,8 @@ class KernelResearchAgent:
         winner_flags: Optional[Dict[str, Any]] = None,
         model_meta: Optional[Dict[str, Any]] = None,
         gpu_profile: Optional[Dict[str, Any]] = None,
+        fusion_context: Optional[str] = None,
+        knowledge_block: Optional[str] = None,
     ) -> KernelResearchReport:
         """
         Research optimization approaches for the identified bottleneck.
@@ -232,6 +234,10 @@ class KernelResearchAgent:
             model_meta=model_meta or {},
             gpu_profile=gpu_profile or {},
         )
+        if fusion_context:
+            user_msg = f"{user_msg}\n\n{fusion_context}"
+        if knowledge_block:
+            user_msg = f"{user_msg}\n\n{knowledge_block}"
 
         try:
             raw = await self._client.chat(
@@ -297,7 +303,7 @@ class KernelResearchAgent:
         model_meta: Dict[str, Any],
         gpu_profile: Dict[str, Any],
     ) -> str:
-        vendor = "amd" if gpu_type in {"MI300X", "MI325X", "MI350X"} else "nvidia"
+        vendor = "amd" if gpu_type in {"MI300X", "MI325X", "MI350X", "MI355X"} else "nvidia"
         sections = [
             f"Model: {model_id}",
             f"GPU: {gpu_type} (vendor={vendor})",
@@ -355,7 +361,7 @@ class KernelResearchAgent:
         gpu_type: str,
     ) -> KernelResearchReport:
         """Heuristic approaches when LLM is unavailable."""
-        vendor = "amd" if gpu_type in {"MI300X", "MI325X", "MI350X"} else "nvidia"
+        vendor = "amd" if gpu_type in {"MI300X", "MI325X", "MI350X", "MI355X"} else "nvidia"
 
         if bottleneck.primary_bottleneck in ("compute_tensor", "memory_bandwidth"):
             if bottleneck.primary_component == "attention":

@@ -273,7 +273,7 @@ class ResearchAgent:
             )
         top_kernels_table = "\n".join(top_kernels_lines) if top_kernels_lines else "  (no kernel data)"
 
-        vendor = "amd" if gpu_type in {"MI300X", "MI325X", "MI350X"} else "nvidia"
+        vendor = "amd" if gpu_type in {"MI300X", "MI325X", "MI350X", "MI355X"} else "nvidia"
 
         user_msg = _CONTEXT_PROMPT_TEMPLATE.format(
             model_id=model_id,

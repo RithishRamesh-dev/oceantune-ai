@@ -9,7 +9,9 @@ Collections
   nodes          — heartbeat / capacity records for each GPU droplet
   configs        — candidate VLLMFlags configs with status tracking
   benchmark_runs — raw + enriched benchmark results per config per context
-  kernel_runs    — Stage-2 kernel-level results
+  kernel_runs            — Stage-2 strategy search results
+  kernel_benchmark_runs  — isolated operator/kernel microbenchmarks
+  kernel_metadata        — kernel implementation registry (stub)
 
 Usage
 -----
@@ -121,6 +123,25 @@ class Database:
         await self.db["kernel_runs"].create_indexes([
             IndexModel([("session_id", ASCENDING), ("iteration", ASCENDING)]),
             IndexModel([("created_at", DESCENDING)]),
+        ])
+        await self.db["kernel_benchmark_runs"].create_indexes([
+            IndexModel([("session_id", ASCENDING), ("op_type", ASCENDING)]),
+            IndexModel([("created_at", DESCENDING)]),
+        ])
+        await self.db["kernel_metadata"].create_indexes([
+            IndexModel([("op_type", ASCENDING), ("backend", ASCENDING)]),
+            IndexModel([("implementation_id", ASCENDING)], unique=True, sparse=True),
+        ])
+        await self.db["recipes"].create_indexes([
+            IndexModel([("recipe_id", ASCENDING)], unique=True),
+            IndexModel([
+                ("model_id", ASCENDING),
+                ("gpu_type", ASCENDING),
+                ("framework", ASCENDING),
+                ("precision", ASCENDING),
+            ]),
+            IndexModel([("best_fitness", DESCENDING)]),
+            IndexModel([("updated_at", DESCENDING)]),
         ])
         log.debug("MongoDB indexes ensured")
 
@@ -277,6 +298,17 @@ class Database:
             },
         )
 
+    async def list_failed_configs(
+        self, session_id: str, limit: int = 20
+    ) -> List[Dict]:
+        """Return failed configs for recipe pitfall mining."""
+        cursor = (
+            self.db["configs"]
+            .find({"session_id": session_id, "status": "failed"})
+            .limit(limit)
+        )
+        return await cursor.to_list(length=limit)
+
     async def requeue_config(self, config_id: str) -> None:
         """Reset a failed config to pending (for retry)."""
         from bson import ObjectId
@@ -424,6 +456,151 @@ class Database:
             self.db["kernel_runs"]
             .find({"session_id": session_id})
             .sort("iteration", ASCENDING)
+            .limit(limit)
+        )
+        return await cursor.to_list(length=limit)
+
+    def _enriched_metrics_from_kernel_run(self, doc: Dict) -> Dict[str, Any]:
+        """Extract enriched_metrics from a kernel_run document."""
+        raw = doc.get("raw_metrics") or {}
+        if isinstance(raw.get("enriched_metrics"), dict):
+            return raw["enriched_metrics"]
+        return raw if isinstance(raw, dict) else {}
+
+    async def get_stage2_winner_metrics(self, session_id: str) -> Dict[str, Any]:
+        """
+        Return enriched metrics for the best Stage 2 kernel_run (strategy search).
+
+        Used as winner_metrics for Stage 3 profiling concurrency selection.
+        """
+        doc = await self.get_best_kernel_run(session_id)
+        if doc:
+            return self._enriched_metrics_from_kernel_run(doc)
+        return {}
+
+    # ------------------------------------------------------------------
+    # Kernel benchmark runs (isolated op microbenchmarks)
+    # ------------------------------------------------------------------
+
+    async def insert_kernel_benchmark_run(
+        self,
+        *,
+        session_id: str,
+        op_type: str,
+        backend: str = "pytorch",
+        gpu_type: str = "",
+        kernel_name: str = "",
+        params: Optional[Dict[str, Any]] = None,
+        metrics: Optional[Dict[str, Any]] = None,
+        source: str = "operator_bench",
+    ) -> str:
+        """Insert an isolated kernel benchmark result. Returns run_id."""
+        from core.kernel_benchmark import KernelBenchmarkMetrics, KernelBenchmarkRun
+
+        kb_metrics = KernelBenchmarkMetrics(**(metrics or {}))
+        run = KernelBenchmarkRun(
+            session_id=session_id,
+            op_type=op_type,
+            backend=backend,
+            gpu_type=gpu_type,
+            kernel_name=kernel_name,
+            params=params or {},
+            metrics=kb_metrics,
+            source=source,
+        )
+        doc = run.to_mongo_doc()
+        result = await self.db["kernel_benchmark_runs"].insert_one(doc)
+        return str(result.inserted_id)
+
+    async def upsert_kernel_metadata(self, doc: Dict[str, Any]) -> bool:
+        """Insert or update a kernel_metadata document by implementation_id."""
+        impl_id = doc.get("implementation_id") or doc.get("backend")
+        if not impl_id:
+            return False
+        doc = {**doc, "implementation_id": impl_id, "updated_at": _now()}
+        result = await self.db["kernel_metadata"].update_one(
+            {"implementation_id": impl_id, "op_type": doc.get("op_type", "attention")},
+            {"$set": doc},
+            upsert=True,
+        )
+        return result.upserted_id is not None or result.modified_count > 0
+
+    async def list_kernel_metadata(
+        self, op_type: Optional[str] = None, limit: int = 50
+    ) -> List[Dict]:
+        filt: Dict[str, Any] = {}
+        if op_type:
+            filt["op_type"] = op_type
+        cursor = self.db["kernel_metadata"].find(filt).limit(limit)
+        return await cursor.to_list(length=limit)
+
+    async def list_kernel_benchmark_runs(
+        self, session_id: str, op_type: Optional[str] = None, limit: int = 50
+    ) -> List[Dict]:
+        filt: Dict[str, Any] = {"session_id": session_id}
+        if op_type:
+            filt["op_type"] = op_type
+        cursor = (
+            self.db["kernel_benchmark_runs"]
+            .find(filt)
+            .sort("created_at", DESCENDING)
+            .limit(limit)
+        )
+        return await cursor.to_list(length=limit)
+
+    # ------------------------------------------------------------------
+    # Recipes (cross-session knowledge base)
+    # ------------------------------------------------------------------
+
+    async def upsert_recipe(self, doc: Dict[str, Any]) -> str:
+        """Insert or replace a recipe document by recipe_id. Returns recipe_id."""
+        recipe_id = doc.get("recipe_id")
+        if not recipe_id:
+            raise ValueError("recipe_id required")
+        await self.db["recipes"].update_one(
+            {"recipe_id": recipe_id},
+            {"$set": doc},
+            upsert=True,
+        )
+        return str(recipe_id)
+
+    async def get_recipe_by_id(self, recipe_id: str) -> Optional[Dict]:
+        return await self.db["recipes"].find_one({"recipe_id": recipe_id})
+
+    async def get_recipe(
+        self,
+        *,
+        model_id: str,
+        gpu_type: str,
+        framework: str = "vllm",
+        precision: str = "auto",
+    ) -> Optional[Dict]:
+        return await self.db["recipes"].find_one({
+            "model_id": model_id,
+            "gpu_type": gpu_type,
+            "framework": framework,
+            "precision": precision,
+        })
+
+    async def search_recipes(
+        self,
+        *,
+        model_id: Optional[str] = None,
+        gpu_type: Optional[str] = None,
+        framework: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict]:
+        filt: Dict[str, Any] = {}
+        if model_id:
+            filt["model_id"] = model_id
+        if gpu_type:
+            filt["gpu_type"] = gpu_type
+        if framework:
+            filt["framework"] = framework
+        cursor = (
+            self.db["recipes"]
+            .find(filt)
+            .sort("best_fitness", DESCENDING)
             .limit(limit)
         )
         return await cursor.to_list(length=limit)

@@ -16,7 +16,7 @@ OceanTune is an automated vLLM inference optimisation system. It benchmarks your
 
 ## How OceanTune works
 
-OceanTune runs a two-stage pipeline driven by four LLM agents powered by [DigitalOcean Serverless Inference](https://www.digitalocean.com/products/ai-ml/serverless-inference).
+OceanTune runs a four-stage pipeline driven by LLM agents powered by [DigitalOcean Serverless Inference](https://www.digitalocean.com/products/ai-ml/serverless-inference). Stages 3–4 (profiling, kernel research, optional custom kernel generation) run when configured in `configs/oceantune.yaml`.
 
 ### Stage 1 — Iterative vLLM config search
 
@@ -42,9 +42,17 @@ Each iteration is a closed feedback loop:
 4. **PlannerAgent** receives the diagnosis and recommendation, then calls the LLM to propose the single most impactful flag change for the next iteration.
 5. Repeat for N generations. The planner detects fitness plateaus and regression configs and signals the LLM to explore more aggressively.
 
-### Stage 2 — Kernel-level search
+### Stage 2 — Inference strategy search
 
-`KernelOptimizerAgent` takes the Stage 1 winner and iteratively tunes lower-level settings: attention backend (`FLASH_ATTN`, `FLASHINFER`), KV cache dtype, scheduler parameters, and GPU-vendor-specific flags (NVIDIA DBO, AMD AITER kernels). 10 iterations.
+`StrategyOptimizerAgent` takes the Stage 1 winner and iteratively tunes serving strategies: FP8 KV cache, prefix caching, chunked prefill, speculative decoding, attention backend (`FLASH_ATTN`, `FLASHINFER`), MoE dispatch, NCCL/RCCL env vars, and AMD AITER kernels. Up to 12 iterations. Results are merged with Stage 1 flags before Stage 3 profiling.
+
+### Stage 3 — Profiling and bottleneck reasoning
+
+`ProfilerAgent`, hardware profilers (NCU / rocprof), `BottleneckReasoningAgent`, and `ResearchAgent` diagnose bottlenecks and benchmark flag recommendations in-place.
+
+### Stage 4 — Autonomous kernel engineering (optional)
+
+When `stage4_enabled: true`, `KernelEvolutionAgent` generates and microbenchmarks custom Triton kernels. Set `stage4_enabled: false` to skip.
 
 ### Output
 
@@ -362,22 +370,22 @@ flowchart LR
         ANALYST -->|"analyst_eval dict"| PLAN
     end
 
-    subgraph S2["Stage 2 — Kernel Search  (10 iterations)"]
+    subgraph S2["Stage 2 — Strategy Search  (12 iterations)"]
         direction TB
-        KO["KernelOptimizerAgent\n────────────────\nLLM kernel flag proposals\natop winner_flags\nAttention backend, KV dtype,\nNVIDIA DBO, AMD AITER"]
+        SO["StrategyOptimizerAgent\n────────────────\nKV, speculative decode,\nattention backend, MoE/AMD"]
         DB2[("MongoDB\nkernel_runs")]
-        KO <-->|"propose + record"| DB2
+        SO <-->|"propose + record"| DB2
     end
 
     CTRL -->|"Iteration 0: baseline flags"| S1
     S1 -->|"winner_flags"| S2
-    S2 -->|"best_kernel"| RG["ReportGenerator"]
+    S2 -->|"best_strategy delta"| RG["ReportGenerator"]
     RG --> OUT(["storage/results/\nYAML recipe\nShell script\nMarkdown report"])
 
     DO(["DO Serverless Inference\nanthropic-claude-4.5-sonnet\n─────────────────\nAll 4 agent LLM calls"])
     PLAN -.- DO
     ANALYST -.- DO
-    KO -.- DO
+    SO -.- DO
 ```
 
 ### Fitness score formula
@@ -385,18 +393,15 @@ flowchart LR
 `MetricsCollector` computes a single `[0, 1]` fitness score per benchmark run:
 
 ```
-fitness = (0.70 × throughput_score + 0.30 × latency_score) × (1 − penalties)
-
-throughput_score = log(tok_s / 100) / log(50000 / 100)   # log-scaled, 100→50000 range
-latency_score    = (30000 − p95_ms) / (30000 − 10)       # inverted, 10ms→30000ms range
+fitness = (0.55 × throughput + 0.20 × p95_latency + 0.15 × ttft + 0.10 × tpot) × (1 − penalties)
 
 penalties:
-  error_rate_penalty  = min(50%, error_rate × 50%)
+  error_rate_penalty   = min(50%, error_rate × 50%)
   failed_level_penalty = 10% per failed concurrency level
   oom_penalty          = 30% if OOM/crash detected in logs
 ```
 
-For other primary metrics, the weights shift: `p95_latency` → `(30%, 70%)`, `ttft` → `(20%, 0%, 80%, 0%)`.
+For other primary metrics, weights shift — see `core/metrics_collector.py` (`p95_latency`, `ttft`, `tpot` modes).
 
 ---
 
@@ -460,17 +465,21 @@ oceantune-ai/
 ├── docker-compose.yml
 │
 ├── agents/
-│   ├── controller_agent.py         # Orchestrates Stage 1 loop and Stage 2
-│   ├── planner.py                  # Proposes next VLLMFlags; plateau + regression detection
+│   ├── controller_agent.py         # Orchestrates Stages 1–4
+│   ├── planner.py                  # Stage 1: proposes next VLLMFlags
 │   ├── executor.py                 # Runs one config: vLLM Docker + benchmark + MongoDB write
 │   ├── analyst.py                  # Per-iteration bottleneck diagnosis + session winner analysis
-│   ├── kernel_optimizer.py         # Stage 2: 10-iteration LLM kernel flag search
+│   ├── strategy_optimizer.py       # Stage 2: inference strategy search
+│   ├── profiler_agent.py           # Stage 3: Torch profiler trace
+│   ├── kernel_optimizer.py         # Legacy Stage 2 (unused by controller)
 │   └── do_client.py                # DO Serverless Inference HTTP client (retry, JSON mode)
 │
 ├── core/
 │   ├── config.py                   # Config dataclasses + YAML loader
 │   ├── db.py                       # MongoDB async client — 5 collections + analytics pipelines
 │   ├── search_space.py             # VLLMFlags dataclass, SearchSpace sampler, ConfigValidator
+│   ├── flag_merge.py               # merge_flags() across pipeline stages
+│   ├── kernel_benchmark.py         # Kernel benchmark run schema (MongoDB)
 │   ├── vllm_server.py              # Starts/stops vLLM in Docker; injects GPU env vars
 │   ├── benchmark_runner.py         # Concurrency ramp; asyncio.wait partial-result collection
 │   ├── metrics_collector.py        # EnrichedMetrics; fitness scoring; OOM penalty
@@ -486,7 +495,8 @@ oceantune-ai/
 │   ├── gpu_profiles.yaml           # Per-GPU: VRAM, Docker image, env vars, recommended settings
 │   ├── models.yaml                 # Per-model: architecture, GPU requirements, extra vLLM flags
 │   ├── search_space.yaml           # Stage 1: 20 tunable vLLM flag parameters
-│   ├── kernel_search_space.yaml    # Stage 2: 15 kernel-level parameters
+│   ├── stage2_search_space.yaml    # Stage 2: strategy + kernel flags
+│   ├── kernel_search_space.yaml    # Legacy (superseded by stage2_search_space.yaml)
 │   └── inference_models.yaml       # DO Serverless Inference model registry
 │
 ├── docs/
@@ -601,7 +611,9 @@ context_configs:
 | `sessions` | One document per optimisation run | `model_id`, `gpu_type`, `status`, `created_at` |
 | `configs` | Candidate configs queue | `fingerprint`, `flags`, `status` (`pending→running→done/failed`) |
 | `benchmark_runs` | All benchmark results | `flags`, `levels[]`, `enriched_metrics`, `fitness_score` |
-| `kernel_runs` | Stage 2 kernel search results | `kernel_config`, `fitness_score`, `llm_reasoning` |
+| `kernel_runs` | Stage 2 strategy search results | `kernel_config`, `fitness_score`, `llm_reasoning` |
+| `kernel_benchmark_runs` | Isolated op microbenchmarks (Stage 3) | `op_type`, `backend`, `metrics` |
+| `kernel_metadata` | Kernel implementation registry (stub) | `op_type`, `backend`, `implementation_id` |
 | `nodes` | GPU droplet heartbeats (multi-node) | `host`, `gpu_type`, `last_seen` |
 
 `benchmark_runs.levels` is a list with one entry per concurrency level tested:

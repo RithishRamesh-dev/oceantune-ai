@@ -1,0 +1,597 @@
+{
+  "rootFolder": "/Users/rramesh/oceantune-ai",
+  "analyzedAt": "2026-07-14T21:12:19.066Z",
+  "rootStructure": [
+    {
+      "name": ".gitignore",
+      "type": "file",
+      "size": 333,
+      "lines": 39
+    },
+    {
+      "name": "Dockerfile",
+      "type": "file",
+      "size": 2782,
+      "lines": 61
+    },
+    {
+      "name": "README.md",
+      "type": "file",
+      "size": 29308,
+      "lines": 701
+    },
+    {
+      "name": "__pycache__",
+      "type": "dir"
+    },
+    {
+      "name": "agents",
+      "type": "dir"
+    },
+    {
+      "name": "ci",
+      "type": "dir"
+    },
+    {
+      "name": "configs",
+      "type": "dir"
+    },
+    {
+      "name": "core",
+      "type": "dir"
+    },
+    {
+      "name": "correctness",
+      "type": "dir"
+    },
+    {
+      "name": "docker-compose.yml",
+      "type": "file",
+      "size": 3521,
+      "lines": 116
+    },
+    {
+      "name": "docs",
+      "type": "dir"
+    },
+    {
+      "name": "experiments",
+      "type": "dir"
+    },
+    {
+      "name": "hardware",
+      "type": "dir"
+    },
+    {
+      "name": "kernels",
+      "type": "dir"
+    },
+    {
+      "name": "microbench",
+      "type": "dir"
+    },
+    {
+      "name": "node",
+      "type": "dir"
+    },
+    {
+      "name": "oceantune.benchmark_runs.csv",
+      "type": "file",
+      "size": 51612,
+      "lines": 65
+    },
+    {
+      "name": "oceantune.py",
+      "type": "file",
+      "size": 6873,
+      "lines": 161
+    },
+    {
+      "name": "profiling",
+      "type": "dir"
+    },
+    {
+      "name": "requirements.txt",
+      "type": "file",
+      "size": 817,
+      "lines": 40
+    },
+    {
+      "name": "scripts",
+      "type": "dir"
+    },
+    {
+      "name": "show_results.py",
+      "type": "file",
+      "size": 8032,
+      "lines": 217
+    },
+    {
+      "name": "storage",
+      "type": "dir"
+    },
+    {
+      "name": "tests",
+      "type": "dir"
+    }
+  ],
+  "rootFileSnippets": {
+    "Dockerfile": [
+      "# OceanTune AI — Dockerfile",
+      "#",
+      "# Extends the official vLLM OpenAI-compatible server image.",
+      "# vLLM, CUDA, PyTorch, and all GPU drivers are already included.",
+      "# We layer our repo and test dependencies on top.",
+      "#",
+      "# Build:",
+      "#   docker build -t oceantune-ai .",
+      "#",
+      "# Run tests:"
+    ],
+    "README.md": [
+      "# OceanTune AI",
+      "",
+      "OceanTune is an automated vLLM inference optimisation system. It benchmarks your model on your GPU across hundreds of flag combinations and uses an LLM-guided search loop to find the configuration that maximises throughput — without any manual tuning.",
+      "",
+      "**What you get:** a ready-to-run shell script and YAML recipe with the optimal `--gpu-memory-utilization`, `--max-num-batched-tokens`, `--kv-cache-dtype`, attention backend, and 20+ other vLLM flags for your specific model and GPU.",
+      "",
+      "---",
+      "",
+      "## Benchmark results",
+      ""
+    ],
+    "docker-compose.yml": [
+      "# OceanTune AI — Docker Compose",
+      "#",
+      "# Usage on GPU droplet:",
+      "#",
+      "#   # Run tests only (no GPU required)",
+      "#   docker compose run --rm tests",
+      "#",
+      "#   # Run tests WITH GPU access",
+      "#   docker compose run --rm tests-gpu",
+      "#"
+    ],
+    "oceantune.benchmark_runs.csv": [
+      "_id,session_id,config_id,fingerprint,context.input_len,context.output_len,fitness_score,error,node_host,created_at,raw_metrics.peak_throughput_tokens_per_sec,raw_metrics.peak_requests_per_sec,raw_metrics.p95_latency_at_peak_ms,raw_metrics.p99_latency_at_peak_ms,raw_metrics.mean_ttft_ms,raw_metrics.p95_ttft_ms,raw_metrics.mean_tpot_ms,raw_metrics.p95_tpot_ms,raw_metrics.mean_itl_ms,raw_metrics.error_rate_max,raw_metrics.valid_levels,raw_metrics.best_concurrency,enriched_metrics.peak_throughput_tokens_per_sec,enriched_metrics.peak_requests_per_sec,enriched_metrics.p95_latency_at_peak_ms,enriched_metrics.p99_latency_at_peak_ms,enriched_metrics.mean_ttft_ms,enriched_metrics.p95_ttft_ms,enriched_metrics.mean_tpot_ms,enriched_metrics.p95_tpot_ms,enriched_metrics.mean_itl_ms,enriched_metrics.error_rate_max,enriched_metrics.valid_levels,enriched_metrics.best_concurrency,enriched_metrics.throughput_per_gb_vram,enriched_metrics.memory_headroom_fraction,enriched_metrics.throughput_per_watt,enriched_metrics.model_load_time_sec,enriched_metrics.total_startup_sec,enriched_metrics.kv_cache_blocks,enriched_metrics.kv_cache_gb,enriched_metrics.has_errors,enriched_metrics.failed_levels,enriched_metrics.all_levels_failed,enriched_metrics.fitness_score,enriched_metrics.primary_metric_used,flags.tensor_parallel_size,flags.pipeline_parallel_size,flags.enable_expert_parallel,flags.data_parallel_size,flags.distributed_executor_backend,flags.gpu_memory_utilization,flags.block_size,flags.kv_cache_dtype,flags.enable_prefix_caching,flags.max_num_seqs,flags.max_num_batched_tokens,flags.dtype,flags.quantization,flags.max_model_len,flags.enforce_eager,flags.load_format,flags.trust_remote_code,flags.scheduler_delay_factor,flags.enable_chunked_prefill,flags.attention_backend,flags.all2all_backend,flags.enable_dbo,flags.cpu_offload_gb,flags.prefix_caching_hash_algo,flags.speculative_model,flags.num_speculative_tokens,flags.run_id,levels[0].concurrency,levels[1].concurrency,levels[2].concurrency,levels[3].concurrency,levels[4].concurrency,levels[5].concurrency,levels[6].concurrency,levels[0].input_len,levels[1].input_len,levels[2].input_len,levels[3].input_len,levels[4].input_len,levels[5].input_len,levels[6].input_len,levels[0].output_len,levels[1].output_len,levels[2].output_len,levels[3].output_len,levels[4].output_len,levels[5].output_len,levels[6].output_len,levels[0].num_prompts,levels[1].num_prompts,levels[2].num_prompts,levels[3].num_prompts,levels[4].num_prompts,levels[5].num_prompts,levels[6].num_prompts,levels[0].duration_sec,levels[1].duration_sec,levels[2].duration_sec,levels[3].duration_sec,levels[4].duration_sec,levels[5].duration_sec,levels[6].duration_sec,levels[0].requests_per_sec,levels[1].requests_per_sec,levels[2].requests_per_sec,levels[3].requests_per_sec,levels[4].requests_per_sec,levels[5].requests_per_sec,levels[6].requests_per_sec,levels[0].output_tokens_per_sec,levels[1].output_tokens_per_sec,levels[2].output_tokens_per_sec,levels[3].output_tokens_per_sec,levels[4].output_tokens_per_sec,levels[5].output_tokens_per_sec,levels[6].output_tokens_per_sec,levels[0].total_tokens_per_sec,levels[1].total_tokens_per_sec,levels[2].total_tokens_per_sec,levels[3].total_tokens_per_sec,levels[4].total_tokens_per_sec,levels[5].total_tokens_per_sec,levels[6].total_tokens_per_sec,levels[0].mean_latency_ms,levels[1].mean_latency_ms,levels[2].mean_latency_ms,levels[3].mean_latency_ms,levels[4].mean_latency_ms,levels[5].mean_latency_ms,levels[6].mean_latency_ms,levels[0].median_latency_ms,levels[1].median_latency_ms,levels[2].median_latency_ms,levels[3].median_latency_ms,levels[4].median_latency_ms,levels[5].median_latency_ms,levels[6].median_latency_ms,levels[0].p90_latency_ms,levels[1].p90_latency_ms,levels[2].p90_latency_ms,levels[3].p90_latency_ms,levels[4].p90_latency_ms,levels[5].p90_latency_ms,levels[6].p90_latency_ms,levels[0].p95_latency_ms,levels[1].p95_latency_ms,levels[2].p95_latency_ms,levels[3].p95_latency_ms,levels[4].p95_latency_ms,levels[5].p95_latency_ms,levels[6].p95_latency_ms,levels[0].p99_latency_ms,levels[1].p99_latency_ms,levels[2].p99_latency_ms,levels[3].p99_latency_ms,levels[4].p99_latency_ms,levels[5].p99_latency_ms,levels[6].p99_latency_ms,levels[0].mean_ttft_ms,levels[1].mean_ttft_ms,levels[2].mean_ttft_ms,levels[3].mean_ttft_ms,levels[4].mean_ttft_ms,levels[5].mean_ttft_ms,levels[6].mean_ttft_ms,levels[0].median_ttft_ms,levels[1].median_ttft_ms,levels[2].median_ttft_ms,levels[3].median_ttft_ms,levels[4].median_ttft_ms,levels[5].median_ttft_ms,levels[6].median_ttft_ms,levels[0].p95_ttft_ms,levels[1].p95_ttft_ms,levels[2].p95_ttft_ms,levels[3].p95_ttft_ms,levels[4].p95_ttft_ms,levels[5].p95_ttft_ms,levels[6].p95_ttft_ms,levels[0].p99_ttft_ms,levels[1].p99_ttft_ms,levels[2].p99_ttft_ms,levels[3].p99_ttft_ms,levels[4].p99_ttft_ms,levels[5].p99_ttft_ms,levels[6].p99_ttft_ms,levels[0].mean_tpot_ms,levels[1].mean_tpot_ms,levels[2].mean_tpot_ms,levels[3].mean_tpot_ms,levels[4].mean_tpot_ms,levels[5].mean_tpot_ms,levels[6].mean_tpot_ms,levels[0].median_tpot_ms,levels[1].median_tpot_ms,levels[2].median_tpot_ms,levels[3].median_tpot_ms,levels[4].median_tpot_ms,levels[5].median_tpot_ms,levels[6].median_tpot_ms,levels[0].p95_tpot_ms,levels[1].p95_tpot_ms,levels[2].p95_tpot_ms,levels[3].p95_tpot_ms,levels[4].p95_tpot_ms,levels[5].p95_tpot_ms,levels[6].p95_tpot_ms,levels[0].p99_tpot_ms,levels[1].p99_tpot_ms,levels[2].p99_tpot_ms,levels[3].p99_tpot_ms,levels[4].p99_tpot_ms,levels[5].p99_tpot_ms,levels[6].p99_tpot_ms,levels[0].mean_itl_ms,levels[1].mean_itl_ms,levels[2].mean_itl_ms,levels[3].mean_itl_ms,levels[4].mean_itl_ms,levels[5].mean_itl_ms,levels[6].mean_itl_ms,levels[0].p95_itl_ms,levels[1].p95_itl_ms,levels[2].p95_itl_ms,levels[3].p95_itl_ms,levels[4].p95_itl_ms,levels[5].p95_itl_ms,levels[6].p95_itl_ms,levels[0].p99_itl_ms,levels[1].p99_itl_ms,levels[2].p99_itl_ms,levels[3].p99_itl_ms,levels[4].p99_itl_ms,levels[5].p99_itl_ms,levels[6].p99_itl_ms,levels[0].error_count,levels[1].error_count,levels[2].error_count,levels[3].error_count,levels[4].error_count,levels[5].error_count,levels[6].error_count,levels[0].timeout_count,levels[1].timeout_count,levels[2].timeout_count,levels[3].timeout_count,levels[4].timeout_count,levels[5].timeout_count,levels[6].timeout_count,levels[0].error_rate,levels[1].error_rate,levels[2].error_rate,levels[3].error_rate,levels[4].error_rate,levels[5].error_rate,levels[6].error_rate,levels[0].failed,levels[1].failed,levels[2].failed,levels[3].failed,levels[4].failed,levels[5].failed,levels[6].failed,levels[0].failure_reason,levels[1].failure_reason,levels[2].failure_reason,levels[3].failure_reason,levels[4].failure_reason,levels[5].failure_reason,levels[6].failure_reason,levels[0].raw_output,levels[1].raw_output,levels[2].raw_output,levels[3].raw_output,levels[4].raw_output,levels[5].raw_output,levels[6].raw_output",
+      "69f54da494ac05a80e859ebb,69f54d5794ac05a80e859eb9,69f54d5794ac05a80e859eba,3278005fb230,1024,1024,0,BenchmarkEngine.__init__() got an unexpected keyword argument 'base_url',localhost,2026-05-02T01:04:36.034Z,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+      "69f54da494ac05a80e859ebc,69f54d5794ac05a80e859eb9,69f54d5794ac05a80e859eba,3278005fb230,1024,4096,0,BenchmarkEngine.__init__() got an unexpected keyword argument 'base_url',localhost,2026-05-02T01:04:36.061Z,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+      "69f54da494ac05a80e859ebd,69f54d5794ac05a80e859eb9,69f54d5794ac05a80e859eba,3278005fb230,1024,8192,0,BenchmarkEngine.__init__() got an unexpected keyword argument 'base_url',localhost,2026-05-02T01:04:36.092Z,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+      "69f54da494ac05a80e859ebe,69f54d5794ac05a80e859eb9,69f54d5794ac05a80e859eba,3278005fb230,2048,8192,0,BenchmarkEngine.__init__() got an unexpected keyword argument 'base_url',localhost,2026-05-02T01:04:36.119Z,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+      "69f54da494ac05a80e859ebf,69f54d5794ac05a80e859eb9,69f54d5794ac05a80e859eba,3278005fb230,4096,16384,0,BenchmarkEngine.__init__() got an unexpected keyword argument 'base_url',localhost,2026-05-02T01:04:36.148Z,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+      "69f54da494ac05a80e859ec0,69f54d5794ac05a80e859eb9,69f54d5794ac05a80e859eba,3278005fb230,8192,32768,0,BenchmarkEngine.__init__() got an unexpected keyword argument 'base_url',localhost,2026-05-02T01:04:36.174Z,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+      "69f54ddf94ac05a80e859ec2,69f54d5794ac05a80e859eb9,69f54da694ac05a80e859ec1,44c90192d811,1024,1024,0,BenchmarkEngine.__init__() got an unexpected keyword argument 'base_url',localhost,2026-05-02T01:05:35.017Z,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+      "69f54ddf94ac05a80e859ec3,69f54d5794ac05a80e859eb9,69f54da694ac05a80e859ec1,44c90192d811,1024,4096,0,BenchmarkEngine.__init__() got an unexpected keyword argument 'base_url',localhost,2026-05-02T01:05:35.080Z,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+      "69f54ddf94ac05a80e859ec4,69f54d5794ac05a80e859eb9,69f54da694ac05a80e859ec1,44c90192d811,1024,8192,0,BenchmarkEngine.__init__() got an unexpected keyword argument 'base_url',localhost,2026-05-02T01:05:35.107Z,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,"
+    ],
+    "oceantune.py": [
+      "#!/usr/bin/env python3",
+      "\"\"\"",
+      "oceantune.py",
+      "------------",
+      "OceanTune AI — Main CLI entry point.",
+      "",
+      "Usage",
+      "-----",
+      "python3 oceantune.py --help",
+      "python3 oceantune.py run --model mistral --gpu H100"
+    ],
+    "requirements.txt": [
+      "# OceanTune AI — Python dependencies",
+      "# Pin exact versions for reproducibility",
+      "",
+      "# Core",
+      "pyyaml==6.0.1",
+      "python-dotenv==1.0.1",
+      "pydantic==2.7.1",
+      "",
+      "# Async & HTTP",
+      "aiohttp==3.9.5"
+    ],
+    "show_results.py": [
+      "#!/usr/bin/env python3",
+      "\"\"\"",
+      "show_results.py  — view OceanTune benchmark results as a table or CSV.",
+      "",
+      "Usage",
+      "-----",
+      "python3 show_results.py                          # latest session summary",
+      "python3 show_results.py --levels                 # include per-concurrency breakdown",
+      "python3 show_results.py --csv                    # CSV to stdout",
+      "python3 show_results.py --session <id>           # specific session"
+    ]
+  },
+  "importantFolders": [
+    {
+      "path": "configs",
+      "category": "config",
+      "fileCount": 9
+    },
+    {
+      "path": "configs/kernel_registry",
+      "category": "core",
+      "fileCount": 1
+    },
+    {
+      "path": "core",
+      "category": "core",
+      "fileCount": 20,
+      "primaryLanguage": "Python"
+    },
+    {
+      "path": "docs",
+      "category": "docs",
+      "fileCount": 3
+    },
+    {
+      "path": "kernels",
+      "category": "core",
+      "fileCount": 1,
+      "primaryLanguage": "Python"
+    },
+    {
+      "path": "scripts",
+      "category": "scripts",
+      "fileCount": 3,
+      "primaryLanguage": "Shell"
+    },
+    {
+      "path": "tests",
+      "category": "tests",
+      "fileCount": 8,
+      "primaryLanguage": "Python"
+    }
+  ],
+  "readmeParagraphs": {
+    "root": "# OceanTune AI"
+  },
+  "totals": {
+    "numFiles": 129,
+    "numDirs": 31,
+    "totalSizeBytes": 2131673,
+    "totalLinesOfCode": 19230
+  },
+  "fileCategories": {
+    "other": 55,
+    "documentation": 5,
+    "source": 59,
+    "config": 10
+  },
+  "linesOfCodePerLanguage": {
+    "Python": 18891,
+    "Shell": 339
+  },
+  "filesPerLanguage": {
+    "Python": 56,
+    "Shell": 3
+  },
+  "projectTypes": [
+    "Python (requirements)"
+  ],
+  "frameworks": [],
+  "entryPoints": [
+    "oceantune.py",
+    "scripts/benchmark.sh",
+    "scripts/docker_test.sh",
+    "scripts/run_vllm.sh",
+    "show_results.py"
+  ],
+  "ciCdTools": [
+    "Docker"
+  ],
+  "packageManagers": [
+    "pip"
+  ],
+  "topLevelDirectories": [
+    {
+      "name": "agents",
+      "numFiles": 15,
+      "totalLoc": 7910,
+      "dominantLanguage": "Python"
+    },
+    {
+      "name": "core",
+      "numFiles": 20,
+      "totalLoc": 6093,
+      "dominantLanguage": "Python"
+    },
+    {
+      "name": "tests",
+      "numFiles": 8,
+      "totalLoc": 2445,
+      "dominantLanguage": "Python"
+    },
+    {
+      "name": "profiling",
+      "numFiles": 4,
+      "totalLoc": 907,
+      "dominantLanguage": "Python"
+    },
+    {
+      "name": "microbench",
+      "numFiles": 3,
+      "totalLoc": 749,
+      "dominantLanguage": "Python"
+    },
+    {
+      "name": "node",
+      "numFiles": 3,
+      "totalLoc": 408,
+      "dominantLanguage": "Python"
+    },
+    {
+      "name": "scripts",
+      "numFiles": 3,
+      "totalLoc": 339,
+      "dominantLanguage": "Shell"
+    },
+    {
+      "name": "kernels",
+      "numFiles": 1,
+      "totalLoc": 1,
+      "dominantLanguage": "Python"
+    },
+    {
+      "name": "configs",
+      "numFiles": 9,
+      "totalLoc": 0
+    },
+    {
+      "name": "docs",
+      "numFiles": 3,
+      "totalLoc": 0
+    },
+    {
+      "name": "storage",
+      "numFiles": 51,
+      "totalLoc": 0
+    }
+  ],
+  "detailedDirectories": [
+    {
+      "path": "agents",
+      "name": "agents",
+      "level": 1,
+      "numFiles": 15,
+      "totalLoc": 7910,
+      "dominantLanguage": "Python",
+      "category": "General",
+      "description": "General module with 15 files (Python)",
+      "subdirectories": []
+    },
+    {
+      "path": "core",
+      "name": "core",
+      "level": 1,
+      "numFiles": 20,
+      "totalLoc": 6093,
+      "dominantLanguage": "Python",
+      "category": "Core/Business",
+      "description": "Core/Business module with 20 files (Python)",
+      "subdirectories": []
+    },
+    {
+      "path": "tests",
+      "name": "tests",
+      "level": 1,
+      "numFiles": 8,
+      "totalLoc": 2445,
+      "dominantLanguage": "Python",
+      "category": "Testing",
+      "description": "Testing module with 8 files (Python)",
+      "subdirectories": []
+    },
+    {
+      "path": "profiling",
+      "name": "profiling",
+      "level": 1,
+      "numFiles": 4,
+      "totalLoc": 907,
+      "dominantLanguage": "Python",
+      "category": "General",
+      "description": "General module with 4 files (Python)",
+      "subdirectories": []
+    },
+    {
+      "path": "microbench",
+      "name": "microbench",
+      "level": 1,
+      "numFiles": 3,
+      "totalLoc": 749,
+      "dominantLanguage": "Python",
+      "category": "General",
+      "description": "General module with 3 files (Python)",
+      "subdirectories": []
+    },
+    {
+      "path": "node",
+      "name": "node",
+      "level": 1,
+      "numFiles": 3,
+      "totalLoc": 408,
+      "dominantLanguage": "Python",
+      "category": "General",
+      "description": "General module with 3 files (Python)",
+      "subdirectories": []
+    },
+    {
+      "path": "scripts",
+      "name": "scripts",
+      "level": 1,
+      "numFiles": 3,
+      "totalLoc": 339,
+      "dominantLanguage": "Shell",
+      "category": "Tools/Scripts",
+      "description": "Tools/Scripts module with 3 files (Shell)",
+      "subdirectories": []
+    },
+    {
+      "path": "storage",
+      "name": "storage",
+      "level": 1,
+      "numFiles": 51,
+      "totalLoc": 0,
+      "category": "General",
+      "description": "General module with 51 files",
+      "subdirectories": [
+        {
+          "path": "storage/logs",
+          "name": "logs",
+          "level": 2,
+          "numFiles": 49,
+          "totalLoc": 0,
+          "category": "General",
+          "description": "General module with 49 files",
+          "subdirectories": []
+        },
+        {
+          "path": "storage/results",
+          "name": "results",
+          "level": 2,
+          "numFiles": 1,
+          "totalLoc": 0,
+          "category": "General",
+          "description": "General module with 1 files",
+          "subdirectories": []
+        }
+      ]
+    },
+    {
+      "path": "configs",
+      "name": "configs",
+      "level": 1,
+      "numFiles": 9,
+      "totalLoc": 0,
+      "category": "Configuration",
+      "description": "Configuration module with 9 files",
+      "subdirectories": [
+        {
+          "path": "configs/kernel_registry",
+          "name": "kernel_registry",
+          "level": 2,
+          "numFiles": 1,
+          "totalLoc": 0,
+          "category": "General",
+          "description": "General module with 1 files",
+          "subdirectories": []
+        }
+      ]
+    },
+    {
+      "path": "docs",
+      "name": "docs",
+      "level": 1,
+      "numFiles": 3,
+      "totalLoc": 0,
+      "category": "Documentation",
+      "description": "Documentation module with 3 files",
+      "subdirectories": [
+        {
+          "path": "docs/research",
+          "name": "research",
+          "level": 2,
+          "numFiles": 1,
+          "totalLoc": 0,
+          "category": "General",
+          "description": "General module with 1 files",
+          "subdirectories": []
+        }
+      ]
+    },
+    {
+      "path": "kernels",
+      "name": "kernels",
+      "level": 1,
+      "numFiles": 1,
+      "totalLoc": 1,
+      "dominantLanguage": "Python",
+      "category": "General",
+      "description": "General module with 1 files (Python)",
+      "subdirectories": []
+    }
+  ],
+  "architecturalInsights": {
+    "coreApplications": [],
+    "entryPointDetails": [
+      {
+        "path": "../../../oceantune.py",
+        "type": "Unknown",
+        "description": ""
+      },
+      {
+        "path": "../../../scripts/benchmark.sh",
+        "type": "Unknown",
+        "description": ""
+      },
+      {
+        "path": "../../../scripts/docker_test.sh",
+        "type": "Unknown",
+        "description": ""
+      },
+      {
+        "path": "../../../scripts/run_vllm.sh",
+        "type": "Unknown",
+        "description": ""
+      },
+      {
+        "path": "../../../show_results.py",
+        "type": "Unknown",
+        "description": ""
+      }
+    ],
+    "serviceArchitecture": {
+      "microservices": [],
+      "monoliths": [],
+      "libraries": []
+    },
+    "layeredArchitecture": {
+      "presentation": [],
+      "business": [
+        "core"
+      ],
+      "data": [],
+      "infrastructure": []
+    }
+  },
+  "largeFiles": [],
+  "dependencies": {
+    "production": [
+      "pyyaml",
+      "python-dotenv",
+      "pydantic",
+      "aiohttp",
+      "httpx",
+      "requests",
+      "pandas",
+      "numpy",
+      "motor",
+      "pymongo",
+      "boto3",
+      "rich",
+      "structlog",
+      "openai",
+      "fastapi",
+      "uvicorn",
+      "click",
+      "pytest",
+      "pytest-asyncio"
+    ],
+    "development": [],
+    "total": 19
+  },
+  "complexity": {
+    "averageFileSize": 149.06976744186048,
+    "maxFileSize": 0,
+    "nestedDepth": 0,
+    "estimatedComplexity": "medium"
+  },
+  "gitRepo": {
+    "firstCommitDate": "2026-05-13",
+    "totalCommits": 53,
+    "numContributors": 0,
+    "currentBranch": "main",
+    "remoteUrls": [
+      "https://github.com/RithishRamesh-dev/oceantune-ai.git"
+    ]
+  }
+}

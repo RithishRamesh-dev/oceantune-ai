@@ -339,7 +339,7 @@ class KernelGenerationAgent:
         gpu_type: str,
         model_meta: Dict[str, Any],
     ) -> str:
-        vendor = "amd" if gpu_type in {"MI300X", "MI325X", "MI350X"} else "nvidia"
+        vendor = "amd" if gpu_type in {"MI300X", "MI325X", "MI350X", "MI355X"} else "nvidia"
         top = research.top_approach
 
         sections = [

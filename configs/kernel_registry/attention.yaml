@@ -1,0 +1,83 @@
+# OceanTune — Attention kernel implementation registry (Phase 1)
+# Maps vLLM attention_backend values to hardware requirements and notes.
+
+implementations:
+
+  FLASH_ATTN:
+    implementation_id: flash_attention_2
+    display_name: FlashAttention-2 (vLLM)
+    vllm_flag_value: FLASH_ATTN
+    min_vllm_version: "0.4.0"
+    vendors: [nvidia]
+    gpu_architectures: [sm_80, sm_90, sm_100]
+    supports_fp8_kv: true
+    supports_gqa: true
+    supports_mla: false
+    supports_paged_kv: true
+    notes: Default NVIDIA path; strong prefill on long sequences.
+
+  FLASHINFER:
+    implementation_id: flashinfer
+    display_name: FlashInfer
+    vllm_flag_value: FLASHINFER
+    min_vllm_version: "0.6.0"
+    vendors: [nvidia]
+    gpu_architectures: [sm_80, sm_90, sm_100]
+    supports_fp8_kv: true
+    supports_gqa: true
+    supports_mla: false
+    supports_paged_kv: true
+    notes: Often faster for GQA and variable-length batches; native paged KV APIs.
+
+  FLASH_ATTN_3:
+    implementation_id: flash_attention_3
+    display_name: FlashAttention-3 (when exposed)
+    vllm_flag_value: FLASH_ATTN
+    min_vllm_version: "0.18.0"
+    vendors: [nvidia]
+    gpu_architectures: [sm_90, sm_100]
+    supports_fp8_kv: true
+    supports_gqa: true
+    supports_mla: false
+    supports_paged_kv: true
+    requires_fa3_stack: true
+    notes: Hopper+ FP8 forward; selected via FLASH_ATTN when FA3 build present.
+
+  ROCM_FLASH:
+    implementation_id: rocm_flash
+    display_name: ROCm Flash Attention
+    vllm_flag_value: ROCM_FLASH
+    min_vllm_version: "0.4.0"
+    vendors: [amd]
+    gpu_architectures: [gfx942, gfx950]
+    supports_fp8_kv: true
+    supports_gqa: true
+    supports_mla: false
+    supports_paged_kv: true
+    notes: Required default for MI300X / MI325X / MI350X.
+
+  TORCH_SDPA:
+    implementation_id: torch_sdpa
+    display_name: PyTorch SDPA
+    vllm_flag_value: TORCH_SDPA
+    min_vllm_version: "0.4.0"
+    vendors: [nvidia, amd]
+    gpu_architectures: []
+    supports_fp8_kv: false
+    supports_gqa: true
+    supports_mla: false
+    supports_paged_kv: false
+    notes: Debug baseline only; not for production tuning.
+
+  XFORMERS:
+    implementation_id: xformers
+    display_name: xFormers
+    vllm_flag_value: XFORMERS
+    min_vllm_version: "0.4.0"
+    vendors: [nvidia]
+    gpu_architectures: [sm_80, sm_90]
+    supports_fp8_kv: false
+    supports_gqa: true
+    supports_mla: false
+    supports_paged_kv: false
+    notes: Legacy; rarely beats FLASH_ATTN on Hopper.

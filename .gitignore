@@ -21,6 +21,14 @@ htmlcov/
 # OceanTune runtime artifacts
 storage/logs/
 storage/results/
+storage/sessions/
+storage/shadow_kernels/
+storage/workspaces/
+storage/kernel_ledger/
+
+# Hyperloom reference (not vendored into OceanTune)
+Hyperloom-main/
+Hyperloom-main.zip
 
 # Secrets — never commit these
 .env

@@ -49,6 +49,9 @@ class DatabaseConfig:
         "configs": "configs",
         "benchmark_runs": "benchmark_runs",
         "kernel_runs": "kernel_runs",
+        "kernel_benchmark_runs": "kernel_benchmark_runs",
+        "kernel_metadata": "kernel_metadata",
+        "recipes": "recipes",
     })
 
 
@@ -185,9 +188,39 @@ class OceanTuneConfig:
         (8192, 32768),
     ])
 
+    # Serving framework: vllm | sglang
+    framework: str = "vllm"
+
     # Stage 4 — Autonomous Kernel Engineering
     stage4_enabled: bool = False
     stage4_iterations: int = 3
+    stage4_e2e_enabled: bool = True
+    stage4_campaign_enabled: bool = True
+
+    # Enablement — boot repair before Stage 1 search
+    enablement_enabled: bool = True
+    enablement_max_repairs: int = 4
+
+    # Attention E2E matrix (Phase 1)
+    attention_e2e_enabled: bool = False
+
+    # Macro-cycle — budgeted Stage 2↔3 reloop
+    macro_cycle_enabled: bool = True
+    macro_cycle_max: int = 2
+    macro_cycle_min_remaining_sec: float = 1800.0
+
+    # Session wall-clock + resume
+    session_max_minutes: float = 0.0  # 0 = unlimited
+    resume_session_id: str = ""
+    prelude_enabled: bool = True
+    prelude_min_confidence: float = 0.7
+    warmstart_max_trials: int = 3
+    search_stall_limit: int = 2
+    convergence_max_spread_pct: float = 15.0
+    snr_threshold_db: float = 30.0
+    framework_version: str = "0.6.0"
+    serving_patches_enabled: bool = True
+    quantization_scheme: str = "none"  # none|fp8|fp8_kv|awq|gptq|nvfp4|bitsandbytes
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +264,12 @@ def _apply_env_overrides(cfg: OceanTuneConfig) -> None:
         cfg.optimiser.strategy = v
     if v := os.getenv("OCEANTUNE_PRIMARY_METRIC"):
         cfg.optimiser.primary_metric = v
+    if v := os.getenv("OCEANTUNE_FRAMEWORK"):
+        cfg.framework = v.lower()
+    if v := os.getenv("OCEANTUNE_RESUME_SESSION"):
+        cfg.resume_session_id = v
+    if v := os.getenv("OCEANTUNE_SESSION_MAX_MINUTES"):
+        cfg.session_max_minutes = float(v)
 
 
 def load_config(override_path: Optional[Path] = None) -> OceanTuneConfig:
@@ -343,10 +382,50 @@ def load_config(override_path: Optional[Path] = None) -> OceanTuneConfig:
     if "context_configs" in raw:
         cfg.context_configs = [tuple(pair) for pair in raw["context_configs"]]
 
+    if "framework" in raw:
+        cfg.framework = str(raw["framework"]).lower()
     if "stage4_enabled" in raw:
         cfg.stage4_enabled = bool(raw["stage4_enabled"])
     if "stage4_iterations" in raw:
         cfg.stage4_iterations = int(raw["stage4_iterations"])
+    if "stage4_e2e_enabled" in raw:
+        cfg.stage4_e2e_enabled = bool(raw["stage4_e2e_enabled"])
+    if "stage4_campaign_enabled" in raw:
+        cfg.stage4_campaign_enabled = bool(raw["stage4_campaign_enabled"])
+    if "enablement_enabled" in raw:
+        cfg.enablement_enabled = bool(raw["enablement_enabled"])
+    if "enablement_max_repairs" in raw:
+        cfg.enablement_max_repairs = int(raw["enablement_max_repairs"])
+    if "attention_e2e_enabled" in raw:
+        cfg.attention_e2e_enabled = bool(raw["attention_e2e_enabled"])
+    if "macro_cycle_enabled" in raw:
+        cfg.macro_cycle_enabled = bool(raw["macro_cycle_enabled"])
+    if "macro_cycle_max" in raw:
+        cfg.macro_cycle_max = int(raw["macro_cycle_max"])
+    if "macro_cycle_min_remaining_sec" in raw:
+        cfg.macro_cycle_min_remaining_sec = float(raw["macro_cycle_min_remaining_sec"])
+    if "session_max_minutes" in raw:
+        cfg.session_max_minutes = float(raw["session_max_minutes"])
+    if "resume_session_id" in raw:
+        cfg.resume_session_id = str(raw["resume_session_id"] or "")
+    if "prelude_enabled" in raw:
+        cfg.prelude_enabled = bool(raw["prelude_enabled"])
+    if "prelude_min_confidence" in raw:
+        cfg.prelude_min_confidence = float(raw["prelude_min_confidence"])
+    if "warmstart_max_trials" in raw:
+        cfg.warmstart_max_trials = int(raw["warmstart_max_trials"])
+    if "search_stall_limit" in raw:
+        cfg.search_stall_limit = int(raw["search_stall_limit"])
+    if "convergence_max_spread_pct" in raw:
+        cfg.convergence_max_spread_pct = float(raw["convergence_max_spread_pct"])
+    if "snr_threshold_db" in raw:
+        cfg.snr_threshold_db = float(raw["snr_threshold_db"])
+    if "framework_version" in raw:
+        cfg.framework_version = str(raw["framework_version"])
+    if "serving_patches_enabled" in raw:
+        cfg.serving_patches_enabled = bool(raw["serving_patches_enabled"])
+    if "quantization_scheme" in raw:
+        cfg.quantization_scheme = str(raw["quantization_scheme"]).lower()
 
     # Env vars always win
     _apply_env_overrides(cfg)
@@ -376,12 +455,29 @@ def _validate(cfg: OceanTuneConfig) -> None:
         # NVIDIA
         "H100", "H200", "B300",
         # AMD
-        "MI300X", "MI325X", "MI350X",
+        "MI300X", "MI325X", "MI350X", "MI355X",
     }
     if cfg.gpu_type not in valid_gpus:
         raise ValueError(
             f"Unknown gpu_type '{cfg.gpu_type}'. "
             f"Choose one of: {sorted(valid_gpus)}"
+        )
+
+    from core.framework_backend import SUPPORTED_FRAMEWORKS
+    if getattr(cfg, "framework", "vllm") not in SUPPORTED_FRAMEWORKS:
+        raise ValueError(
+            f"Unknown framework '{cfg.framework}'. "
+            f"Choose one of: {SUPPORTED_FRAMEWORKS}"
+        )
+
+    valid_metrics = {
+        "throughput", "p95_latency", "ttft", "tpot",
+        "prefill_heavy", "decode_heavy", "cost_aware",
+    }
+    if cfg.optimiser.primary_metric not in valid_metrics:
+        raise ValueError(
+            f"Unknown primary_metric '{cfg.optimiser.primary_metric}'. "
+            f"Choose one of: {sorted(valid_metrics)}"
         )
 
     if cfg.vllm.port < 1024 or cfg.vllm.port > 65535:

@@ -152,7 +152,19 @@ optimiser:
   mutation_rate: 0.2            # used by search_space crossover helpers
   elite_fraction: 0.2           # used by search_space crossover helpers
   # Primary metric drives fitness scoring in MetricsCollector and Analyst ranking
+  # throughput | p95_latency | ttft | tpot | prefill_heavy | decode_heavy | cost_aware
   primary_metric: "throughput"  # throughput | p95_latency | ttft | tpot
+
+# ── Serving framework ─────────────────────────────────────────────────────────
+# vllm (default) | sglang (OpenAI-compatible adapter; subset of flags)
+framework: "vllm"
+
+# ── Enablement (boot repair before Stage 1) ───────────────────────────────────
+enablement_enabled: true
+enablement_max_repairs: 4
+
+# ── Attention E2E matrix (Phase 1 backend truth) ──────────────────────────────
+attention_e2e_enabled: false
 
 # ── Stage 4 — Autonomous Kernel Engineering ──────────────────────────────────
 # Stage 4 runs after Stage 3 profiling. It autonomously:
@@ -160,6 +172,7 @@ optimiser:
 #   2. Validates correctness against PyTorch reference (CorrectnessFirewall)
 #   3. Benchmarks speedup via isolated microbenchmark
 #   4. Keeps kernels that pass correctness + show >1% speedup (keep/revert loop)
+#   5. Stage 4b fusion campaign + kernel ledger (+ optional shadow E2E)
 #
 # Prerequisites:
 #   - PyTorch + Triton must be installed in the OceanTune Python environment
@@ -169,9 +182,30 @@ optimiser:
 #
 stage4_enabled: true         # set to false to skip kernel generation
 stage4_iterations: 5         # number of evolution rounds (generate→validate→keep/revert)
+stage4_e2e_enabled: true
+stage4_campaign_enabled: true
+
+# ── Macro-cycle Stage 2↔3 reloop ──────────────────────────────────────────────
+macro_cycle_enabled: true
+macro_cycle_max: 2
+macro_cycle_min_remaining_sec: 1800
+
+# ── Session budget / resume / prelude ─────────────────────────────────────────
+session_max_minutes: 0          # 0 = unlimited; else wall-clock stop for macro
+resume_session_id: ""           # or OCEANTUNE_RESUME_SESSION
+prelude_enabled: true
+prelude_min_confidence: 0.7
+warmstart_max_trials: 3
+search_stall_limit: 2
+convergence_max_spread_pct: 15.0
+snr_threshold_db: 30.0
+framework_version: "0.6.0"
+serving_patches_enabled: true
+quantization_scheme: "none"     # none|fp8|fp8_kv|awq|gptq|nvfp4|bitsandbytes
 
 # ── Context-Length Evaluation Matrix ─────────────────────────────────────────
 # Each [input_tokens, output_tokens] pair → separate optimisation recipe.
 context_configs:
-  - [1024,   1024]
-  - [1024,   4096]
+  - [1024,   1024]    # chat-like
+  - [1024,   4096]    # long generation
+  - [512,    64]      # decode-heavy (Phase 1 — attention/KV bandwidth)

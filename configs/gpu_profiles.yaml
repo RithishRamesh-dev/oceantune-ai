@@ -245,3 +245,54 @@ gpu_profiles:
       CDNA4 (gfx950). 288 GB HBM3e. Improved FP8 throughput vs CDNA3.
       Verify ROCm image compatibility — may need newer image than v0.18.1.
       FUSION_SHARED_EXPERTS flag may differ from CDNA3 — validate on first run.
+
+  MI355X:
+    vendor: amd
+    arch: cdna4
+    rocm_arch: gfx950
+    vram_gb: 288
+    vram_type: HBM3e
+    fp16: true
+    bf16: true
+    fp8: true
+    nvfp4: false
+    mxfp4: true
+    flash_attention: false
+    default_gpu_memory_utilization: 0.90
+    max_tensor_parallel: 8
+    # DeepSeek-V4.1-Flash specialized ROCm image (override via VLLM_IMAGE)
+    docker_image: "vllm/vllm-openai-rocm:deepseekv41-flash-0909"
+    docker_image_pinned: "vllm/vllm-openai-rocm:deepseekv41-flash-0909"
+    ipc_host: true
+    vllm_extra_args:
+      - "--distributed-executor-backend"
+      - "mp"
+    env_vars:
+      HSA_NO_SCRATCH_RECLAIM: "1"
+      NCCL_MIN_NCHANNELS: "112"
+      SAFETENSORS_FAST_GPU: "1"
+      VLLM_ROCM_USE_AITER: "1"
+      VLLM_ROCM_USE_AITER_MHA: "1"
+      VLLM_ROCM_USE_AITER_MOE: "0"
+      VLLM_ROCM_USE_AITER_MLA: "1"
+      VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: "INT6"
+      VLLM_USE_TRITON_FLASH_ATTN: "0"
+      PYTORCH_ROCM_ARCH: "gfx950"
+      GPU_ARCHS: "gfx950"
+      TOKENIZERS_PARALLELISM: "false"
+      HF_HOME: "/root/.cache/huggingface"
+    recommended_kv_cache_dtype: "auto"
+    recommended_block_size: 16
+    docker_extra_flags:
+      - "--device /dev/kfd"
+      - "--device /dev/dri"
+      - "--group-add 44"
+      - "--group-add video"
+      - "--cap-add SYS_PTRACE"
+      - "--security-opt seccomp=unconfined"
+      - "--shm-size"
+      - "32g"
+    notes: >
+      CDNA4 MI355X (gfx950), 8×288 GB typical. Baseline DeepSeek-V4.1-Flash:
+      AITER=1, AITER_MHA=1, AITER_MOE=0, TP=4, enforce-eager, tokenizer-mode deepseek_v41.
+      Use image vllm/vllm-openai-rocm:deepseekv41-flash-0909 for Quark-MXFP4.

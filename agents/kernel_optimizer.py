@@ -1,7 +1,14 @@
 """
 agents/kernel_optimizer.py
 --------------------------
-Kernel Optimizer Agent — Stage 2.
+Kernel Optimizer Agent — LEGACY (not used by ControllerAgent).
+
+Stage 2 in production is StrategyOptimizerAgent (agents/strategy_optimizer.py),
+which reads configs/stage2_search_space.yaml including NCCL/DBO/communication.
+
+This module remains for reference and optional manual invocation.
+
+Kernel Optimizer Agent — Stage 2 (legacy).
 
 Starting from the winning Stage 1 vLLM config, the Kernel Optimizer
 iteratively explores low-level kernel and runtime parameters (attention
@@ -57,7 +64,7 @@ log = logging.getLogger("agents.kernel_optimizer")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _KERNEL_SS_YAML = _REPO_ROOT / "configs" / "kernel_search_space.yaml"
 
-_AMD_GPU_TYPES = {"MI300X", "MI325X", "MI350X"}
+_AMD_GPU_TYPES = {"MI300X", "MI325X", "MI350X", "MI355X"}
 
 _PROPOSE_SYSTEM_PROMPT = """\
 You are an expert vLLM kernel tuning engineer.

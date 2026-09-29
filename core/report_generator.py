@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 from agents.analyst import AnalysisResult
+from core.flag_merge import merge_flags, to_vllm_flags_dict
 from core.search_space import VLLMFlags
 
 _DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "storage" / "results"
@@ -72,6 +73,8 @@ class ReportGenerator:
         stage3_fitness: float = 0.0,
         stage3_applied_recs: Optional[List[Dict[str, Any]]] = None,
         stage3_all_tried_recs: Optional[List[Dict[str, Any]]] = None,
+        attention_benchmark_runs: Optional[List[Dict[str, Any]]] = None,
+        stage2_kernel_runs: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Path]:
         """
         Write all report artefacts and return a dict of {type: path}.
@@ -115,6 +118,8 @@ class ReportGenerator:
             stage3_fitness=stage3_fitness,
             stage3_applied_recs=stage3_applied_recs or [],
             stage3_all_tried_recs=stage3_all_tried_recs or [],
+            attention_benchmark_runs=attention_benchmark_runs,
+            stage2_kernel_runs=stage2_kernel_runs,
         )
 
         return {"yaml": yaml_path, "shell": shell_path, "markdown": md_path}
@@ -135,7 +140,7 @@ class ReportGenerator:
         research_report=None,
         evolution_result=None,
     ) -> Path:
-        merged_flags = {**analysis.winner_flags, **best_kernel_config}
+        merged_flags = merge_flags(analysis.winner_flags, best_kernel_config)
         recipe: Dict[str, Any] = {
             "# OceanTune AI — Optimised Recipe": None,
             "session_id": session_id,
@@ -200,13 +205,9 @@ class ReportGenerator:
         docker_image: str,
     ) -> Path:
         # Merge Stage 1 winner flags with Stage 2/3 strategy overrides.
-        # best_kernel_config contains the additional flags set by Stage 2 (e.g.
-        # attention_backend, kv_cache_dtype) on top of the Stage 1 baseline.
-        known_vllm_fields = set(VLLMFlags.__dataclass_fields__)
-        flags = {
-            **analysis.winner_flags,
-            **{k: v for k, v in best_kernel_config.items() if k in known_vllm_fields},
-        }
+        flags = to_vllm_flags_dict(
+            merge_flags(analysis.winner_flags, best_kernel_config)
+        )
 
         # Rebuild a VLLMFlags object to get the canonical CLI args
         try:
@@ -275,6 +276,8 @@ class ReportGenerator:
         stage3_fitness: float = 0.0,
         stage3_applied_recs: Optional[List[Dict[str, Any]]] = None,
         stage3_all_tried_recs: Optional[List[Dict[str, Any]]] = None,
+        attention_benchmark_runs: Optional[List[Dict[str, Any]]] = None,
+        stage2_kernel_runs: Optional[List[Dict[str, Any]]] = None,
     ) -> Path:
         top = analysis.top_configs[:5]
 
@@ -532,6 +535,12 @@ class ReportGenerator:
                 "Set `stage4_enabled: true` in `oceantune.yaml` to activate.\n"
             )
 
+        attention_section = self._format_attention_section(
+            attention_benchmark_runs=attention_benchmark_runs,
+            stage2_kernel_runs=stage2_kernel_runs,
+            best_kernel_config=best_kernel_config,
+        )
+
         md = (
             f"# OceanTune AI — Optimisation Report\n\n"
             f"**Session:** `{session_id}`  \n"
@@ -561,6 +570,7 @@ class ReportGenerator:
             "---\n\n"
             "## Top 5 Configurations\n\n"
             + top_table
+            + attention_section
             + stage2_section
             + stage3_section
             + stage4_section
@@ -572,6 +582,73 @@ class ReportGenerator:
         with open(path, "w", encoding="utf-8") as f:
             f.write(md)
         return path
+
+    @staticmethod
+    def _format_attention_section(
+        *,
+        attention_benchmark_runs: Optional[List[Dict[str, Any]]],
+        stage2_kernel_runs: Optional[List[Dict[str, Any]]],
+        best_kernel_config: Dict[str, Any],
+    ) -> str:
+        """Phase 1: isolated microbench + Stage 2 attention_backend trials."""
+        runs = attention_benchmark_runs or []
+        s2 = stage2_kernel_runs or []
+        if not runs and not s2:
+            return ""
+
+        lines = [
+            "\n---\n\n## Attention Kernel Benchmarks (Phase 1)\n\n",
+        ]
+        chosen = best_kernel_config.get("attention_backend")
+        if chosen:
+            lines.append(f"**Selected backend (Stage 2 delta):** `{chosen}`\n\n")
+
+        if runs:
+            lines.append("### Isolated microbench (`kernel_benchmark_runs`)\n\n")
+            lines.append(
+                "| Backend label | p50 latency (µs) | TFLOP/s | Roofline bound | "
+                "Efficiency % |\n"
+                "|---------------|------------------|---------|----------------|"
+                "-------------|\n"
+            )
+            for doc in runs:
+                m = doc.get("metrics") or {}
+                if m.get("error"):
+                    continue
+                lines.append(
+                    f"| `{doc.get('backend', '—')}` | "
+                    f"{m.get('latency_us_p50', 0):.1f} | "
+                    f"{m.get('throughput_tflops', 0):.2f} | "
+                    f"`{m.get('roofline_bound', 'unknown')}` | "
+                    f"{m.get('roofline_efficiency_pct', 0):.1f} |\n"
+                )
+            lines.append("\n")
+
+        attn_trials = [
+            r for r in s2
+            if (r.get("kernel_config") or {}).get("attention_backend")
+        ]
+        if attn_trials:
+            lines.append("### Stage 2 attention backend trials (`kernel_runs`)\n\n")
+            lines.append(
+                "| Backend | Fitness | Peak tok/s | Category |\n"
+                "|---------|---------|------------|----------|\n"
+            )
+            for run in sorted(
+                attn_trials, key=lambda x: x.get("fitness_score", 0), reverse=True
+            ):
+                cfg = run.get("kernel_config") or {}
+                em = (run.get("raw_metrics") or {}).get("enriched_metrics") or {}
+                thr = em.get("peak_throughput_tokens_per_sec", "—")
+                thr_s = f"{thr:.1f}" if isinstance(thr, (int, float)) else "—"
+                lines.append(
+                    f"| `{cfg.get('attention_backend', '—')}` | "
+                    f"{run.get('fitness_score', 0):.4f} | {thr_s} | "
+                    f"`{cfg.get('_category', '—')}` |\n"
+                )
+            lines.append("\n")
+
+        return "".join(lines)
 
 
 # ---------------------------------------------------------------------------
