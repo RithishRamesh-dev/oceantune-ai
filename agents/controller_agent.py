@@ -742,6 +742,23 @@ class ControllerAgent:
             "gpu_memory_utilization": 0.90,
             "block_size": 1 if mla else 16,
         }
+        # DeepSeek-V4.1-Flash Quark-MXFP4 / MI355X known-good baseline recipe
+        mid = (self.cfg.model_id or "").lower()
+        if (
+            "deepseek-v4" in mid
+            or "deepseek_v4" in mid
+            or "quark-mxfp4" in mid
+            or getattr(self.cfg, "gpu_type", "") == "MI355X"
+        ):
+            base.update({
+                "tensor_parallel_size": 4,
+                "max_num_batched_tokens": 8192,
+                "gpu_memory_utilization": 0.90,
+                "enforce_eager": True,
+                "trust_remote_code": True,
+                "tokenizer_mode": "deepseek_v41",
+            })
+            log.info("Enablement: using DeepSeek-V4.1 / MI355X baseline recipe (TP=4)")
         known = set(VLLMFlags.__dataclass_fields__)
         result = EnablementResult(success=False)
         max_repairs = int(getattr(self.cfg, "enablement_max_repairs", 4))
@@ -1070,6 +1087,7 @@ class ControllerAgent:
             log.debug("Cross-session warm-start query failed: %s", e)
 
         # Iteration 0: bare minimum — let vLLM choose all defaults
+        # (except DeepSeek-V4.1 / MI355X which require tokenizer + trust flags)
         current_best = VLLMFlags(
             tensor_parallel_size=1,
             pipeline_parallel_size=1,
@@ -1077,6 +1095,25 @@ class ControllerAgent:
             distributed_executor_backend="mp",
             cpu_offload_gb=0,
         )
+        mid = (self.cfg.model_id or "").lower()
+        if (
+            "deepseek-v4" in mid
+            or "deepseek_v4" in mid
+            or "quark-mxfp4" in mid
+            or self.cfg.gpu_type == "MI355X"
+        ):
+            current_best = VLLMFlags(
+                tensor_parallel_size=4,
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+                distributed_executor_backend="mp",
+                cpu_offload_gb=0,
+                gpu_memory_utilization=0.90,
+                max_num_batched_tokens=8192,
+                enforce_eager=True,
+                trust_remote_code=True,
+                tokenizer_mode="deepseek_v41",
+            )
         current_best.run_id = current_best.fingerprint()
 
         best_fitness = 0.0
