@@ -446,7 +446,7 @@ class ControllerAgent:
                         node_cfg = self.cfg.nodes[0]
                         gpu_alloc = GPUSlotAllocator(
                             gpu_indices=node_cfg.gpu_indices,
-                            gpu_type=node_cfg.gpu_type,
+                            gpu_type=self.cfg.gpu_type or node_cfg.gpu_type,
                         )
                         port_alloc = PortAllocator(
                             start=self.cfg.coordinator.port_pool_start,
@@ -1315,7 +1315,7 @@ class ControllerAgent:
         node_cfg = self.cfg.nodes[0]
         gpu_alloc = GPUSlotAllocator(
             gpu_indices=node_cfg.gpu_indices,
-            gpu_type=node_cfg.gpu_type,
+            gpu_type=self.cfg.gpu_type or node_cfg.gpu_type,
         )
         port_alloc = PortAllocator(
             start=self.cfg.coordinator.port_pool_start,
@@ -1363,7 +1363,7 @@ class ControllerAgent:
         n_gpus = len(node_cfg.gpu_indices)
         gpu_alloc = GPUSlotAllocator(
             gpu_indices=node_cfg.gpu_indices,
-            gpu_type=node_cfg.gpu_type,
+            gpu_type=self.cfg.gpu_type or node_cfg.gpu_type,
         )
         port_alloc = PortAllocator(
             start=self.cfg.coordinator.port_pool_start,
@@ -1441,7 +1441,7 @@ class ControllerAgent:
         node_cfg = self.cfg.nodes[0]
         gpu_alloc = GPUSlotAllocator(
             gpu_indices=node_cfg.gpu_indices,
-            gpu_type=node_cfg.gpu_type,
+            gpu_type=self.cfg.gpu_type or node_cfg.gpu_type,
         )
         port_alloc = PortAllocator(
             start=self.cfg.coordinator.port_pool_start,
@@ -1583,7 +1583,7 @@ class ControllerAgent:
         node_cfg = self.cfg.nodes[0]
         gpu_alloc = GPUSlotAllocator(
             gpu_indices=node_cfg.gpu_indices,
-            gpu_type=node_cfg.gpu_type,
+            gpu_type=self.cfg.gpu_type or node_cfg.gpu_type,
         )
         port_alloc = PortAllocator(
             start=self.cfg.coordinator.port_pool_start,
@@ -2325,7 +2325,7 @@ class ControllerAgent:
         node_cfg = self.cfg.nodes[0]
         gpu_alloc = GPUSlotAllocator(
             gpu_indices=node_cfg.gpu_indices,
-            gpu_type=node_cfg.gpu_type,
+            gpu_type=self.cfg.gpu_type or node_cfg.gpu_type,
         )
         port_alloc = PortAllocator(
             start=self.cfg.coordinator.port_pool_start,
