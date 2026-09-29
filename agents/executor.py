@@ -163,8 +163,10 @@ class ExecutorAgent:
         # Acquire GPU slot and port
         slot = await self._gpu_alloc.acquire(tp_size)
         if slot is None:
-            log.warning("Executor: no GPU slots available for tp=%d, re-queuing", tp_size)
-            await self._db.requeue_config(config_id)
+            log.warning("Executor: no GPU slots available for tp=%d", tp_size)
+            await self._db.mark_config_failed(
+                config_id, f"no_gpu_slots_for_tp={tp_size}"
+            )
             return
 
         port = await self._port_alloc.acquire()

@@ -25,7 +25,7 @@ from typing import List, Optional, Set
 log = logging.getLogger("core.gpu_allocator")
 
 # GPU vendors whose device-visibility env var is ROCR_VISIBLE_DEVICES
-_AMD_GPU_TYPES: Set[str] = {"MI300X", "MI325X", "MI350X"}
+_AMD_GPU_TYPES: Set[str] = {"MI300X", "MI325X", "MI350X", "MI355X"}
 
 
 class GPUSlotAllocator:
